@@ -26,6 +26,28 @@ from lightrag.query_validation import validate_query_not_empty, validate_rag_que
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+# Global storage for recent query activations (for 3D viewer real-time activation)
+_recent_query_activations: List[Dict[str, Any]] = []
+_MAX_ACTIVATIONS_TO_KEEP = 100
+_ACTIVATION_TTL_SECONDS = 60  # Activations expire after 60 seconds
+
+# Daily cache of query activations for idle replay in the 3D viewer.
+# Keyed by day ("2026-08-05"); previous days are dropped on the next write.
+_daily_query_cache: Dict[str, List[Dict[str, Any]]] = {}
+_MAX_DAILY_CACHE = 500
+
+
+def _record_daily_activation(activation_data: Dict[str, Any]) -> None:
+    """Cache a query activation under today's date for idle replay."""
+    day_key = time.strftime("%Y-%m-%d")
+    bucket = _daily_query_cache.setdefault(day_key, [])
+    bucket.append(activation_data)
+    while len(bucket) > _MAX_DAILY_CACHE:
+        bucket.pop(0)
+    # Drop previous days
+    for key in list(_daily_query_cache.keys()):
+        if key != day_key:
+            del _daily_query_cache[key]
 
 class QueryRequest(BaseModel):
     query: str = Field(
@@ -1529,7 +1551,59 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             # aquery_data returns the new format with status, message, data, and metadata
             if isinstance(response, dict):
-                return QueryDataResponse(**response)
+                result = QueryDataResponse(**response)
+
+                # Store query activation for 3D viewer real-time activation
+                if result.status == "success" and result.data:
+                    activation_data = {
+                        "timestamp": time.time(),
+                        "query": request.query,
+                        "entities": [],
+                        "relationships": [],
+                    }
+
+                    # Extract entity names from dict
+                    if "entities" in result.data and result.data["entities"]:
+                        activation_data["entities"] = [
+                            e.get("entity_name", str(e)) if isinstance(e, dict) else str(e)
+                            for e in result.data["entities"]
+                        ]
+
+                    # Extract relationship entity pairs from dict
+                    if "relationships" in result.data and result.data["relationships"]:
+                        activation_data["relationships"] = [
+                            {
+                                "src": r.get("src_id", str(r)) if isinstance(r, dict) else str(r),
+                                "tgt": r.get("tgt_id", str(r)) if isinstance(r, dict) else str(r),
+                            }
+                            for r in result.data["relationships"]
+                        ]
+
+                    _recent_query_activations.append(activation_data)
+
+                    # Cache under today's date for idle replay in the 3D viewer
+                    _record_daily_activation(activation_data)
+
+                    # Log the activation
+                    entity_count = len(activation_data["entities"])
+                    rel_count = len(activation_data["relationships"])
+                    logger.info(
+                        f"Query activation recorded: '{request.query}' "
+                        f"({entity_count} entities, {rel_count} relationships)"
+                    )
+
+                    # Clean up expired activations (older than TTL)
+                    current_time = time.time()
+                    _recent_query_activations[:] = [
+                        a for a in _recent_query_activations
+                        if current_time - a["timestamp"] < _ACTIVATION_TTL_SECONDS
+                    ]
+
+                    # Keep only the most recent activations
+                    while len(_recent_query_activations) > _MAX_ACTIVATIONS_TO_KEEP:
+                        _recent_query_activations.pop(0)
+
+                return result
             else:
                 # Handle unexpected response format
                 return QueryDataResponse(
@@ -1541,5 +1615,27 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)
             raise internal_server_error(e)
+
+    @router.get(
+        "/query/activations/daily_replay",
+        dependencies=[Depends(combined_auth)],
+        summary="Get a random cached query activation for idle replay",
+        description="Returns a random activation from today's query cache so the 3D viewer can replay activations when idle",
+        include_in_schema=False,
+    )
+    async def get_daily_replay():
+        """Return a random activation from today's cache for idle replay.
+
+        The 3D viewer polls this when no new query has arrived for a while and
+        replays the returned activation in a dimmed style. Pure read — replays
+        are never recorded back into the cache.
+        """
+        import random
+
+        day_key = time.strftime("%Y-%m-%d")
+        bucket = _daily_query_cache.get(day_key) or []
+        if not bucket:
+            return {"activation": None, "cached_count": 0}
+        return {"activation": random.choice(bucket), "cached_count": len(bucket)}
 
     return router

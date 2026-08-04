@@ -1,0 +1,2690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GK Brain Knowledge Graph · 3D Galaxy</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<style>
+  :root {
+    --color-bg: #050510;
+    --color-surface: rgba(15, 15, 35, 0.7);
+    --color-border: rgba(100, 120, 200, 0.2);
+    --color-text: #e0e0f0;
+    --color-text-muted: #8888aa;
+    --color-accent: #4a9eff;
+    --color-accent-glow: rgba(74, 158, 255, 0.4);
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-mono: 'SF Mono', Monaco, Consolas, monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font-sans);
+    background: var(--color-bg);
+    color: var(--color-text);
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  #canvas-container {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 1;
+  }
+
+  .ui-overlay {
+    position: absolute;
+    z-index: 10;
+    pointer-events: none;
+  }
+
+  .ui-overlay > * {
+    pointer-events: auto;
+  }
+
+  .top-bar {
+    top: 0; left: 0; right: 0;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: linear-gradient(to bottom, rgba(5, 5, 16, 0.8), transparent);
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+
+  .logo-icon {
+    width: 32px; height: 32px;
+    background: linear-gradient(135deg, var(--color-accent), #a855f7);
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+  }
+
+  .stats {
+    display: flex;
+    gap: 24px;
+    font-size: 13px;
+    color: var(--color-text-muted);
+  }
+
+  .stat-value {
+    color: var(--color-accent);
+    font-weight: 600;
+    font-family: var(--font-mono);
+  }
+
+  .side-panel {
+    top: 80px; right: 24px;
+    width: 320px;
+    max-height: calc(100vh - 160px);
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 16px;
+    padding: 20px;
+    overflow-y: auto;
+    transition: transform 0.3s ease, opacity 0.3s ease;
+  }
+
+  .side-panel.hidden {
+    transform: translateX(360px);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .panel-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 12px;
+  }
+
+  .entity-name {
+    font-size: 20px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    color: var(--color-accent);
+  }
+
+  .entity-description {
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--color-text);
+    margin-bottom: 16px;
+  }
+
+  .entity-description .desc-segment {
+    position: relative;
+    padding-left: 14px;
+    margin-bottom: 6px;
+  }
+
+  .entity-description .desc-segment::before {
+    content: '•';
+    position: absolute;
+    left: 0;
+    color: var(--color-accent);
+    font-weight: 700;
+  }
+
+  .entity-description .desc-segment:last-child {
+    margin-bottom: 0;
+  }
+
+  .entity-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+  }
+
+  .bottom-bar {
+    bottom: 0; left: 0; right: 0;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    background: linear-gradient(to top, rgba(5, 5, 16, 0.8), transparent);
+  }
+
+  .control-btn {
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 10px 16px;
+    color: var(--color-text);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .control-btn:hover {
+    background: rgba(74, 158, 255, 0.1);
+    border-color: var(--color-accent);
+    transform: translateY(-2px);
+  }
+
+  .control-btn:active {
+    transform: translateY(0);
+  }
+
+  /* GK Charger mobile QR modal */
+  .gk-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(3, 3, 10, 0.7);
+    backdrop-filter: blur(6px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+  }
+
+  .gk-modal-overlay.hidden {
+    display: none;
+  }
+
+  .gk-modal {
+    position: relative;
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 16px;
+    padding: 32px 36px 28px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6), 0 0 40px var(--color-accent-glow);
+    animation: gk-modal-in 0.25s ease;
+  }
+
+  @keyframes gk-modal-in {
+    from { transform: translateY(12px) scale(0.97); opacity: 0; }
+    to { transform: translateY(0) scale(1); opacity: 1; }
+  }
+
+  .gk-modal-title {
+    color: var(--color-text);
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+
+  .gk-modal-qr {
+    width: 260px;
+    height: 260px;
+    border-radius: 12px;
+    background: #fff;
+    padding: 8px;
+    box-sizing: border-box;
+  }
+
+  .gk-modal-hint {
+    color: var(--color-text-muted);
+    font-size: 12px;
+  }
+
+  .gk-modal-close {
+    position: absolute;
+    top: 10px;
+    right: 14px;
+    background: none;
+    border: none;
+    color: var(--color-text);
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.6;
+    transition: opacity 0.2s ease;
+  }
+
+  .gk-modal-close:hover {
+    opacity: 1;
+  }
+
+  .loading-overlay {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: var(--color-bg);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    transition: opacity 0.5s ease;
+  }
+
+  .loading-overlay.hidden {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .loading-spinner {
+    width: 60px; height: 60px;
+    border: 3px solid rgba(74, 158, 255, 0.2);
+    border-top-color: var(--color-accent);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+
+  .loading-text {
+    margin-top: 20px;
+    font-size: 16px;
+    color: var(--color-text-muted);
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .tooltip {
+    position: absolute;
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    z-index: 20;
+    max-width: 300px;
+  }
+
+  .tooltip.visible {
+    opacity: 1;
+  }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(100, 120, 200, 0.3);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(100, 120, 200, 0.5);
+  }
+
+  .query-panel {
+    top: 80px;
+    left: 24px;
+    display: flex;
+    gap: 8px;
+    z-index: 10;
+  }
+
+  .query-panel input {
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 10px 16px;
+    color: var(--color-text);
+    font-size: 14px;
+    width: 350px;
+    outline: none;
+    transition: all 0.2s ease;
+  }
+
+  .query-panel input:focus {
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 3px var(--color-accent-glow);
+  }
+
+  .query-panel input::placeholder {
+    color: var(--color-text-muted);
+  }
+
+  .query-panel button {
+    background: linear-gradient(135deg, var(--color-accent), #a855f7);
+    border: none;
+    border-radius: 12px;
+    padding: 10px 20px;
+    color: white;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+
+  .query-panel button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px var(--color-accent-glow);
+  }
+
+  .query-panel button:active {
+    transform: translateY(0);
+  }
+
+  .activation-log {
+    top: 136px;
+    left: 24px;
+    width: calc(350px + 8px + 80px); /* match query-panel width: input + gap + button */
+    max-height: calc(100vh - 220px);
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    z-index: 10;
+  }
+
+  .log-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--color-border);
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--color-text);
+  }
+
+  .log-close {
+    background: none;
+    border: none;
+    color: var(--color-text-muted);
+    font-size: 20px;
+    cursor: pointer;
+    padding: 0;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    transition: all 0.2s ease;
+  }
+
+  .log-close:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--color-text);
+  }
+
+  .log-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+  }
+
+  .log-entry {
+    padding: 8px;
+    margin-bottom: 8px;
+    border-radius: 6px;
+    border-left: 3px solid;
+    line-height: 1.5;
+  }
+
+  .log-entry:last-child {
+    margin-bottom: 0;
+  }
+
+  .log-info {
+    background: rgba(74, 158, 255, 0.1);
+    border-left-color: var(--color-accent);
+    color: var(--color-text);
+  }
+
+  .log-success {
+    background: rgba(16, 185, 129, 0.1);
+    border-left-color: #10b981;
+    color: var(--color-text);
+  }
+
+  .log-warning {
+    background: rgba(245, 158, 11, 0.1);
+    border-left-color: #f59e0b;
+    color: var(--color-text);
+  }
+
+  .log-error {
+    background: rgba(239, 68, 68, 0.1);
+    border-left-color: #ef4444;
+    color: var(--color-text);
+  }
+
+  .log-timestamp {
+    color: var(--color-text-muted);
+    font-size: 10px;
+    display: block;
+    margin-bottom: 4px;
+  }
+
+  .log-entities {
+    margin-top: 6px;
+    padding-left: 8px;
+    color: var(--color-text-muted);
+    font-size: 11px;
+  }
+
+  .log-entities span {
+    display: inline-block;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 2px 6px;
+    margin: 2px 2px;
+    border-radius: 3px;
+    font-size: 10px;
+  }
+  .log-edge-info {
+    background: rgba(168, 85, 247, 0.1);
+    border-left-color: #a855f7;
+    color: var(--color-text);
+    font-size: 10px;
+    font-style: italic;
+  }
+
+  /* Insights Panel */
+  .insights-panel {
+    top: 80px;
+    right: 24px;
+    width: 420px;
+    max-height: calc(100vh - 200px);
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 16px;
+    padding: 20px;
+    overflow-y: auto;
+    transition: all 0.3s ease;
+  }
+
+  .insights-panel.hidden {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(20px);
+  }
+
+  .insights-title {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 16px;
+    background: linear-gradient(135deg, #4a9eff, #a855f7);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .insight-card {
+    background: rgba(74, 158, 255, 0.05);
+    border: 1px solid rgba(74, 158, 255, 0.15);
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 12px;
+    transition: all 0.2s ease;
+  }
+
+  .insight-card:hover {
+    background: rgba(74, 158, 255, 0.08);
+    border-color: rgba(74, 158, 255, 0.25);
+  }
+
+  .insight-icon {
+    font-size: 24px;
+    margin-bottom: 8px;
+  }
+
+  .insight-header {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--color-text);
+    margin-bottom: 6px;
+  }
+
+  .insight-description {
+    font-size: 13px;
+    color: var(--color-text-muted);
+    line-height: 1.5;
+  }
+
+  .insight-description .desc-segment,
+  .use-case-description .desc-segment,
+  .top-entity-desc .desc-segment {
+    position: relative;
+    padding-left: 12px;
+    margin-bottom: 4px;
+  }
+
+  .insight-description .desc-segment::before,
+  .use-case-description .desc-segment::before,
+  .top-entity-desc .desc-segment::before {
+    content: '•';
+    position: absolute;
+    left: 0;
+    color: var(--color-accent);
+    font-weight: 700;
+  }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+
+  .stat-card {
+    background: rgba(168, 85, 247, 0.08);
+    border: 1px solid rgba(168, 85, 247, 0.2);
+    border-radius: 10px;
+    padding: 12px;
+    text-align: center;
+  }
+
+  .stat-card-value {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--color-accent);
+    margin-bottom: 4px;
+  }
+
+  .stat-card-label {
+    font-size: 11px;
+    color: var(--color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .use-case-card {
+    background: rgba(34, 197, 94, 0.05);
+    border: 1px solid rgba(34, 197, 94, 0.2);
+    border-radius: 10px;
+    padding: 12px;
+    margin-bottom: 10px;
+  }
+
+  .use-case-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: #22c55e;
+    margin-bottom: 6px;
+  }
+
+  .use-case-description {
+    font-size: 12px;
+    color: var(--color-text-muted);
+    line-height: 1.4;
+    margin-bottom: 6px;
+  }
+
+  .use-case-example {
+    font-size: 11px;
+    color: var(--color-text-muted);
+    font-style: italic;
+    padding-left: 10px;
+    border-left: 2px solid rgba(34, 197, 94, 0.3);
+  }
+
+  .cluster-legend {
+    margin-top: 20px;
+    padding-top: 16px;
+    border-top: 1px solid var(--color-border);
+  }
+
+  .cluster-legend-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--color-text);
+    margin-bottom: 12px;
+  }
+
+  .cluster-legend .cluster-label {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--color-accent);
+    margin-bottom: 10px;
+  }
+
+  .cluster-legend .cluster-stats {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+
+  .cluster-legend .cluster-stat {
+    flex: 1;
+    background: rgba(74, 158, 255, 0.08);
+    border-radius: 6px;
+    padding: 8px;
+    text-align: center;
+  }
+
+  .cluster-legend .cluster-stat-value {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--color-accent);
+  }
+
+  .cluster-legend .cluster-stat-label {
+    font-size: 9px;
+    color: var(--color-text-muted);
+    text-transform: uppercase;
+  }
+
+  .cluster-legend .top-entities-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--color-text-muted);
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .cluster-legend .top-entity {
+    background: rgba(74, 158, 255, 0.05);
+    border-left: 2px solid var(--color-accent);
+    padding: 8px;
+    margin-bottom: 6px;
+    border-radius: 4px;
+  }
+
+  .cluster-legend .top-entity-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-text);
+    margin-bottom: 3px;
+  }
+
+  .cluster-legend .top-entity-desc {
+    font-size: 10px;
+    color: var(--color-text-muted);
+    line-height: 1.3;
+  }
+  .brightness-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 10px 16px;
+    color: var(--color-text);
+    font-size: 14px;
+    backdrop-filter: blur(10px);
+    cursor: default;
+    transition: border-color 0.3s ease;
+  }
+
+  .brightness-control:hover {
+    border-color: var(--color-accent);
+  }
+
+  .brightness-control input[type="range"] {
+    width: 110px;
+    accent-color: var(--color-accent);
+    cursor: pointer;
+  }
+
+  .conn-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 6px;
+  }
+
+  .conn-chip {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 10px;
+    padding: 3px 9px;
+    font-size: 11px;
+    color: var(--color-text);
+    cursor: pointer;
+    transition: border-color 0.2s ease, color 0.2s ease;
+  }
+
+  .conn-chip:hover {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+  }
+
+  .conn-chip.disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  .conn-chip.disabled:hover {
+    border-color: var(--color-border);
+    color: var(--color-text);
+  }
+
+  .relationship-view {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--color-border);
+  }
+
+  .relationship-view.hidden {
+    display: none;
+  }
+
+  .relationship-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+  }
+
+  .rel-entity-link {
+    color: var(--color-accent);
+    cursor: pointer;
+    font-weight: 600;
+  }
+
+  .rel-entity-link:hover {
+    text-decoration: underline;
+  }
+
+  .rel-desc {
+    font-size: 11px;
+    color: var(--color-text-muted);
+    line-height: 1.4;
+    margin-top: 6px;
+  }
+
+  .rel-keywords {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 6px;
+  }
+
+  .rel-keyword {
+    background: rgba(74, 158, 255, 0.1);
+    border-radius: 8px;
+    padding: 2px 7px;
+    font-size: 10px;
+    color: var(--color-accent);
+  }
+
+  .rel-weight {
+    font-size: 10px;
+    color: var(--color-text-muted);
+    margin-top: 6px;
+  }
+
+  .panel-back {
+    background: none;
+    border: none;
+    color: var(--color-accent);
+    font-size: 12px;
+    cursor: pointer;
+    padding: 0;
+    margin-bottom: 8px;
+    display: none;
+  }
+
+  .panel-back:hover {
+    text-decoration: underline;
+  }
+
+  #entity-cluster {
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 0 3px;
+    transition: background 0.2s ease, color 0.2s ease;
+  }
+
+  #entity-cluster:hover {
+    background: rgba(74, 158, 255, 0.15);
+    color: var(--color-accent);
+  }
+</style>
+</head>
+<body>
+
+<div id="canvas-container"></div>
+
+<div class="ui-overlay top-bar">
+  <div class="logo">
+    <div class="logo-icon">⚡</div>
+    <span>GK Brain Knowledge Graph</span>
+  </div>
+  <div class="stats">
+    <div>Entities: <span class="stat-value" id="stat-entities">—</span></div>
+    <div>Edges: <span class="stat-value" id="stat-edges">—</span></div>
+    <div>Clusters: <span class="stat-value" id="stat-clusters">—</span></div>
+  </div>
+</div>
+
+<div class="ui-overlay side-panel hidden" id="side-panel">
+  <div class="panel-title">Entity Details</div>
+  <button class="panel-back" id="panel-back">← Back</button>
+  <div class="entity-name" id="entity-name">—</div>
+  <div class="entity-description" id="entity-description">—</div>
+  <div class="entity-meta">
+    <div>Cluster: <span id="entity-cluster" title="Hover to highlight this cluster in the graph">—</span></div>
+    <div>Position: <span id="entity-position">—</span></div>
+    <div>Connections: <span id="entity-connections">—</span></div>
+  </div>
+  <div class="conn-chips" id="entity-conn-chips"></div>
+
+  <!-- Relationship drill-down view (populated on connection-chip click) -->
+  <div class="relationship-view hidden" id="relationship-view"></div>
+
+  <!-- Cluster Information Legend -->
+  <div class="cluster-legend" id="cluster-legend">
+    <div class="cluster-legend-title">📊 Cluster Information</div>
+    <div class="cluster-label" id="cluster-label">Select an entity to view cluster info</div>
+    <div class="cluster-stats" id="cluster-stats"></div>
+    <div class="top-entities-title">Key Entities</div>
+    <div id="cluster-entities"></div>
+  </div>
+</div>
+
+<div class="ui-overlay bottom-bar">
+  <button class="control-btn" id="btn-insights">
+    <span>💡</span> Insights
+  </button>
+  <button class="control-btn" id="btn-reset-camera">
+    <span>⟲</span> Reset View
+  </button>
+  <button class="control-btn" id="btn-toggle-edges">
+    <span>⋯</span> Toggle Edges
+  </button>
+  <button class="control-btn" id="btn-toggle-labels">
+    <span>Aa</span> Toggle Labels
+  </button>
+  <button class="control-btn" id="btn-auto-rotate">
+    <span>🔄</span> Auto Rotate
+  </button>
+  <button class="control-btn" id="btn-entity-details">
+    <span>ℹ️</span> Entity Details
+  </button>
+  <button class="control-btn" id="btn-query-log">
+    <span>🔍</span> Query Log
+  </button>
+  <button class="control-btn" id="btn-gk-mobile">
+    <span>📱</span> GK充电宝移动端
+  </button>
+  <div class="brightness-control" title="Node brightness">
+    <span>🔆</span>
+    <input type="range" id="brightness-slider" min="0.2" max="2.0" step="0.05" value="1.0">
+  </div>
+</div>
+
+<div class="gk-modal-overlay hidden" id="gk-modal-overlay">
+  <div class="gk-modal">
+    <button class="gk-modal-close" id="gk-modal-close">×</button>
+    <div class="gk-modal-title">使用GK充电宝移动端提问</div>
+    <img class="gk-modal-qr" src="__API_BASE__/graph3d/gkcharger_qrcode.jpg" alt="GK Charger mobile WeChat QR code" />
+    <div class="gk-modal-hint">微信扫一扫，打开小程序提问</div>
+  </div>
+</div>
+
+<div class="ui-overlay query-panel" id="query-panel">
+  <input type="text" id="query-input" placeholder="Enter query to activate neurons..." />
+  <button id="query-submit">Query</button>
+</div>
+
+<div class="ui-overlay activation-log" id="activation-log">
+  <div class="log-header">
+    <span>🔍 Query Log</span>
+    <button class="log-close" id="log-close">×</button>
+  </div>
+  <div class="log-content" id="log-content">
+    <div class="log-entry log-info">Ready to query. Enter a search term above.</div>
+  </div>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<div class="ui-overlay insights-panel hidden" id="insights-panel">
+  <div class="insights-title">🔬 Research Insights</div>
+  <div class="stats-grid" id="insights-stats"></div>
+  <div id="insights-content"></div>
+  <div class="insights-title" style="margin-top: 20px; font-size: 16px;">📚 Research Use Cases</div>
+  <div id="use-cases-content"></div>
+</div>
+
+<div class="loading-overlay" id="loading">
+  <div class="loading-spinner"></div>
+  <div class="loading-text">Loading knowledge graph...</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+const API_BASE = '__API_BASE__';
+const BINARY_URL = `${API_BASE}/graph3d/layout.bin`;
+const META_URL = `${API_BASE}/graph3d/layout_meta.json`;
+const ACTIVATIONS_URL = `${API_BASE}/query/activations`;
+
+const POINT_SIZE = 0.012;
+const SPHERE_SEGMENTS_W = 48;
+const SPHERE_SEGMENTS_H = 32;
+
+// Cluster color palette (10 distinct colors)
+const CLUSTER_COLORS = [
+  0x2a5a9f, 0x6835a7, 0x0a7951, 0x956e0b, 0x8f2424,
+  0x047684, 0x5b3c96, 0x547c0e, 0x99550e, 0x942c5f
+];
+
+let scene, camera, renderer, composer, controls;
+let bloomPass = null;
+let pointsMesh, edgesMesh;
+let entityData = null;
+let edgeData = null;
+let hoveredEntity = -1;
+let selectedEntity = -1;
+let showEdges = false;
+let showLabels = false;
+
+// Node brightness (slider-controlled, persisted in localStorage)
+const BLOOM_STRENGTH_BASE = 0.6; // UnrealBloomPass strength at brightness 1.0
+let brightnessFactor = parseFloat(localStorage.getItem('graph3d_brightness')) || 1.0;
+
+// Neuron activation state
+let entityNameToIndex = new Map();
+let activationAnimation = null;
+
+// Multi-activation system: track multiple coexisting activation groups
+const MAX_CONCURRENT_ACTIVATIONS = 6;
+
+// Cluster lookup (built in createPoints): clusterId -> array of entity indices
+const clusterToIndices = new Map();
+
+// Persistent highlight layer: survives pulse()'s per-frame base-color reset.
+// Entries are re-applied every frame while activations run (pulse() calls
+// applyHighlightsToArrays), and applied directly when no loop is active.
+// idx -> { color: THREE.Color, sizeBoost: number, source: string, startTime: number }
+const persistentHighlights = new Map();
+const HIGHLIGHT_SETTLE_MS = 1500; // clicked-node pulse-then-settle duration
+const HIGHLIGHT_SETTLED_BOOST = 1.4; // settled size multiplier for clicked node
+let highlightAnimFrame = null;
+
+function setHighlight(indices, color, sizeBoost = 2.0, source = 'click') {
+  for (const idx of indices) {
+    persistentHighlights.set(idx, { color, sizeBoost, source, startTime: Date.now() });
+  }
+  applyPersistentHighlights();
+}
+
+function clearHighlights(source = null) {
+  if (source === null) {
+    persistentHighlights.clear();
+  } else {
+    for (const [idx, h] of persistentHighlights) {
+      if (h.source === source) persistentHighlights.delete(idx);
+    }
+  }
+  applyPersistentHighlights();
+}
+
+// Write highlight colors/sizes into attribute arrays. Caller handles needsUpdate.
+// Returns true while any clicked-node highlight is still settling (needs another frame).
+function applyHighlightsToArrays(colors, sizes) {
+  const now = Date.now();
+  let settling = false;
+  for (const [idx, h] of persistentHighlights) {
+    let boost = h.sizeBoost;
+    if (h.source === 'click') {
+      const t = Math.min((now - h.startTime) / HIGHLIGHT_SETTLE_MS, 1);
+      boost = HIGHLIGHT_SETTLED_BOOST + (h.sizeBoost - HIGHLIGHT_SETTLED_BOOST) * (1 - t);
+      if (t < 1) settling = true;
+    }
+    colors[idx * 3] = h.color.r;
+    colors[idx * 3 + 1] = h.color.g;
+    colors[idx * 3 + 2] = h.color.b;
+    sizes[idx] = POINT_SIZE * boost;
+  }
+  return settling;
+}
+
+function applyPersistentHighlights() {
+  if (!pointsMesh || !entityData) return;
+  const colors = pointsMesh.geometry.attributes.color.array;
+  const sizes = pointsMesh.geometry.attributes.size.array;
+  if (activationGroups.length === 0) {
+    // No pulse loop rewriting colors each frame — restore base state first so
+    // cleared highlights revert immediately.
+    for (let idx = 0; idx < entityData.length; idx++) {
+      const baseColor = getBaseColor(idx);
+      colors[idx * 3] = baseColor.r;
+      colors[idx * 3 + 1] = baseColor.g;
+      colors[idx * 3 + 2] = baseColor.b;
+      sizes[idx] = POINT_SIZE;
+    }
+  }
+  const settling = applyHighlightsToArrays(colors, sizes);
+  pointsMesh.geometry.attributes.color.needsUpdate = true;
+  pointsMesh.geometry.attributes.size.needsUpdate = true;
+  // Keep animating the settle while no activation loop is running
+  if (settling && !highlightAnimFrame && !activationAnimation) {
+    highlightAnimFrame = requestAnimationFrame(() => {
+      highlightAnimFrame = null;
+      applyPersistentHighlights();
+    });
+  }
+}
+
+// Base point color for an entity (cluster color scaled by brightness)
+function getBaseColor(idx) {
+  return new THREE.Color(CLUSTER_COLORS[entityData[idx].cluster % CLUSTER_COLORS.length])
+    .multiplyScalar(brightnessFactor);
+}
+
+// Apply the current brightness to the scene. While activations run, pulse()'s
+// per-frame reset picks up brightnessFactor automatically — this handles the
+// idle case via applyPersistentHighlights(), which rewrites base colors.
+function applyBrightness() {
+  if (bloomPass) {
+    bloomPass.strength = BLOOM_STRENGTH_BASE * brightnessFactor;
+  }
+  if (!pointsMesh || !entityData) return;
+  if (activationGroups.length > 0) return; // next pulse() frame applies it
+  applyPersistentHighlights();
+}
+
+// Format a description that may contain <SEP> tokens into styled HTML.
+// Splits on <SEP>, trims, deduplicates, and wraps each segment as a bullet.
+function formatDescription(text) {
+  if (!text) return '';
+  if (!text.includes('<SEP>')) return text;
+
+  const segments = text
+    .split(/<SEP>/i)
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+
+  // Deduplicate exact matches (preserve order)
+  const seen = new Set();
+  const unique = [];
+  for (const seg of segments) {
+    const key = seg.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(seg);
+    }
+  }
+
+  if (unique.length === 1) return unique[0];
+
+  return unique.map(s => `<div class="desc-segment">${s}</div>`).join('');
+}
+const ACTIVATION_FADE_DURATION = 60000; // 60 seconds before fade starts
+const ACTIVATION_FADE_OUT_TIME = 5000; // 5 seconds to fade out completely
+
+let activationGroups = []; // Array of activation group objects
+// Each group: {
+//   id: unique identifier,
+//   color: THREE.Color,
+//   timestamp: creation time (Date.now()),
+//   indices: Set of entity indices,
+//   edgeData: array of [srcIdx, tgtIdx] pairs,
+//   spheres: array of sphere meshes,
+//   edgesMesh: LineSegments mesh,
+//   particles: Points mesh for traffic lines,
+//   trafficData: traffic line animation data
+// }
+
+// Real-time polling for query activations
+let lastActivationTimestamp = Date.now() / 1000; // Initialize to current time to only get NEW activations
+let pollingInterval = null;
+const POLL_INTERVAL_MS = 2000; // Poll every 2 seconds
+
+// Queue system for sequential activation processing
+let activationQueue = [];
+let isProcessingQueue = false;
+const ACTIVATION_DISPLAY_DURATION = 4000; // How long each activation stays visible
+const QUEUE_PROCESSING_DELAY = 500; // Delay between processing queued activations
+
+// Idle replay: when no real query activity for IDLE_REPLAY_DELAY_MS, replay a
+// random activation from today's server-side cache in a dimmed style.
+let lastQueryActivityAt = Date.now();
+const IDLE_REPLAY_DELAY_MS = 30000;
+const REPLAY_CHECK_INTERVAL_MS = 5000;
+const REPLAY_DIM_FACTOR = 0.45;
+
+// Logging functions
+function addLog(message, type = 'info', details = null) {
+  const logContent = document.getElementById('log-content');
+  const timestamp = new Date().toLocaleTimeString();
+
+  const entry = document.createElement('div');
+  entry.className = `log-entry log-${type}`;
+
+  let html = `<span class="log-timestamp">${timestamp}</span>${message}`;
+
+  if (details) {
+    html += `<div class="log-entities">${details}</div>`;
+  }
+
+  entry.innerHTML = html;
+  logContent.appendChild(entry);
+
+  // Auto-scroll to bottom
+  logContent.scrollTop = logContent.scrollHeight;
+
+  // Keep only last 50 entries
+  while (logContent.children.length > 50) {
+    logContent.removeChild(logContent.firstChild);
+  }
+}
+
+function formatEntityList(entities, maxShow = 10) {
+  const shown = entities.slice(0, maxShow);
+  let html = shown.map(e => `<span>${e}</span>`).join('');
+  if (entities.length > maxShow) {
+    html += `<span>+${entities.length - maxShow} more</span>`;
+  }
+  return html;
+}
+
+async function loadData() {
+  try {
+    // Load metadata
+    const metaResp = await fetch(META_URL);
+    if (!metaResp.ok) throw new Error('Failed to load metadata');
+    const meta = await metaResp.json();
+
+    entityData = meta.entities;
+    edgeData = meta.edges;
+
+    document.getElementById('stat-entities').textContent = meta.entity_count.toLocaleString();
+    document.getElementById('stat-edges').textContent = meta.edge_count.toLocaleString();
+    document.getElementById('stat-clusters').textContent = meta.cluster_count.toLocaleString();
+
+    // Load binary layout
+    const binResp = await fetch(BINARY_URL);
+    if (!binResp.ok) throw new Error('Failed to load binary layout');
+    const binBuffer = await binResp.arrayBuffer();
+
+    // Parse binary format
+    const positions = new Float32Array(binBuffer, 0, meta.entity_count * 3);
+    const clusters = new Uint16Array(binBuffer, meta.entity_count * 3 * 4, meta.entity_count);
+
+    // Update entity data with positions
+    for (let i = 0; i < meta.entity_count; i++) {
+      entityData[i].x = positions[i * 3];
+      entityData[i].y = positions[i * 3 + 1];
+      entityData[i].z = positions[i * 3 + 2];
+      entityData[i].cluster = clusters[i];
+    }
+
+    return true;
+  } catch (err) {
+    console.error('Failed to load data:', err);
+    return false;
+  }
+}
+
+function initScene() {
+  const container = document.getElementById('canvas-container');
+  const width = container.clientWidth;
+  const height = container.clientHeight;
+
+  // Scene
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x050510);
+
+  // Camera
+  camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 2000);
+  camera.position.set(5, 5, 5);
+
+  // Renderer
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setSize(width, height);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.25;
+  container.appendChild(renderer.domElement);
+
+  // Post-processing
+  composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+
+  bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(width, height),
+    BLOOM_STRENGTH_BASE * brightnessFactor,  // strength (reduced for better activation visibility)
+    0.4,  // radius
+    0.3   // threshold (increased so only activated entities glow brightly)
+  );
+  composer.addPass(bloomPass);
+
+  // Controls
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.05;
+  controls.rotateSpeed = 0.5;
+  controls.zoomSpeed = 1.2;
+  controls.autoRotate = true;  // Enable gentle auto-rotation by default
+  controls.autoRotateSpeed = 0.45;
+
+  // Resize handler
+  window.addEventListener('resize', () => {
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    renderer.setSize(w, h);
+    composer.setSize(w, h);
+  });
+}
+
+function createPoints() {
+  if (!entityData) return;
+
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(entityData.length * 3);
+  const colors = new Float32Array(entityData.length * 3);
+  const sizes = new Float32Array(entityData.length);
+
+  for (let i = 0; i < entityData.length; i++) {
+    const entity = entityData[i];
+    positions[i * 3] = entity.x;
+    positions[i * 3 + 1] = entity.y;
+    positions[i * 3 + 2] = entity.z;
+
+    const color = getBaseColor(i);
+    colors[i * 3] = color.r;
+    colors[i * 3 + 1] = color.g;
+    colors[i * 3 + 2] = color.b;
+
+    sizes[i] = POINT_SIZE;
+
+    // Build name-to-index map
+    entityNameToIndex.set(entity.name, i);
+
+    // Build cluster-to-indices map
+    if (!clusterToIndices.has(entity.cluster)) {
+      clusterToIndices.set(entity.cluster, []);
+    }
+    clusterToIndices.get(entity.cluster).push(i);
+  }
+
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+  const material = new THREE.PointsMaterial({
+    size: POINT_SIZE,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.4,
+    sizeAttenuation: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+
+  pointsMesh = new THREE.Points(geometry, material);
+  scene.add(pointsMesh);
+}
+
+// Neuron activation functions - Neural Pulse Effect
+// Color palette for differentiating queries
+const ACTIVATION_COLORS = [
+  new THREE.Color(0x00ffff), // Cyan
+  new THREE.Color(0xff00ff), // Magenta
+  new THREE.Color(0xffff00), // Yellow
+  new THREE.Color(0x00ff00), // Lime green
+  new THREE.Color(0xff8800), // Orange
+  new THREE.Color(0xff0088), // Pink
+  new THREE.Color(0x8800ff), // Purple
+  new THREE.Color(0xff0000), // Red
+  new THREE.Color(0x0088ff), // Blue
+  new THREE.Color(0x00ff88), // Mint
+];
+const ACTIVATION_COLOR_NAMES = [
+  'Cyan', 'Magenta', 'Yellow', 'Lime', 'Orange',
+  'Pink', 'Purple', 'Red', 'Blue', 'Mint'
+];
+let activationColorIndex = 0;
+
+function activateEntities(entityNames, duration = 3000, dimFactor = 1.0) {
+  if (!pointsMesh || !entityData) return;
+
+  // Keep original edges hidden during activation
+  if (edgesMesh) {
+    edgesMesh.visible = false;
+  }
+
+  // Find entity indices
+  const indices = new Set();
+  const notFound = [];
+  for (const name of entityNames) {
+    const idx = entityNameToIndex.get(name);
+    if (idx !== undefined) {
+      indices.add(idx);
+    } else {
+      notFound.push(name);
+    }
+  }
+
+  if (indices.size === 0) {
+    addLog(`⚠️ No entities found in point cloud. Try a different query.`, 'warning');
+    return;
+  }
+
+  if (notFound.length > 0) {
+    console.log(`Entities not found in point cloud: ${notFound.length}/${entityNames.length}`);
+  }
+
+  // Get the current activation color and increment for next time
+  const colorIdx = activationColorIndex % ACTIVATION_COLORS.length;
+  const ACTIVATION_COLOR = ACTIVATION_COLORS[colorIdx];
+  const ACTIVATION_COLOR_NAME = ACTIVATION_COLOR_NAMES[colorIdx];
+  activationColorIndex++;
+
+  // Create new activation group
+  const activationGroup = {
+    id: Date.now() + Math.random(), // Unique ID
+    color: ACTIVATION_COLOR,
+    timestamp: Date.now(),
+    indices: indices,
+    spheres: [],
+    edgesMesh: null,
+    particles: null,
+    trafficData: null,
+    startTime: Date.now(),
+    dimFactor: dimFactor // 1.0 = live query, < 1.0 = dimmed idle replay
+  };
+
+  // Create small glowing spheres for each activated entity (node-sized glow)
+  indices.forEach((idx) => {
+    const entity = entityData[idx];
+
+    // Create small sphere geometry (about node size)
+    const sphereGeometry = new THREE.SphereGeometry(POINT_SIZE * 1.5, 16, 16);
+    const sphereMaterial = new THREE.MeshBasicMaterial({
+      color: ACTIVATION_COLOR,
+      transparent: true,
+      opacity: 0.9,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+
+    const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+    sphere.position.set(entity.x, entity.y, entity.z);
+    sphere.userData = { baseOpacity: 0.9, startTime: Date.now(), activationGroupId: activationGroup.id };
+
+    scene.add(sphere);
+    activationGroup.spheres.push(sphere);
+  });
+
+  // Create activated edges with flowing particles
+  if (edgeData) {
+    const activatedPositions = [];
+    const activatedColors = [];
+    const edgeSegments = []; // Store edge data for particle flow
+
+    for (const [srcIdx, tgtIdx] of edgeData) {
+      if (srcIdx >= entityData.length || tgtIdx >= entityData.length) continue;
+
+      const srcActivated = indices.has(srcIdx);
+      const tgtActivated = indices.has(tgtIdx);
+
+      // Only include edges where BOTH endpoints are activated
+      if (srcActivated && tgtActivated) {
+        const src = entityData[srcIdx];
+        const tgt = entityData[tgtIdx];
+
+        activatedPositions.push(src.x, src.y, src.z);
+        activatedPositions.push(tgt.x, tgt.y, tgt.z);
+
+        // Use activation color with white blend for edges
+        const edgeColor = ACTIVATION_COLOR.clone().lerp(new THREE.Color(0xffffff), 0.3);
+        activatedColors.push(edgeColor.r, edgeColor.g, edgeColor.b);
+        activatedColors.push(edgeColor.r, edgeColor.g, edgeColor.b);
+
+        edgeSegments.push({ src: { x: src.x, y: src.y, z: src.z }, tgt: { x: tgt.x, y: tgt.y, z: tgt.z } });
+      }
+    }
+
+    if (activatedPositions.length > 0) {
+      const edgeGeometry = new THREE.BufferGeometry();
+      edgeGeometry.setAttribute('position', new THREE.Float32BufferAttribute(activatedPositions, 3));
+      edgeGeometry.setAttribute('color', new THREE.Float32BufferAttribute(activatedColors, 3));
+
+      const edgeMaterial = new THREE.LineBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.6,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        linewidth: 2
+      });
+
+      activationGroup.edgesMesh = new THREE.LineSegments(edgeGeometry, edgeMaterial);
+      scene.add(activationGroup.edgesMesh);
+
+      const edgeCount = activatedPositions.length / 6;
+      addLog(`🔗 Created <strong>${edgeCount}</strong> activated edges with traffic flow`, 'info');
+
+      // Create traffic lines along edges using the activation color
+      activationGroup.trafficData = createTrafficLines(edgeSegments, ACTIVATION_COLOR);
+      if (activationGroup.trafficData) {
+        activationGroup.particles = activationGroup.trafficData.particles;
+      }
+    }
+  }
+
+  // Add to activation groups
+  activationGroups.push(activationGroup);
+
+  // Remove oldest activations if exceeding max limit
+  while (activationGroups.length > MAX_CONCURRENT_ACTIVATIONS) {
+    const oldestGroup = activationGroups.shift();
+    removeActivationGroup(oldestGroup);
+  }
+
+  // Start the global animation loop if not already running
+  if (!activationAnimation) {
+    startActivationAnimation();
+  }
+
+  addLog(`✨ Neural Pulse activated for <strong>${indices.size}</strong> entities (${ACTIVATION_COLOR_NAME})`, 'success');
+}
+
+// Global animation loop for all activation groups
+function startActivationAnimation() {
+  const colors = pointsMesh.geometry.attributes.color.array;
+  const sizes = pointsMesh.geometry.attributes.size.array;
+
+  function pulse() {
+    const now = Date.now();
+    const groupsToRemove = [];
+
+    // Reset all points to original colors first
+    // (We'll re-apply activation colors for each group)
+    for (let idx = 0; idx < entityData.length; idx++) {
+      const baseColor = getBaseColor(idx);
+      colors[idx * 3] = baseColor.r;
+      colors[idx * 3 + 1] = baseColor.g;
+      colors[idx * 3 + 2] = baseColor.b;
+      sizes[idx] = POINT_SIZE;
+    }
+
+    // Re-apply persistent highlights (clicked node, hovered cluster, selected
+    // edge endpoints) so they survive the per-frame reset. Activation groups
+    // below may still brighten a highlighted node further.
+    applyHighlightsToArrays(colors, sizes);
+
+    // Process each activation group
+    for (const group of activationGroups) {
+      const age = now - group.timestamp;
+      let fadeFactor = 1.0;
+
+      // Calculate fade based on age
+      if (age > ACTIVATION_FADE_DURATION) {
+        // Start fading after 60 seconds
+        const fadeProgress = (age - ACTIVATION_FADE_DURATION) / ACTIVATION_FADE_OUT_TIME;
+        fadeFactor = Math.max(0, 1.0 - fadeProgress);
+
+        // If fully faded, mark for removal
+        if (fadeFactor <= 0) {
+          groupsToRemove.push(group);
+          continue;
+        }
+      }
+
+      // Pulse for first 2 seconds, then maintain subtle glow
+      const groupElapsed = now - group.startTime;
+      const pulseIntensity = groupElapsed < 2000
+        ? Math.sin((groupElapsed / 2000) * Math.PI * 4) * 0.5 + 0.5
+        : 1.0;
+
+      // Replays render dimmer: scale every fade-driven term by the group's dimFactor
+      const effectiveFade = fadeFactor * (group.dimFactor ?? 1);
+
+      // Apply activation color to entities
+      for (const idx of group.indices) {
+        const baseColor = getBaseColor(idx);
+        // Blend toward activation color-white with fade
+        const brightColor = baseColor.clone()
+          .lerp(group.color, 0.3 * effectiveFade)
+          .lerp(new THREE.Color(0xffffff), pulseIntensity * 0.5 * effectiveFade);
+        colors[idx * 3] = brightColor.r;
+        colors[idx * 3 + 1] = brightColor.g;
+        colors[idx * 3 + 2] = brightColor.b;
+        sizes[idx] = POINT_SIZE * (1 + pulseIntensity * 1.5 * effectiveFade);
+      }
+
+      // Propagate to neighbor entities with dimmer effect
+      if (edgeData) {
+        for (const [srcIdx, tgtIdx] of edgeData) {
+          const srcActivated = group.indices.has(srcIdx);
+          const tgtActivated = group.indices.has(tgtIdx);
+
+          if (srcActivated || tgtActivated) {
+            const neighborIdx = srcActivated ? tgtIdx : srcIdx;
+            if (!group.indices.has(neighborIdx)) {
+              const neighborColor = getBaseColor(neighborIdx);
+              const dimPulse = pulseIntensity * 0.3 * effectiveFade;
+              const dimColor = neighborColor.clone()
+                .lerp(group.color, 0.2 * effectiveFade)
+                .lerp(new THREE.Color(0xffffff), dimPulse);
+              colors[neighborIdx * 3] = dimColor.r;
+              colors[neighborIdx * 3 + 1] = dimColor.g;
+              colors[neighborIdx * 3 + 2] = dimColor.b;
+              sizes[neighborIdx] = POINT_SIZE * (1 + dimPulse * 1.0);
+            }
+          }
+        }
+      }
+
+      // Pulse the edges mesh
+      if (group.edgesMesh) {
+        group.edgesMesh.material.opacity = (0.3 + pulseIntensity * 0.3) * effectiveFade;
+      }
+
+      // Animate pulse spheres
+      if (group.spheres) {
+        group.spheres.forEach(sphere => {
+          const sphereElapsed = now - sphere.userData.startTime;
+          const pulse = Math.sin((sphereElapsed / 1000) * Math.PI * 2) * 0.3 + 0.7;
+          sphere.material.opacity = sphere.userData.baseOpacity * pulse * effectiveFade;
+          const scale = 1 + (pulse - 0.7) * 0.5 * effectiveFade;
+          sphere.scale.set(scale, scale, scale);
+        });
+      }
+
+      // Animate traffic lines
+      if (group.trafficData && group.particles) {
+        const linePositions = group.particles.geometry.attributes.position.array;
+        const edgeSegments = group.trafficData.edgeSegments;
+        const lineCount = group.trafficData.lineCount;
+        const LINE_LENGTH = 0.15;
+
+        for (let i = 0; i < lineCount; i++) {
+          const edgeIndex = i % edgeSegments.length;
+          const edge = edgeSegments[edgeIndex];
+          const progress = ((groupElapsed / 2500) + i / lineCount) % 1;
+
+          const startPos = progress;
+          const endPos = Math.min(progress + LINE_LENGTH, 1.0);
+
+          const startX = edge.src.x + (edge.tgt.x - edge.src.x) * startPos;
+          const startY = edge.src.y + (edge.tgt.y - edge.src.y) * startPos;
+          const startZ = edge.src.z + (edge.tgt.z - edge.src.z) * startPos;
+
+          const endX = edge.src.x + (edge.tgt.x - edge.src.x) * endPos;
+          const endY = edge.src.y + (edge.tgt.y - edge.src.y) * endPos;
+          const endZ = edge.src.z + (edge.tgt.z - edge.src.z) * endPos;
+
+          linePositions[i * 6] = startX;
+          linePositions[i * 6 + 1] = startY;
+          linePositions[i * 6 + 2] = startZ;
+          linePositions[i * 6 + 3] = endX;
+          linePositions[i * 6 + 4] = endY;
+          linePositions[i * 6 + 5] = endZ;
+        }
+
+        group.particles.geometry.attributes.position.needsUpdate = true;
+        group.particles.material.opacity = 0.9 * effectiveFade;
+      }
+    }
+
+    // Remove fully faded groups
+    for (const group of groupsToRemove) {
+      const index = activationGroups.indexOf(group);
+      if (index !== -1) {
+        activationGroups.splice(index, 1);
+        removeActivationGroup(group);
+      }
+    }
+
+    pointsMesh.geometry.attributes.color.needsUpdate = true;
+    pointsMesh.geometry.attributes.size.needsUpdate = true;
+
+    // Continue animation if there are active groups
+    if (activationGroups.length > 0) {
+      activationAnimation = requestAnimationFrame(pulse);
+    } else {
+      activationAnimation = null;
+      // Restore edges visibility based on user preference
+      if (edgesMesh) {
+        edgesMesh.visible = showEdges;
+      }
+    }
+  }
+
+  activationAnimation = requestAnimationFrame(pulse);
+}
+
+// Create traffic lines along edges (glowing lines with activation color)
+function createTrafficLines(edgeSegments, activationColor) {
+  const LINES_PER_EDGE = 2; // 2 traffic lines per edge
+  const LINE_LENGTH = 0.15; // Length of each traffic line segment
+  const totalLines = edgeSegments.length * LINES_PER_EDGE;
+
+  if (totalLines === 0) return;
+
+  const positions = new Float32Array(totalLines * 2 * 3); // 2 vertices per line
+  const colors = new Float32Array(totalLines * 2 * 3);
+
+  // Create lighter and darker variants of the activation color
+  const TRAFFIC_BRIGHT = activationColor.clone().lerp(new THREE.Color(0xffffff), 0.4);
+  const TRAFFIC_DIM = activationColor.clone().lerp(new THREE.Color(0xffffff), 0.1);
+
+  // Initialize traffic lines at random positions along edges
+  for (let i = 0; i < totalLines; i++) {
+    const edgeIndex = i % edgeSegments.length;
+    const edge = edgeSegments[edgeIndex];
+    const progress = Math.random();
+
+    // Calculate line start and end positions
+    const startPos = progress;
+    const endPos = Math.min(progress + LINE_LENGTH, 1.0);
+
+    const startX = edge.src.x + (edge.tgt.x - edge.src.x) * startPos;
+    const startY = edge.src.y + (edge.tgt.y - edge.src.y) * startPos;
+    const startZ = edge.src.z + (edge.tgt.z - edge.src.z) * startPos;
+
+    const endX = edge.src.x + (edge.tgt.x - edge.src.x) * endPos;
+    const endY = edge.src.y + (edge.tgt.y - edge.src.y) * endPos;
+    const endZ = edge.src.z + (edge.tgt.z - edge.src.z) * endPos;
+
+    // Start vertex
+    positions[i * 6] = startX;
+    positions[i * 6 + 1] = startY;
+    positions[i * 6 + 2] = startZ;
+
+    // End vertex
+    positions[i * 6 + 3] = endX;
+    positions[i * 6 + 4] = endY;
+    positions[i * 6 + 5] = endZ;
+
+    // Color: gradient from bright to dim variant of activation color
+    const color = TRAFFIC_DIM.clone().lerp(TRAFFIC_BRIGHT, Math.random());
+    colors[i * 6] = color.r;
+    colors[i * 6 + 1] = color.g;
+    colors[i * 6 + 2] = color.b;
+    colors[i * 6 + 3] = color.r;
+    colors[i * 6 + 4] = color.g;
+    colors[i * 6 + 5] = color.b;
+  }
+
+  const lineGeometry = new THREE.BufferGeometry();
+  lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  lineGeometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+  const lineMaterial = new THREE.LineBasicMaterial({
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.9,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    linewidth: 2
+  });
+
+  const particles = new THREE.LineSegments(lineGeometry, lineMaterial);
+  particles.userData.edgeSegments = edgeSegments;
+  particles.userData.lineCount = totalLines;
+  scene.add(particles);
+
+  // Return particles and data for storage in activation group
+  return {
+    particles: particles,
+    edgeSegments: edgeSegments,
+    lineCount: totalLines
+  };
+}
+
+// Helper function to remove an activation group and clean up its visual elements
+function removeActivationGroup(group) {
+  if (!group) return;
+
+  // Remove spheres
+  if (group.spheres) {
+    group.spheres.forEach(sphere => {
+      scene.remove(sphere);
+      sphere.geometry.dispose();
+      sphere.material.dispose();
+    });
+  }
+
+  // Remove edges mesh
+  if (group.edgesMesh) {
+    scene.remove(group.edgesMesh);
+    group.edgesMesh.geometry.dispose();
+    group.edgesMesh.material.dispose();
+  }
+
+  // Remove traffic particles
+  if (group.particles) {
+    scene.remove(group.particles);
+    group.particles.geometry.dispose();
+    group.particles.material.dispose();
+  }
+
+  console.log(`Removed activation group ${group.id} (age: ${((Date.now() - group.timestamp) / 1000).toFixed(1)}s)`);
+}
+
+async function queryAndActivate(queryText) {
+  addLog(`🔍 Querying: <strong>${queryText}</strong>`, 'info');
+
+  try {
+    const response = await fetch(`${API_BASE}/query/data`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        query: queryText,
+        mode: 'hybrid',
+        top_k: 20,
+        chunk_top_k: 10
+      })
+    });
+
+    if (!response.ok) {
+      addLog(`❌ Query failed: ${response.statusText}`, 'error');
+      console.error('Query failed:', response.statusText);
+      return;
+    }
+
+    const result = await response.json();
+    if (result.status === 'success' && result.data) {
+      const entityNames = [];
+
+      // Collect entity names from results
+      if (result.data.entities) {
+        entityNames.push(...result.data.entities.map(e => e.entity_name));
+      }
+
+      // Collect entity names from relationships
+      if (result.data.relationships) {
+        for (const rel of result.data.relationships) {
+          entityNames.push(rel.src_id, rel.tgt_id);
+        }
+      }
+
+      // Remove duplicates
+      const uniqueEntities = [...new Set(entityNames)];
+
+      // Log the results
+      const entityCount = result.data.entities ? result.data.entities.length : 0;
+      const relCount = result.data.relationships ? result.data.relationships.length : 0;
+      addLog(
+        `✅ Found <strong>${entityCount}</strong> entities, <strong>${relCount}</strong> relationships`,
+        'success',
+        formatEntityList(uniqueEntities, 15)
+      );
+
+      // Add to queue instead of activating directly
+      activationQueue.push({
+        query: queryText,
+        entities: uniqueEntities,
+        entityCount: entityCount,
+        timestamp: Date.now() / 1000,
+        isManual: true
+      });
+
+      // Stamp activity so idle replay pauses
+      lastQueryActivityAt = Date.now();
+
+      // Advance the polling watermark so the same activation isn't
+      // re-fetched by pollForActivations() and processed a second time.
+      lastActivationTimestamp = Date.now() / 1000 + 1;
+
+      // Start processing queue if not already processing
+      if (!isProcessingQueue) {
+        processActivationQueue();
+      }
+    } else {
+      addLog(`⚠️ Query returned no results`, 'warning');
+    }
+  } catch (error) {
+    addLog(`❌ Query error: ${error.message}`, 'error');
+    console.error('Query error:', error);
+  }
+}
+
+function createEdges() {
+  if (!edgeData || !entityData) return;
+
+  const positions = [];
+  const colors = [];
+
+  for (const [srcIdx, tgtIdx] of edgeData) {
+    if (srcIdx >= entityData.length || tgtIdx >= entityData.length) continue;
+
+    const src = entityData[srcIdx];
+    const tgt = entityData[tgtIdx];
+
+    positions.push(src.x, src.y, src.z);
+    positions.push(tgt.x, tgt.y, tgt.z);
+
+    const color = new THREE.Color(CLUSTER_COLORS[src.cluster % CLUSTER_COLORS.length]);
+    colors.push(color.r, color.g, color.b);
+    colors.push(color.r, color.g, color.b);
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+  const material = new THREE.LineBasicMaterial({
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.15,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+
+  edgesMesh = new THREE.LineSegments(geometry, material);
+  edgesMesh.visible = showEdges; // Apply default visibility (false)
+  scene.add(edgesMesh);
+}
+
+function frameAll(padding = 0.8) {
+  if (!entityData || entityData.length === 0) return;
+
+  // Compute bounding box
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+  for (const entity of entityData) {
+    const x = entity.x, y = entity.y, z = entity.z;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  }
+
+  // Compute center and radius
+  const cx = (minX + maxX) * 0.5;
+  const cy = (minY + maxY) * 0.5;
+  const cz = (minZ + maxZ) * 0.5;
+  const sx = maxX - minX;
+  const sy = maxY - minY;
+  const sz = maxZ - minZ;
+  const radius = 0.5 * Math.sqrt(sx * sx + sy * sy + sz * sz) || 1e-3;
+
+  // Calculate camera distance based on FOV
+  const vFOV = THREE.MathUtils.degToRad(camera.fov);
+  const hFOV = 2 * Math.atan(Math.tan(vFOV * 0.5) * camera.aspect);
+  const fov = Math.min(vFOV, hFOV);
+  const dist = (radius / Math.sin(fov * 0.5)) * padding;
+
+  // Position camera
+  controls.target.set(cx, cy, cz);
+  camera.position.set(cx - dist, cy, cz);
+  camera.near = Math.max(0.01, dist / 100);
+  camera.far = dist * 60;
+  camera.updateProjectionMatrix();
+
+  // Set zoom limits
+  controls.minDistance = dist * 0.05;
+  controls.maxDistance = dist * 20;
+  controls.update();
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  composer.render();
+}
+
+function setupInteraction() {
+  const raycaster = new THREE.Raycaster();
+  raycaster.params.Points.threshold = POINT_SIZE * 2;
+  const mouse = new THREE.Vector2();
+  const tooltip = document.getElementById('tooltip');
+
+  renderer.domElement.addEventListener('mousemove', (event) => {
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(pointsMesh);
+
+    if (intersects.length > 0) {
+      const idx = intersects[0].index;
+      if (idx !== hoveredEntity) {
+        hoveredEntity = idx;
+        const entity = entityData[idx];
+        tooltip.textContent = entity.name;
+        tooltip.classList.add('visible');
+      }
+      tooltip.style.left = `${event.clientX + 12}px`;
+      tooltip.style.top = `${event.clientY + 12}px`;
+    } else {
+      hoveredEntity = -1;
+      tooltip.classList.remove('visible');
+    }
+  });
+
+  renderer.domElement.addEventListener('click', () => {
+    if (hoveredEntity >= 0) {
+      selectedEntity = hoveredEntity;
+      // Fresh graph click starts a new navigation path
+      panelHistory.length = 0;
+      updatePanelBack();
+      // Light up the clicked node (pulse-then-settle, source-tagged 'click')
+      clearHighlights('click');
+      setHighlight([selectedEntity], new THREE.Color(0xffffff), 2.5, 'click');
+      showEntityDetails(selectedEntity);
+    }
+  });
+}
+
+// Panel navigation history for relationship drill-down
+const panelHistory = [];
+let panelClusterId = null;
+let highlightEdgeMesh = null;
+
+function updatePanelBack() {
+  document.getElementById('panel-back').style.display =
+    panelHistory.length > 0 ? 'block' : 'none';
+}
+
+// Navigate to an entity from inside the panel (keeps back-history)
+function navigateToEntity(idx) {
+  if (idx == null || idx < 0) return;
+  if (selectedEntity >= 0 && selectedEntity !== idx) {
+    panelHistory.push(selectedEntity);
+  }
+  selectedEntity = idx;
+  clearHighlights('click');
+  setHighlight([idx], new THREE.Color(0xffffff), 2.5, 'click');
+  showEntityDetails(idx);
+  updatePanelBack();
+}
+
+// Bright single edge between two entities (relationship selection)
+function setHighlightEdge(srcIdx, tgtIdx) {
+  clearHighlightEdge();
+  const src = entityData[srcIdx];
+  const tgt = entityData[tgtIdx];
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(
+    [src.x, src.y, src.z, tgt.x, tgt.y, tgt.z], 3));
+  const material = new THREE.LineBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.9,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+  highlightEdgeMesh = new THREE.LineSegments(geometry, material);
+  scene.add(highlightEdgeMesh);
+}
+
+function clearHighlightEdge() {
+  if (highlightEdgeMesh) {
+    scene.remove(highlightEdgeMesh);
+    highlightEdgeMesh.geometry.dispose();
+    highlightEdgeMesh.material.dispose();
+    highlightEdgeMesh = null;
+  }
+}
+
+// Show relationship details between two entities in the side panel and
+// light both nodes plus the connecting edge in the 3D graph.
+async function showRelationship(fromName, toName) {
+  const relView = document.getElementById('relationship-view');
+  relView.classList.remove('hidden');
+  relView.innerHTML = '<div class="relationship-title">Relationship</div>' +
+    '<div class="rel-desc">Loading…</div>';
+
+  let edge;
+  try {
+    const r = await fetch(
+      `${API_BASE}/graph3d/edge_info?src=${encodeURIComponent(fromName)}&tgt=${encodeURIComponent(toName)}`
+    );
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.detail || r.statusText);
+    }
+    edge = await r.json();
+  } catch (err) {
+    relView.innerHTML = '<div class="relationship-title">Relationship</div>' +
+      `<div class="rel-desc">⚠️ ${err.message}</div>`;
+    return;
+  }
+
+  relView.innerHTML = '<div class="relationship-title">Relationship</div>';
+
+  // Entity pair as clickable links (built via DOM to avoid attribute injection)
+  const pairDiv = document.createElement('div');
+  const makeLink = (name) => {
+    const link = document.createElement('span');
+    link.className = 'rel-entity-link';
+    link.textContent = name;
+    link.addEventListener('click', () => {
+      const idx = entityNameToIndex.get(name);
+      if (idx !== undefined) navigateToEntity(idx);
+    });
+    return link;
+  };
+  pairDiv.appendChild(makeLink(fromName));
+  pairDiv.appendChild(document.createTextNode(' ↔ '));
+  pairDiv.appendChild(makeLink(toName));
+  relView.appendChild(pairDiv);
+
+  const descDiv = document.createElement('div');
+  descDiv.className = 'rel-desc';
+  descDiv.innerHTML = formatDescription(edge.description) || 'No description available.';
+  relView.appendChild(descDiv);
+
+  const keywords = (edge.keywords || '').split(',').map(k => k.trim()).filter(Boolean);
+  if (keywords.length) {
+    const kwDiv = document.createElement('div');
+    kwDiv.className = 'rel-keywords';
+    for (const kw of keywords) {
+      const tag = document.createElement('span');
+      tag.className = 'rel-keyword';
+      tag.textContent = kw;
+      kwDiv.appendChild(tag);
+    }
+    relView.appendChild(kwDiv);
+  }
+
+  const weightDiv = document.createElement('div');
+  weightDiv.className = 'rel-weight';
+  weightDiv.textContent = `Weight: ${Number(edge.weight || 0).toFixed(2)}`;
+  relView.appendChild(weightDiv);
+
+  // Light both nodes and the edge in the 3D graph
+  const srcIdx = entityNameToIndex.get(fromName);
+  const tgtIdx = entityNameToIndex.get(toName);
+  clearHighlights('edge');
+  clearHighlightEdge();
+  const lit = [];
+  if (srcIdx !== undefined) lit.push(srcIdx);
+  if (tgtIdx !== undefined) lit.push(tgtIdx);
+  if (lit.length) setHighlight(lit, new THREE.Color(0xffffff), 2.2, 'edge');
+  if (srcIdx !== undefined && tgtIdx !== undefined) {
+    setHighlightEdge(srcIdx, tgtIdx);
+  }
+}
+
+function showEntityDetails(idx) {
+  const panel = document.getElementById('side-panel');
+  const entity = entityData[idx];
+
+  document.getElementById('entity-name').textContent = entity.name;
+  const descEl = document.getElementById('entity-description');
+  const descHtml = formatDescription(entity.description);
+  if (descHtml) {
+    descEl.innerHTML = descHtml;
+  } else {
+    descEl.textContent = 'No description available.';
+  }
+  document.getElementById('entity-cluster').textContent = entity.cluster;
+  document.getElementById('entity-position').textContent =
+    `(${entity.x.toFixed(2)}, ${entity.y.toFixed(2)}, ${entity.z.toFixed(2)})`;
+
+  // Track cluster for hover-highlight (feature: hover cluster text lights cluster N)
+  panelClusterId = entity.cluster;
+
+  // Reset relationship drill-down state
+  const relView = document.getElementById('relationship-view');
+  relView.classList.add('hidden');
+  relView.innerHTML = '';
+  clearHighlights('edge');
+  clearHighlightEdge();
+
+  // Count connections
+  const connections = edgeData.filter(([s, t]) => s === idx || t === idx).length;
+  document.getElementById('entity-connections').textContent = connections;
+
+  // Clickable connection chips (sorted by relationship weight, capped by backend)
+  const chipsDiv = document.getElementById('entity-conn-chips');
+  chipsDiv.innerHTML = '';
+  fetch(`${API_BASE}/graph3d/entity_edges?name=${encodeURIComponent(entity.name)}`)
+    .then(r => (r.ok ? r.json() : null))
+    .then(data => {
+      // Ignore stale responses if the user already clicked another entity
+      if (selectedEntity !== idx) return;
+      chipsDiv.innerHTML = '';
+      const neighbors = data?.neighbors || [];
+      for (const neighbor of neighbors) {
+        const chip = document.createElement('span');
+        const neighborIdx = entityNameToIndex.get(neighbor.name);
+        const inLayout = neighborIdx !== undefined;
+        chip.className = inLayout ? 'conn-chip' : 'conn-chip disabled';
+        chip.textContent = neighbor.name;
+        chip.title = inLayout
+          ? `Weight ${Number(neighbor.weight || 0).toFixed(2)} — click to view relationship`
+          : 'Not in 3D layout';
+        if (inLayout) {
+          chip.addEventListener('click', () => showRelationship(entity.name, neighbor.name));
+        }
+        chipsDiv.appendChild(chip);
+      }
+    })
+    .catch(err => console.error('Error loading entity edges:', err));
+
+  panel.classList.remove('hidden');
+
+  // Show cluster info
+  if (clustersData) {
+    showClusterInfo(entity.cluster);
+  } else {
+    // Load clusters data if not available
+    fetch(`${API_BASE}/graph3d/clusters`)
+      .then(r => r.json())
+      .then(data => {
+        clustersData = data;
+        showClusterInfo(entity.cluster);
+      })
+      .catch(err => console.error('Error loading clusters:', err));
+  }
+}
+
+// UI controls
+document.getElementById('btn-reset-camera').addEventListener('click', () => {
+  frameAll();
+});
+
+document.getElementById('btn-toggle-edges').addEventListener('click', () => {
+  showEdges = !showEdges;
+  if (edgesMesh) edgesMesh.visible = showEdges;
+});
+
+document.getElementById('btn-toggle-labels').addEventListener('click', () => {
+  showLabels = !showLabels;
+  // TODO: Implement label rendering with CSS2DRenderer
+});
+
+// Query panel - submit button
+document.getElementById('query-submit').addEventListener('click', () => {
+  const queryInput = document.getElementById('query-input');
+  const queryText = queryInput.value.trim();
+  if (queryText) {
+    queryAndActivate(queryText);
+  }
+});
+
+// Query panel - enter key
+document.getElementById('query-input').addEventListener('keypress', (e) => {
+  if (e.key === 'Enter') {
+    const queryText = e.target.value.trim();
+    if (queryText) {
+      queryAndActivate(queryText);
+    }
+  }
+});
+
+// Auto-rotate toggle button
+document.getElementById('btn-auto-rotate').addEventListener('click', () => {
+  controls.autoRotate = !controls.autoRotate;
+  const btn = document.getElementById('btn-auto-rotate');
+  btn.style.opacity = controls.autoRotate ? '1' : '0.5';
+  addLog(
+    controls.autoRotate ? '🔄 Auto-rotate enabled' : '⏸️ Auto-rotate disabled',
+    'info'
+  );
+});
+
+// Brightness slider (persisted in localStorage)
+const brightnessSlider = document.getElementById('brightness-slider');
+brightnessSlider.value = brightnessFactor;
+brightnessSlider.addEventListener('input', () => {
+  brightnessFactor = parseFloat(brightnessSlider.value) || 1.0;
+  localStorage.setItem('graph3d_brightness', String(brightnessFactor));
+  applyBrightness();
+});
+
+// Entity Details toggle button
+document.getElementById('btn-entity-details').addEventListener('click', () => {
+  const panel = document.getElementById('side-panel');
+  panel.classList.toggle('hidden');
+  const btn = document.getElementById('btn-entity-details');
+  btn.style.opacity = panel.classList.contains('hidden') ? '0.5' : '1';
+  if (panel.classList.contains('hidden')) {
+    // Closing the panel clears all interactive highlights
+    clearHighlights('click');
+    clearHighlights('edge');
+    clearHighlights('cluster-hover');
+    clearHighlightEdge();
+  }
+});
+
+// Back button for relationship drill-down navigation
+document.getElementById('panel-back').addEventListener('click', () => {
+  const prev = panelHistory.pop();
+  if (prev != null) {
+    selectedEntity = prev;
+    clearHighlights('click');
+    setHighlight([prev], new THREE.Color(0xffffff), 2.5, 'click');
+    showEntityDetails(prev);
+  }
+  updatePanelBack();
+});
+
+// Hover the cluster label in the entity panel -> light up the whole cluster
+const clusterSpan = document.getElementById('entity-cluster');
+clusterSpan.addEventListener('mouseenter', () => {
+  if (panelClusterId == null) return;
+  const idxs = clusterToIndices.get(panelClusterId) || [];
+  const color = new THREE.Color(CLUSTER_COLORS[panelClusterId % CLUSTER_COLORS.length])
+    .lerp(new THREE.Color(0xffffff), 0.55);
+  setHighlight(idxs, color, 1.8, 'cluster-hover');
+});
+clusterSpan.addEventListener('mouseleave', () => {
+  clearHighlights('cluster-hover');
+});
+
+// Query Log toggle button
+document.getElementById('btn-query-log').addEventListener('click', () => {
+  const panel = document.getElementById('activation-log');
+  const isHidden = panel.style.display === 'none';
+  panel.style.display = isHidden ? 'flex' : 'none';
+  const btn = document.getElementById('btn-query-log');
+  btn.style.opacity = isHidden ? '1' : '0.5';
+});
+
+// GK Charger mobile QR modal
+const gkModalOverlay = document.getElementById('gk-modal-overlay');
+document.getElementById('btn-gk-mobile').addEventListener('click', () => {
+  gkModalOverlay.classList.remove('hidden');
+});
+document.getElementById('gk-modal-close').addEventListener('click', () => {
+  gkModalOverlay.classList.add('hidden');
+});
+gkModalOverlay.addEventListener('click', (e) => {
+  if (e.target === gkModalOverlay) gkModalOverlay.classList.add('hidden');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') gkModalOverlay.classList.add('hidden');
+});
+
+// Log panel close button (now toggles visibility)
+document.getElementById('log-close').addEventListener('click', () => {
+  const panel = document.getElementById('activation-log');
+  panel.style.display = 'none';
+  const btn = document.getElementById('btn-query-log');
+  btn.style.opacity = '0.5';
+});
+
+// Poll for new query activations from other sources
+async function pollForActivations() {
+  try {
+    const url = lastActivationTimestamp
+      ? `${ACTIVATIONS_URL}?since=${lastActivationTimestamp}&limit=5`
+      : `${ACTIVATIONS_URL}?limit=5`;
+
+    const response = await fetch(url);
+    if (!response.ok) return;
+
+    const data = await response.json();
+
+    if (data.activations && data.activations.length > 0) {
+      // Add each activation to the queue
+      for (const activation of data.activations) {
+        const entityNames = [];
+
+        // Collect entity names
+        if (activation.entities) {
+          entityNames.push(...activation.entities);
+        }
+
+        // Collect from relationships
+        if (activation.relationships) {
+          for (const rel of activation.relationships) {
+            entityNames.push(rel.src, rel.tgt);
+          }
+        }
+
+        const uniqueEntities = [...new Set(entityNames)];
+
+        if (uniqueEntities.length > 0) {
+          // Add to queue
+          activationQueue.push({
+            query: activation.query,
+            entities: uniqueEntities,
+            entityCount: activation.entities?.length || 0,
+            timestamp: activation.timestamp
+          });
+        }
+      }
+
+      // Update timestamp
+      lastActivationTimestamp = data.latest_timestamp;
+
+      // Stamp activity so idle replay pauses
+      lastQueryActivityAt = Date.now();
+
+      // Start processing queue if not already processing
+      if (!isProcessingQueue) {
+        processActivationQueue();
+      }
+    }
+  } catch (error) {
+    console.error('Polling error:', error);
+  }
+}
+
+// Start polling after data is loaded
+function startPolling() {
+  if (pollingInterval) return; // Already polling
+
+  pollingInterval = setInterval(pollForActivations, POLL_INTERVAL_MS);
+  setInterval(checkIdleReplay, REPLAY_CHECK_INTERVAL_MS);
+  addLog('🔄 Real-time activation monitoring enabled', 'info');
+}
+
+// After 30s without real query activity, replay a random activation from
+// today's server-side cache in a dimmed style. A real query arriving at any
+// point (including mid-fetch) prevents the replay from being queued.
+async function checkIdleReplay() {
+  if (isProcessingQueue || activationQueue.length > 0) return;
+  if (Date.now() - lastQueryActivityAt < IDLE_REPLAY_DELAY_MS) return;
+
+  try {
+    const response = await fetch(`${ACTIVATIONS_URL}/daily_replay`);
+    if (!response.ok) return;
+    const { activation } = await response.json();
+    if (!activation) return;
+
+    // Re-check idle after the await — a real query may have arrived mid-fetch
+    if (Date.now() - lastQueryActivityAt < IDLE_REPLAY_DELAY_MS) return;
+    if (isProcessingQueue || activationQueue.length > 0) return;
+
+    const entityNames = [...(activation.entities || [])];
+    for (const rel of (activation.relationships || [])) {
+      entityNames.push(rel.src, rel.tgt);
+    }
+    const uniqueEntities = [...new Set(entityNames)];
+    if (uniqueEntities.length === 0) return;
+
+    activationQueue.push({
+      query: activation.query,
+      entities: uniqueEntities,
+      entityCount: activation.entities?.length || 0,
+      timestamp: Date.now() / 1000,
+      isReplay: true
+    });
+
+    if (!isProcessingQueue) {
+      processActivationQueue();
+    }
+  } catch (error) {
+    console.error('Idle replay error:', error);
+  }
+}
+
+// Process activation queue sequentially
+async function processActivationQueue() {
+  if (isProcessingQueue || activationQueue.length === 0) {
+    return;
+  }
+
+  isProcessingQueue = true;
+
+  while (activationQueue.length > 0) {
+    const activation = activationQueue.shift();
+
+    // Log the activation (different message for manual vs external vs replay)
+    if (activation.isReplay) {
+      addLog(
+        `🔁 Replay: <strong>"${activation.query}"</strong> (dimmed)`,
+        'info'
+      );
+    } else if (activation.isManual) {
+      addLog(
+        `🔍 Manual query: <strong>"${activation.query}"</strong>`,
+        'info'
+      );
+    } else {
+      addLog(
+        `🌐 External query: <strong>"${activation.query}"</strong>`,
+        'info'
+      );
+    }
+
+    addLog(
+      `✅ Found <strong>${activation.entityCount}</strong> entities`,
+      'success',
+      formatEntityList(activation.entities, 15)
+    );
+
+    // Activate the entities (dimmed for replays)
+    activateEntities(
+      activation.entities,
+      ACTIVATION_DISPLAY_DURATION,
+      activation.isReplay ? REPLAY_DIM_FACTOR : 1.0
+    );
+    addLog(`⚡ Activated <strong>${activation.entities.length}</strong> neurons`, 'success');
+
+    // If there are more items in queue, show queue status
+    if (activationQueue.length > 0) {
+      addLog(
+        `⏳ ${activationQueue.length} more query${activationQueue.length > 1 ? 'ies' : 'y'} queued...`,
+        'info'
+      );
+    }
+
+    // Wait for activation to be visible before processing next
+    await new Promise(resolve => setTimeout(resolve, ACTIVATION_DISPLAY_DURATION + QUEUE_PROCESSING_DELAY));
+  }
+
+  isProcessingQueue = false;
+}
+
+function stopPolling() {
+  if (pollingInterval) {
+    clearInterval(pollingInterval);
+    pollingInterval = null;
+    addLog('⏸️ Real-time activation monitoring paused', 'info');
+  }
+}
+
+async function init() {
+  const loaded = await loadData();
+  if (!loaded) {
+    document.getElementById('loading').innerHTML = `
+      <div style="text-align: center; color: var(--color-text-muted);">
+        <div style="font-size: 48px; margin-bottom: 16px;">⚠</div>
+        <div style="font-size: 18px; margin-bottom: 8px;">Failed to load knowledge graph</div>
+        <div style="font-size: 14px;">Make sure the layout has been computed.</div>
+      </div>
+    `;
+    return;
+  }
+
+  initScene();
+  createPoints();
+  createEdges();
+  frameAll();  // Position camera to fit all data
+  setupInteraction();
+  animate();
+
+  // Start polling for external query activations
+  startPolling();
+
+  // Hide loading overlay
+  setTimeout(() => {
+    document.getElementById('loading').classList.add('hidden');
+  }, 500);
+}
+
+// ===== INSIGHTS PANEL AND CLUSTER ANALYSIS =====
+
+let insightsData = null;
+let clustersData = null;
+
+// Toggle insights panel
+document.getElementById('btn-insights').addEventListener('click', async () => {
+  const panel = document.getElementById('insights-panel');
+  const isHidden = panel.classList.contains('hidden');
+
+  if (isHidden) {
+    panel.classList.remove('hidden');
+    document.getElementById('btn-insights').style.opacity = '1';
+
+    // Fetch insights if not already loaded
+    if (!insightsData) {
+      await loadInsights();
+    }
+  } else {
+    panel.classList.add('hidden');
+    document.getElementById('btn-insights').style.opacity = '0.5';
+  }
+});
+
+// Load insights from backend
+async function loadInsights() {
+  try {
+    addLog('📊 Loading research insights...', 'info');
+
+    // Fetch insights
+    const insightsResponse = await fetch(`${API_BASE}/graph3d/insights`);
+    insightsData = await insightsResponse.json();
+
+    // Fetch clusters
+    const clustersResponse = await fetch(`${API_BASE}/graph3d/clusters`);
+    clustersData = await clustersResponse.json();
+
+    // Display insights
+    displayInsights();
+
+    addLog('✅ Research insights loaded', 'success');
+  } catch (error) {
+    console.error('Error loading insights:', error);
+    addLog('⚠️ Failed to load insights', 'warning');
+  }
+}
+
+// Display insights in panel
+function displayInsights() {
+  if (!insightsData) return;
+
+  // Display stats
+  const statsGrid = document.getElementById('insights-stats');
+  statsGrid.innerHTML = `
+    <div class="stat-card">
+      <div class="stat-card-value">${insightsData.total_entities.toLocaleString()}</div>
+      <div class="stat-card-label">Entities</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-card-value">${insightsData.total_edges.toLocaleString()}</div>
+      <div class="stat-card-label">Relationships</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-card-value">${insightsData.total_clusters}</div>
+      <div class="stat-card-label">Clusters</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-card-value">${insightsData.avg_connections_per_entity}</div>
+      <div class="stat-card-label">Avg Connections</div>
+    </div>
+  `;
+
+  // Display insights
+  const insightsContent = document.getElementById('insights-content');
+  insightsContent.innerHTML = insightsData.insights.map(insight => `
+    <div class="insight-card">
+      <div class="insight-icon">${insight.icon}</div>
+      <div class="insight-header">${insight.title}</div>
+      <div class="insight-description">${formatDescription(insight.description)}</div>
+    </div>
+  `).join('');
+
+  // Display use cases
+  const useCasesContent = document.getElementById('use-cases-content');
+  useCasesContent.innerHTML = insightsData.use_cases.map(useCase => `
+    <div class="use-case-card">
+      <div class="use-case-title">${useCase.title}</div>
+      <div class="use-case-description">${formatDescription(useCase.description)}</div>
+      <div class="use-case-example">💡 ${useCase.example}</div>
+    </div>
+  `).join('');
+}
+
+// Show cluster info inside the Entity Details side panel
+function showClusterInfo(clusterId) {
+  if (!clustersData) return;
+
+  const cluster = clustersData.clusters.find(c => c.cluster_id === clusterId);
+  const legend = document.getElementById('cluster-legend');
+  if (!legend) return;
+
+  if (!cluster) {
+    // Cluster analysis not available for this cluster
+    document.getElementById('cluster-label').textContent = `Cluster ${clusterId}`;
+    document.getElementById('cluster-stats').innerHTML = '';
+    document.getElementById('cluster-entities').innerHTML =
+      '<div style="color: var(--color-text-muted); font-size: 11px; font-style: italic;">Detailed analysis not available for this cluster.</div>';
+    return;
+  }
+
+  // Display cluster label
+  document.getElementById('cluster-label').textContent = `Cluster ${clusterId}: ${cluster.label}`;
+
+  // Display stats
+  const statsDiv = document.getElementById('cluster-stats');
+  statsDiv.innerHTML = `
+    <div class="cluster-stat">
+      <div class="cluster-stat-value">${cluster.entity_count}</div>
+      <div class="cluster-stat-label">Entities</div>
+    </div>
+    <div class="cluster-stat">
+      <div class="cluster-stat-value">${cluster.internal_edges}</div>
+      <div class="cluster-stat-label">Internal Edges</div>
+    </div>
+  `;
+
+  // Display top entities
+  const entitiesDiv = document.getElementById('cluster-entities');
+  entitiesDiv.innerHTML = cluster.top_entities.map(entity => `
+    <div class="top-entity">
+      <div class="top-entity-name">${entity.name}</div>
+      <div class="top-entity-desc">${formatDescription(entity.description)}</div>
+    </div>
+  `).join('');
+}
+
+// Show cluster info when hovering over entity (optional)
+function setupClusterInfo() {
+  // Cluster info is now shown inside the Entity Details side panel
+  // No separate panel setup needed
+}
+
+init();
+</script>
+
+</body>
+</html>
