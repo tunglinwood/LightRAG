@@ -712,6 +712,7 @@ def _handle_single_entity_extraction(
     chunk_key: str,
     timestamp: int,
     file_path: str = "unknown_source",
+    html_url: str = "",
 ):
     if len(record_attributes) != 4 or "entity" not in record_attributes[0]:
         if len(record_attributes) > 1 and "entity" in record_attributes[0]:
@@ -756,6 +757,7 @@ def _handle_single_entity_extraction(
             description=entity_description,
             source_id=chunk_key,
             file_path=file_path,
+            html_url=html_url,
             timestamp=timestamp,
         )
 
@@ -776,6 +778,7 @@ def _handle_single_relationship_extraction(
     chunk_key: str,
     timestamp: int,
     file_path: str = "unknown_source",
+    html_url: str = "",
 ):
     if (
         len(record_attributes) != 5 or "relation" not in record_attributes[0]
@@ -836,6 +839,7 @@ def _handle_single_relationship_extraction(
             keywords=edge_keywords,
             source_id=edge_source_id,
             file_path=file_path,
+            html_url=html_url,
             timestamp=timestamp,
         )
 
@@ -909,6 +913,7 @@ async def _process_json_extraction_result(
     chunk_key: str,
     timestamp: int,
     file_path: str = "unknown_source",
+    html_url: str = "",
     parsed: dict[str, Any] | None = None,
 ) -> tuple[dict, dict]:
     """Process a JSON-formatted extraction result from LLM.
@@ -1010,6 +1015,7 @@ async def _process_json_extraction_result(
                 description=entity_description,
                 source_id=chunk_key,
                 file_path=file_path,
+                html_url=html_url,
                 timestamp=timestamp,
             )
             maybe_nodes[truncated_name].append(node_data)
@@ -1510,6 +1516,7 @@ async def _process_extraction_result(
     chunk_key: str,
     timestamp: int,
     file_path: str = "unknown_source",
+    html_url: str = "",
     tuple_delimiter: str = "<|#|>",
     completion_delimiter: str = "<|COMPLETE|>",
     warn_on_missing_completion_delimiter: bool = True,
@@ -1607,7 +1614,7 @@ async def _process_extraction_result(
 
         # Try to parse as entity
         entity_data = _handle_single_entity_extraction(
-            record_attributes, chunk_key, timestamp, file_path
+            record_attributes, chunk_key, timestamp, file_path, html_url
         )
         if entity_data is not None:
             truncated_name = _truncate_entity_identifier(
@@ -1623,7 +1630,7 @@ async def _process_extraction_result(
 
         # Try to parse as relationship
         relationship_data = _handle_single_relationship_extraction(
-            record_attributes, chunk_key, timestamp, file_path
+            record_attributes, chunk_key, timestamp, file_path, html_url
         )
         if relationship_data is not None:
             truncated_source = _truncate_entity_identifier(
@@ -1676,6 +1683,7 @@ async def _rebuild_from_extraction_result(
         if chunk_data
         else "unknown_source"
     )
+    html_url = chunk_data.get("html_url", "") if chunk_data else ""
 
     # Auto-detect format: try JSON first if the result looks like JSON
     json_parse_reported_failure = False
@@ -1692,6 +1700,7 @@ async def _rebuild_from_extraction_result(
             chunk_id,
             timestamp,
             file_path,
+            html_url,
             parsed=parsed,
         )
         # A successful parse (tolerant_load_json_dict's own non-empty-dict
@@ -1712,6 +1721,7 @@ async def _rebuild_from_extraction_result(
         chunk_id,
         timestamp,
         file_path,
+        html_url,
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
         warn_on_missing_completion_delimiter=not json_parse_reported_failure,
@@ -4108,6 +4118,7 @@ async def extract_entities(
         content = strip_internal_multimodal_markup_for_extraction(chunk_dp["content"])
         # Get file path from chunk data or use default
         file_path = chunk_dp.get("file_path", "unknown_source")
+        html_url = chunk_dp.get("html_url", "")
 
         # Build the optional `---Section Context---` block from the chunk's
         # heading breadcrumb. The marker/wrapping lives entirely in the prompt
@@ -4238,6 +4249,7 @@ async def extract_entities(
                 chunk_key,
                 timestamp,
                 file_path,
+                html_url,
             )
         else:
             maybe_nodes, maybe_edges = await _process_extraction_result(
@@ -4245,6 +4257,7 @@ async def extract_entities(
                 chunk_key,
                 timestamp,
                 file_path,
+                html_url,
                 tuple_delimiter=context_base["tuple_delimiter"],
                 completion_delimiter=context_base["completion_delimiter"],
             )
@@ -4313,6 +4326,7 @@ async def extract_entities(
                     chunk_key,
                     timestamp,
                     file_path,
+                    html_url,
                 )
             else:
                 glean_nodes, glean_edges = await _process_extraction_result(
@@ -4320,6 +4334,7 @@ async def extract_entities(
                     chunk_key,
                     timestamp,
                     file_path,
+                    html_url,
                     tuple_delimiter=context_base["tuple_delimiter"],
                     completion_delimiter=context_base["completion_delimiter"],
                 )
