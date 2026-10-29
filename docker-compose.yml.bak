@@ -44,3 +44,46 @@ services:
       # deployment, and compose supplies the container path.
       # See docs/UserDefinedUI.md.
       UI_TEMPLATES_DIR: "/app/data/ui_templates"
+
+  # Persistent MCP server (streamable-http on :9623), built from the same
+  # source image as the REST service above. Serves the same knowledge base
+  # (shared WORKING_DIR + .env), so LLM/embedding/storage config resolves
+  # identically for MCP clients and REST callers.
+  # Opt-in via `docker compose --profile mcp up` (or `up lightrag-mcp`): the
+  # .env selects file-backed storages (NetworkX/JSON/NanoVectorDB), which do
+  # not tolerate two concurrent writers on one WORKING_DIR. Concurrent
+  # READERS (REST queries + MCP queries) are fine; avoid running MCP inserts
+  # while the REST pipeline is writing, or switch to Postgres/Neo4j backends.
+  lightrag-mcp:
+    image: ghcr.io/hkuds/lightrag:latest
+    container_name: hua-lightrag-mcp
+    profiles: ["mcp"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      tags:
+        - ghcr.io/hkuds/lightrag:latest
+    command: ["lightrag-mcp"]
+    ports:
+      - "${MCP_HOST:-0.0.0.0}:${MCP_PORT:-9623}:9623"
+    volumes:
+      - ./data/rag_storage:/app/data/rag_storage
+      - ./data/inputs:/app/data/inputs
+      - ./data/prompts:/app/data/prompts
+      - ./.env:/app/.env
+    environment:
+      WORKING_DIR: "/app/data/rag_storage"
+      INPUT_DIR: "/app/data/inputs"
+      PROMPT_DIR: "/app/data/prompts"
+      # Persistent daemon instead of the default client-spawned stdio.
+      LIGHTRAG_MCP_TRANSPORT: "streamable-http"
+      LIGHTRAG_MCP_HOST: "0.0.0.0"
+      LIGHTRAG_MCP_PORT: "9623"
+      DOTENV_PATH: "/app/.env"
+    deploy:
+      restart_policy:
+        condition: on-failure
+        max_attempts: 10
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

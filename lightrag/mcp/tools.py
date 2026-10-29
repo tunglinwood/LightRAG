@@ -10,7 +10,6 @@ propagate so they surface as server crashes rather than silent wrong answers.
 
 import json
 from typing import Literal, Optional
-from uuid import uuid4
 
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
@@ -20,12 +19,22 @@ from lightrag.base import DocStatus
 from lightrag.constants import MAX_QUERY_CHARS, MAX_QUERY_TOP_K
 from lightrag.utils import logger
 
-_QUERY_MODES = ("local", "global", "hybrid", "naive", "mix", "bypass")
 _DOC_STATUSES = ("PENDING", "PARSING", "ANALYZING", "PROCESSING", "PROCESSED", "FAILED")
 
 
 def _rag(ctx: Context):
     return ctx.request_context.lifespan_context["rag"]
+
+
+def _validate_query(query: str, top_k: Optional[int], chunk_top_k: Optional[int]) -> None:
+    """Shared bounds for the query tools, checked before any storage touch."""
+    if not 1 <= len(query) <= MAX_QUERY_CHARS:
+        raise ToolError(
+            f"query length must be between 1 and {MAX_QUERY_CHARS} characters, got {len(query)}"
+        )
+    for name, value in (("top_k", top_k), ("chunk_top_k", chunk_top_k)):
+        if value is not None and not 1 <= value <= MAX_QUERY_TOP_K:
+            raise ToolError(f"{name} must be between 1 and {MAX_QUERY_TOP_K}, got {value}")
 
 
 def _doc_to_json(doc_id: str, status) -> dict:
@@ -49,71 +58,37 @@ def _doc_to_json(doc_id: str, status) -> dict:
     }
 
 
-async def run_query(
+async def query_data(
     rag,
     query: str,
     mode: Literal["local", "global", "hybrid", "naive", "mix", "bypass"] = "mix",
-    response_type: Optional[str] = None,
-    only_need_context: bool = False,
     top_k: Optional[int] = None,
     chunk_top_k: Optional[int] = None,
 ) -> str:
-    """Query the LightRAG knowledge base.
+    """Retrieve raw structured graph data without LLM generation.
 
-    mode selects the retrieval strategy (local/global/hybrid/naive/mix/bypass).
+    Returns the same JSON the REST POST /query/data endpoint serves:
+    retrieved entities, relationships, chunks, references, plus retrieval
+    metadata (query mode, extracted keywords, processing counts). Use this
+    when you want the knowledge-graph evidence itself — to feed your own
+    reasoning or chain into another tool — instead of a synthesized answer.
     top_k and chunk_top_k bound retrieval breadth (1..1000); unset keeps the
-    server's configured defaults. only_need_context returns the retrieved
-    context without LLM generation. response_type overrides the answer format
-    (e.g. "Bullet Points").
+    server's configured defaults.
     """
-    if not 1 <= len(query) <= MAX_QUERY_CHARS:
-        raise ToolError(
-            f"query length must be between 1 and {MAX_QUERY_CHARS} characters, got {len(query)}"
-        )
-    for name, value in (("top_k", top_k), ("chunk_top_k", chunk_top_k)):
-        if value is not None and not 1 <= value <= MAX_QUERY_TOP_K:
-            raise ToolError(f"{name} must be between 1 and {MAX_QUERY_TOP_K}, got {value}")
+    _validate_query(query, top_k, chunk_top_k)
 
     param = QueryParam(
         mode=mode,
         stream=False,
-        only_need_context=only_need_context,
-        **({"response_type": response_type} if response_type else {}),
         **({"top_k": top_k} if top_k else {}),
         **({"chunk_top_k": chunk_top_k} if chunk_top_k else {}),
     )
     try:
-        return await rag.aquery(query, param=param)
+        result = await rag.aquery_data(query, param=param)
     except Exception as e:
-        logger.error(f"MCP query failed: {e}")
-        raise ToolError(f"Query failed: {e}") from e
-
-
-async def insert_text(rag, text: str, file_source: str) -> str:
-    """Insert a text document into the knowledge base.
-
-    file_source names the document for citation/dedup (e.g. "notes.md").
-    Returns JSON with the processing status and a track_id for progress
-    polling via get_insert_status.
-    """
-    text = text.strip()
-    if not text:
-        raise ToolError("text must not be empty")
-    if not file_source.strip():
-        raise ToolError("file_source must not be empty")
-
-    track_id = f"mcp-{uuid4().hex[:12]}"
-    try:
-        await rag.apipeline_enqueue_documents(
-            input=[text], file_paths=[file_source], track_id=track_id
-        )
-        await rag.apipeline_process_enqueue_documents()
-    except Exception as e:
-        logger.error(f"MCP insert failed (track_id={track_id}): {e}")
-        raise ToolError(f"Insert failed: {e}") from e
-    return json.dumps(
-        {"status": "processed", "track_id": track_id, "file_source": file_source}
-    )
+        logger.error(f"MCP query_data failed: {e}")
+        raise ToolError(f"Query data failed: {e}") from e
+    return json.dumps(result)
 
 
 async def list_documents(
@@ -159,51 +134,23 @@ async def list_documents(
     )
 
 
-async def get_insert_status(rag, track_id: str) -> str:
-    """Get processing status for every document sharing a track_id.
-
-    Returns JSON in the same document shape as list_documents. Unknown
-    track_ids are an error so callers do not mistake a typo for an empty
-    (still-processing) batch.
-    """
-    try:
-        docs = await rag.aget_docs_by_track_id(track_id)
-    except Exception as e:
-        logger.error(f"MCP get_insert_status failed (track_id={track_id}): {e}")
-        raise ToolError(f"Get insert status failed: {e}") from e
-    if not docs:
-        raise ToolError(f"unknown track_id: {track_id}")
-    return json.dumps(
-        {"track_id": track_id, "documents": [_doc_to_json(i, s) for i, s in docs.items()]}
-    )
-
-
 def register_tools(mcp) -> None:
-    """Register the four tools on an MCPServer instance.
+    """Register the tools on an MCPServer instance.
 
     Each wrapper only resolves ``rag`` from the lifespan context; all logic
     lives in the module-level functions above.
     """
 
-    @mcp.tool()
-    async def query(
+    @mcp.tool(name="query_data")
+    async def query_data_tool(
         query: str,
         mode: Literal["local", "global", "hybrid", "naive", "mix", "bypass"] = "mix",
-        response_type: Optional[str] = None,
-        only_need_context: bool = False,
         top_k: Optional[int] = None,
         chunk_top_k: Optional[int] = None,
         ctx: Context = None,
     ) -> str:
-        """Query the LightRAG knowledge base (mode: local/global/hybrid/naive/mix/bypass)."""
-        return await run_query(
-            _rag(ctx), query, mode, response_type, only_need_context, top_k, chunk_top_k
-        )
-
-    @mcp.tool(name="insert_text")
-    async def insert_text_tool(text: str, file_source: str, ctx: Context = None) -> str:
-        """Insert a text document into the knowledge base under the given source name."""
-        return await insert_text(_rag(ctx), text, file_source)
+        """Retrieve structured entities/relationships/chunks without LLM generation (same data as POST /query/data)."""
+        return await query_data(_rag(ctx), query, mode, top_k, chunk_top_k)
 
     @mcp.tool(name="list_documents")
     async def list_documents_tool(
@@ -218,8 +165,3 @@ def register_tools(mcp) -> None:
     ) -> str:
         """List documents with pagination; optional status_filter and per-status counts."""
         return await list_documents(_rag(ctx), status_filter, page, page_size)
-
-    @mcp.tool(name="get_insert_status")
-    async def get_insert_status_tool(track_id: str, ctx: Context = None) -> str:
-        """Get processing status for a track_id returned by insert_text."""
-        return await get_insert_status(_rag(ctx), track_id)

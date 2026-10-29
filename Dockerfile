@@ -44,9 +44,9 @@ COPY pyproject.toml .
 COPY setup.py .
 COPY uv.lock .
 
-# Install base, API, and offline extras without the project to improve caching
+# Install base, API, MCP, and offline extras without the project to improve caching
 RUN --mount=type=cache,target=/root/.local/share/uv \
-    uv sync --frozen --no-dev --extra api --extra offline --extra docling --no-install-project --no-editable
+    uv sync --frozen --no-dev --extra api --extra mcp --extra offline --extra docling --no-install-project --no-editable
 
 # Copy project sources after dependency layer
 COPY lightrag/ ./lightrag/
@@ -56,7 +56,7 @@ COPY --from=frontend-builder /app/lightrag/api/webui ./lightrag/api/webui
 
 # Sync project in non-editable mode and ensure pip is available for runtime installs
 RUN --mount=type=cache,target=/root/.local/share/uv \
-    uv sync --frozen --no-dev --extra api --extra offline --extra docling --no-editable \
+    uv sync --frozen --no-dev --extra api --extra mcp --extra offline --extra docling --no-editable \
     && /app/.venv/bin/python -m ensurepip --upgrade
 
 # Prepare offline cache directory, pre-populate tiktoken data, and download the
@@ -97,7 +97,7 @@ ENV PATH=/app/.venv/bin:/root/.local/bin:$PATH
 # the wheels downloaded in the builder stage without adding an image layer.
 RUN --mount=type=cache,target=/root/.local/share/uv \
     --mount=type=bind,from=builder,source=/app/spacy_models,target=/tmp/spacy_models \
-    uv sync --frozen --no-dev --extra api --extra offline --extra docling --no-editable \
+    uv sync --frozen --no-dev --extra api --extra mcp --extra offline --extra docling --no-editable \
     && /app/.venv/bin/python -m ensurepip --upgrade \
     && /app/.venv/bin/python -m pip install --no-index --no-cache-dir \
         --find-links=/tmp/spacy_models zh_core_web_sm en_core_web_sm
@@ -139,8 +139,8 @@ ENV HOME=/home/lightrag \
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Expose API port
-EXPOSE 9621
+# Expose API port (9621 REST, 9623 MCP streamable-http daemon)
+EXPOSE 9621 9623
 
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python", "-m", "lightrag.api.lightrag_server"]
