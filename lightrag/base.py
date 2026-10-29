@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from enum import Enum
 import os
 from dotenv import load_dotenv
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import (
     Any,
     ClassVar,
@@ -17,7 +17,7 @@ from typing import (
     List,
     AsyncIterator,
 )
-from .utils import EmbeddingFunc, get_env_value
+from .utils import EmbeddingFunc, get_env_value, logger
 from .types import KnowledgeGraph
 from .exceptions import (
     StorageCapabilityError,
@@ -150,6 +150,17 @@ class QueryParam:
     """User-provided prompt for the query.
     Additional instructions for LLM. If provided, this will be injected into the prompt template.
     Its purpose is to let the user customize the way LLM generates the response.
+
+    The server may prepend a global prefix (``USER_PROMPT_PREFIX`` /
+    ``LightRAG.user_prompt_prefix``) to this value. **If this field is empty,
+    the prefix alone becomes the instructions sent to the LLM** -- an empty
+    ``user_prompt`` does not disable the prefix. Set
+    ``disable_user_prompt_prefix`` (declared at the end of this class) to opt
+    out instead.
+
+    Two paths do not receive the prefix: ``bypass`` mode ignores this field
+    entirely (empty or not), and a caller-supplied ``system_prompt`` without a
+    ``{user_prompt}`` placeholder silently drops it.
     """
 
     enable_rerank: bool = os.getenv("RERANK_BY_DEFAULT", "true").lower() == "true"
@@ -161,6 +172,20 @@ class QueryParam:
     """If True, includes reference list in the response for supported endpoints.
     This parameter controls whether the API response includes a references field
     containing citation information for the retrieved content.
+    """
+
+    # Declared last on purpose. QueryParam is a plain dataclass, so SDK callers
+    # may construct it positionally; inserting a field beside `user_prompt`
+    # would silently rebind every positional argument after it (a positional
+    # `False` meant for `enable_rerank` would land here instead). New fields
+    # belong at the end.
+    disable_user_prompt_prefix: bool = False
+    """Do not prepend the server-side global prompt prefix to ``user_prompt``.
+
+    The prefix is operator configuration: a request can only opt out of it, it
+    can never read or replace it. Default ``False``, i.e. the prefix applies --
+    including when ``user_prompt`` is empty, where the prefix alone becomes the
+    instructions. Set this to True to take full control of the final text.
     """
 
 
@@ -180,7 +205,26 @@ class StorageNameSpace(ABC):
 
     @abstractmethod
     async def index_done_callback(self) -> None:
-        """Commit the storage operations after indexing"""
+        """Commit the storage operations after indexing.
+
+        **On a raise, say whether a durable reference could be gone.** A
+        backend able to prove this failure discarded nothing -- every
+        buffered operation still buffered, or the commit itself landed and
+        only a step after it failed -- raises
+        ``lightrag.exceptions.ReferencesIntactFlushError`` (a subclass is
+        fine, so a backend may keep its own hierarchy). Any other exception
+        tells the caller to assume an operation was dropped and to quarantine
+        whatever named it, which is what a backend that implements nothing
+        keeps.
+
+        Prove it for the WHOLE flush: one that dropped a permanently-rejected
+        operation while retaining a retryable one has lost a reference, and
+        the honest answer for that flush is the default.
+
+        Why a caller needs the answer and what it costs when it cannot have
+        it: *LLM extraction cache reachability* in
+        ``docs/design/PurgeRecoveryContract.md``.
+        """
 
     async def drop_pending_index_ops(self) -> None:
         """Discard any not-yet-flushed buffered index ops.
@@ -195,6 +239,69 @@ class StorageNameSpace(ABC):
         the next batch. Immediate-write backends keep the default no-op.
         """
         return None
+
+    async def drop_pending_upserts(
+        self, *, cache_types: set[str] | None = None
+    ) -> int | None:
+        """Discard buffered UPSERTS, keeping buffered deletes.
+
+        The narrow counterpart of ``drop_pending_index_ops``, for a caller
+        abandoning writes that must NOT abandon deletions: a buffered delete
+        is a tombstone some already-returned operation promised, and dropping
+        one is unrecoverable.
+
+        ``cache_types`` restricts the discard to LLM-cache rows of those
+        types; a buffer key that does not parse as a cache key is KEPT. Pass
+        it whenever the reason to discard is reachability, so the discard
+        cannot reach rows no reference can orphan. ``None`` discards every
+        buffered upsert, for a caller abandoning the batch outright.
+
+        Returns tri-state, and a caller MUST distinguish all three by
+        identity, not truthiness: an ``int`` is the number discarded, ``0``
+        means this backend can discard and had nothing buffered, and ``None``
+        means it cannot discard at all, so the caller's writes are still
+        pending and its fallback is to defer them. Reading ``0`` as ``None``
+        reports a loss that did not happen; the reverse reports safety that
+        does not hold.
+
+        Backends that cannot separate upserts from deletes keep the default
+        ``None``. Only ``OpenSearchKVStorage`` overrides it today.
+
+        Why the tombstones, the cache types and the fallback are what they
+        are: *LLM extraction cache reachability* in
+        ``docs/design/PurgeRecoveryContract.md``.
+        """
+        return None
+
+    async def has_pending_index_ops(self) -> bool:
+        """Whether buffered upserts are still waiting for a commit.
+
+        For a caller that is about to DROP this buffer, or to publish another
+        namespace that depends on it, and must not read a successful
+        ``index_done_callback`` as proof that everything landed: a per-item
+        backend can retain retryable failures (408/429/5xx) and return
+        normally. Everywhere that residue heals on the next flush it is
+        accepted (see *LLM extraction cache reachability* in
+        ``docs/design/PurgeRecoveryContract.md``) — ask here only where the
+        buffer is about to be discarded or the process is about to exit.
+
+        "About to exit" means every commit from there on, not just the last
+        one: a shutdown that publishes a dependent namespace BEFORE a later
+        gate can quarantine it has already put the row on disk, where no
+        quarantine reaches it.
+
+        UPSERTS only. A retained tombstone carries no reference and does not
+        make another namespace's rows unreachable.
+
+        The default is ``False``, which is the truth for an immediate-write or
+        snapshot backend (no per-operation buffer, nothing to retain) and an
+        UNIMPLEMENTED answer for the deferred per-item vector storages, which
+        do buffer and do retain. Only ``OpenSearchKVStorage`` overrides it,
+        because only the KV side is asked today. Before querying this on a
+        vector storage, implement it there -- a confident ``False`` over a
+        non-empty buffer is worse than no method at all.
+        """
+        return False
 
     @abstractmethod
     async def drop(self) -> dict[str, str]:
@@ -225,20 +332,23 @@ class StorageNameSpace(ABC):
 
 @dataclass
 class BaseVectorStorage(StorageNameSpace, ABC):
-    embedding_func: EmbeddingFunc
+    requires_embedding_func: ClassVar[bool] = True
+
+    embedding_func: EmbeddingFunc | None
     cosine_better_than_threshold: float = field(default=0.2)
     meta_fields: set[str] = field(default_factory=set)
 
     def _validate_embedding_func(self):
-        """Validate that embedding_func is provided.
+        """Validate the backend's embedding function requirement.
 
         This method should be called at the beginning of __post_init__
-        in all vector storage implementations.
+        in all vector storage implementations. Backends that never materialize
+        vectors may set ``requires_embedding_func`` to ``False``.
 
         Raises:
-            ValueError: If embedding_func is None
+            ValueError: If the backend requires embedding_func and it is None
         """
-        if self.embedding_func is None:
+        if self.requires_embedding_func and self.embedding_func is None:
             raise ValueError(
                 "embedding_func is required for vector storage. "
                 "Please provide a valid EmbeddingFunc instance."
@@ -295,7 +405,7 @@ class BaseVectorStorage(StorageNameSpace, ABC):
 
         Multi-worker note:
             Backends that buffer writes in process memory (e.g.
-            OpenSearchVectorDBStorage as of #3043) keep the buffer
+            OpenSearchVectorDBStorage) keep the buffer
             process-local. In a multi-worker deployment (e.g.
             lightrag-gunicorn) other workers will not observe these writes
             until the writing worker has called index_done_callback().
@@ -386,6 +496,41 @@ class BaseVectorStorage(StorageNameSpace, ABC):
         pass
 
 
+def normalize_kv_create_time(value: Any) -> int:
+    """Coerce a stored ``create_time`` into the int the KV contract promises.
+
+    Stored rows are not always written by the current release: an older
+    LightRAG could store ``time.time()`` unrounded (a float), a hand-edited
+    ``JsonKVStorage`` file can carry ``null``, and external tooling can leave
+    the field a string. Every backend that preserves ``create_time`` across a
+    replacement upsert funnels the stored value through here, so the backends
+    agree on malformed input instead of each writing its own shape back.
+
+    ``None`` -- the documented "unknown" marker -- maps to ``0`` silently.
+    Anything that will not coerce is data corruption rather than a legacy
+    shape, so it is logged before falling back to ``0``.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        # bool is an int subclass, so int(True) would record 1. A boolean
+        # timestamp is corruption, not a legacy shape -- and OpenSearch's
+        # server-side equivalent cannot coerce it either, so both answer 0.
+        logger.warning(f"KV create_time is a boolean ({value!r}); recording 0")
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is not a ValueError: JSON ``1e309`` decodes to float
+        # infinity, and ``int(inf)`` raises it. Without it here a single
+        # hand-edited row would abort the whole upsert instead of taking this
+        # documented fallback.
+        logger.warning(
+            f"KV create_time is not a number ({value!r}); recording 0 (unknown)"
+        )
+        return 0
+
+
 @dataclass
 class BaseKVStorage(StorageNameSpace, ABC):
     embedding_func: EmbeddingFunc
@@ -448,10 +593,45 @@ class BaseKVStorage(StorageNameSpace, ABC):
         1. Changes will be persisted to disk during the next index_done_callback
         2. update flags to notify other processes that data persistence is needed
 
+        Storage-managed timestamps (binding on every backend):
+            1. A key that does not exist yet is stamped with both
+               ``create_time`` and ``update_time``. Under concurrency the
+               FIRST creation defines ``create_time``: a backend whose insert
+               is not naturally atomic must make it so (Mongo's
+               ``$setOnInsert``, PG's ``ON CONFLICT``, Redis's ``SET ... NX``)
+               instead of letting the last writer's clock win.
+            2. A key that already exists keeps its stored ``create_time`` and
+               only advances ``update_time`` -- including when ``data``
+               replaces the whole value with business fields only, which is
+               what the chunk-tracking writers send.
+            3. A stored row carrying no ``create_time`` (written before the
+               field existed) records ``0`` = unknown. Never invent an
+               original timestamp for it: ``0`` is what every read path
+               already substitutes, so the row keeps the meaning it had.
+            4. A caller-supplied ``create_time`` is ignored on the update
+               path. The timestamp is storage-managed, so preserving it must
+               not depend on callers round-tripping metadata fields.
+            5. Stored values reach ``int`` through
+               :func:`normalize_kv_create_time` so the backends agree on
+               legacy and malformed shapes.
+
+            ``MongoKVStorage`` (``$setOnInsert``) and ``PGKVStorage``
+            (``ON CONFLICT ... DO UPDATE`` that never assigns
+            ``create_time``) are the reference implementations: the
+            conditional write belongs on the server, not in a client-side
+            read-modify-write: a client-side read-then-write cannot keep a
+            concurrent first insert or a concurrent delete from moving the
+            timestamp, and no later write repairs it, because every update
+            preserves what it finds. A backend without such a primitive
+            reconstructs one -- ``OpenSearchKVStorage`` with a
+            ``scripted_upsert`` bulk action, ``RedisKVStorage`` with a Lua
+            script that reads a bounded prefix and writes in the same step --
+            rather than reading whole values back.
+
         Multi-worker note:
             Backends that buffer writes in process memory (e.g.
-            OpenSearchKVStorage as of the KV-batching change derived from
-            #2822) keep the buffer process-local. In a multi-worker
+            OpenSearchKVStorage, since its KV writes were batched) keep the
+            buffer process-local. In a multi-worker
             deployment (e.g. lightrag-gunicorn) other workers will not
             observe these writes until the writing worker has called
             index_done_callback(). Callers that depend on cross-worker
@@ -493,6 +673,46 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
     embedding_func: EmbeddingFunc
 
+    # Whether this backend can lose an uncommitted in-memory mutation when a
+    # peer commit makes it reload. ``True`` means the backend
+    # holds the whole graph in process memory, commits it as one unit, and has
+    # no pending buffer or redo log to replay over a reloaded snapshot -- so
+    # concurrent writers on one workspace must be serialized above it.
+    # ``LightRAG._admin_write_gate`` keys off this: where it is ``True`` the
+    # admin graph writers take the workspace admin lock and the pipeline
+    # ``busy`` reservation; where it is ``False`` (every server-backed store,
+    # which has row/transaction-level concurrency of its own) they run
+    # unserialized, as before.
+    #
+    # ``ClassVar`` on purpose: the storage bases are dataclasses, so a bare
+    # annotated attribute would become an ``__init__`` field and change the
+    # constructor signature and field order of every backend.
+    requires_single_writer: ClassVar[bool] = False
+
+    def discard_uncommitted_mutations(self, reason: str) -> bool:
+        """Give up in-memory graph mutations no commit has published.
+
+        For a backend that buffers the whole graph in process memory
+        (``requires_single_writer``), an operation that dies between its
+        ``upsert_node`` / ``remove_nodes`` and its commit leaves those
+        mutations sitting in that buffer with nothing owing anything about
+        them, so the next unrelated commit publishes them -- making an
+        operation that was reported as FAILED durable after the fact. Called
+        by ``LightRAG._admin_write_gate`` on the one exit where the operation's
+        own ``except Exception`` handlers cannot run (a cancellation, including
+        the hold ceiling's), while the gate still holds the admin lock and the
+        pipeline reservation, so no other writer can be mid-mutation.
+
+        **Synchronous on purpose.** It runs on an already-cancelled task where
+        every ``await`` is a place the cleanup can be interrupted a second
+        time; a plain attribute write cannot be.
+
+        Returns True when something was actually given up (worth logging),
+        False when there was nothing unpublished. The default is False: a
+        server-backed store commits per statement and holds no such buffer.
+        """
+        return False
+
     @abstractmethod
     async def has_node(self, node_id: str) -> bool:
         """Check if a node exists in the graph.
@@ -525,6 +745,37 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
         Returns:
             The number of edges connected to the node
+
+        **A self-loop must not be in the store, so its degree is not
+        contracted.** Every LightRAG ingress refuses one -- extraction,
+        ``create_relation`` via ``_reject_self_loop_relation``
+        (``lightrag/utils_graph.py``), custom-KG insert -- and
+        ``tools/migrate_graph_storage.py`` refuses a source graph that holds
+        one, rather than dropping it and orphaning the relation's vector row.
+        A self-loop
+        carries no connectivity for graph retrieval, and degree is exactly the
+        connectivity measure that feeds relation ``rank``, BFS truncation
+        priority and ``get_popular_labels``, so an edge reaching nothing has no
+        meaningful degree to report. A store still holding one holds
+        invariant-violating data to be removed, not data to be ranked.
+
+        Backends therefore use the cheapest natural query for degree and may
+        answer differently from each other -- and from their own
+        ``node_degrees_batch`` -- on such an edge. That divergence is
+        unreachable for any graph the contract admits.
+
+        **Do not "fix" this by filtering self-loops out of the degree
+        queries.** It was implemented across all seven backends and reverted
+        for cost: it takes Neo4j's ``node_degrees_batch`` off its O(1)
+        ``GetDegree`` plan and onto an expand per requested node, and it turns
+        OpenSearch's ``get_popular_labels`` and ``get_knowledge_graph('*')``
+        into a script evaluation per document in the edge index, because
+        OpenSearch cannot compare two fields with a term query. Both sit on the
+        retrieval hot path. The invariant is enforced where it costs nothing --
+        at the boundary -- rather than on every query.
+
+        Edge LISTINGS are governed separately, and a self-loop IS listed there
+        -- see ``get_node_edges``.
         """
 
     @abstractmethod
@@ -574,6 +825,44 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         Returns:
             A list of (source_id, target_id) tuples representing edges,
             or None if the node doesn't exist
+
+        Three outcomes, three answers — implementations must not merge them:
+
+        * ``[]``   — the node exists and has no relations.
+        * ``None`` — the node is **confirmed absent**.
+        * raise    — the backend could not answer. A transport/server error is
+          neither of the above; reporting it as ``[]`` or ``None`` turns an
+          unknown into a fact that callers (entity merge/dedup, graph edits)
+          act on. Same rule as :meth:`BaseKVStorage.get_by_id_strict`.
+
+        ``get_nodes_edges_batch`` cannot express the middle case (it returns a
+        dict of lists) and flattens ``None`` to ``[]`` by design; callers that
+        need the distinction must use this single-node form.
+
+        **A self-loop appears ONCE** -- listed, never hidden, here and in
+        ``get_nodes_edges_batch``. :meth:`node_degree` says the store must not
+        hold one; this method is how a store that does is repaired, so the two
+        are not in tension: a self-loop the listing hides cannot be found and
+        cannot be deleted.
+
+        Hiding it would be a data-loss bug, not a tidier contract. Entity
+        deletion, entity rename, entity merge and the purge of a document's
+        contributions all enumerate a node's incident edges HERE to delete or
+        rewrite the matching relation rows; an edge this method omits leaves an
+        orphan relation vector row behind a deleted entity, or a dangling
+        endpoint behind a renamed one.
+
+        A backend that walks its outbound and inbound matches separately must
+        skip the second occurrence of ``src == tgt``, or it reports one edge
+        twice. ``pgtable``, ``mongo``, ``opensearch`` and the AGE backend's
+        batch form all carry that guard.
+
+        The single-node form on the Cypher family (``neo4j``, ``memgraph``, and
+        AGE) instead resolves one undirected ``(n)-[]-(m)`` match, where how
+        many rows a self-loop produces is the SERVER's answer, not the query's.
+        No offline test settles it, so treat those three as unverified on this
+        rule rather than as compliant -- the batch forms, which issue two
+        directed matches, are the ones pinned here.
         """
 
     async def get_nodes_batch(self, node_ids: list[str]) -> dict[str, dict]:
@@ -596,6 +885,12 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         Default implementation fetches node degrees one by one.
         Override this method for better performance in storage backends
         that support batch operations.
+
+        **Answer every requested id.** A node with no edges gets ``0``, not a
+        missing key -- an override that builds its result from aggregation
+        buckets sees no bucket for such a node and drops it unless it seeds the
+        dict first. Callers then need no "absent means zero" rule of their own,
+        and the batch agrees with :meth:`node_degree` on an isolated node.
         """
         result = {}
         for node_id in node_ids:
@@ -609,8 +904,17 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         """Edge degrees as a batch using UNWIND also uses node_degrees_batch
 
         Default implementation calculates edge degrees one by one.
-        Override this method for better performance in storage backends
-        that support batch operations.
+
+        **Override this on any backend whose ``node_degree`` is a round trip.**
+        The default is not merely "slower": it is two AWAITED ``node_degree``
+        calls per pair, issued serially, and retrieval hands it the whole
+        incident-edge set of the top entities rather than ``top_k`` of them --
+        so a single query became thousands of sequential requests on the
+        backends that inherited it. Overriding is eight lines: collect the
+        DISTINCT endpoint ids, resolve them with one ``node_degrees_batch``,
+        sum per pair (``pgtable_impl`` and ``opensearch_impl`` both carry the
+        same shape). Doing so also takes the scalar ``node_degree`` off the
+        retrieval path entirely.
         """
         result = {}
         for src_id, tgt_id in edge_pairs:
@@ -659,6 +963,41 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         1. Changes will be persisted to disk during the next index_done_callback
         2. Only one process should updating the storage at a time before index_done_callback,
            KG-storage-log should be used to avoid data corruption
+
+        Attribute contract (applies to ``upsert_edge`` and the batch variants
+        too):
+            Every value must be a storable scalar -- ``str``
+            (XML-compatible), ``int``, finite ``float``, or ``bool``. Nothing
+            else: no nested containers, and no ``None``. Attribute names must
+            not contain ``"."`` or start with ``"$"``.
+
+            This is the intersection of what the registered backends can carry,
+            and callers are responsible for it because the backends disagree on
+            what happens when it is violated. The same non-scalar is refused by
+            the Neo4j driver, stored verbatim by MongoDB and by
+            PostgreSQL's ``jsonb`` column, and fatal to GraphML serialization;
+            ``None`` deletes the property on the Cypher backends but is a hard
+            error on NetworkX. ``lightrag.utils.validate_graph_attributes``
+            is the shared enforcement point -- prefer it over re-deriving the
+            rule per backend.
+
+            This is a **caller** contract, enforced where input enters the
+            system. An implementation should reject only what *it* cannot store,
+            which may be less: ``NetworkXStorage`` accepts ``NaN`` and integers
+            past int64 because GraphML round-trips them, even though the Neo4j
+            driver cannot pack either.
+
+            That asymmetry is deliberate, and the reason is the same for names
+            and values. Every rewrite path (entity edit, rename, merge,
+            extraction rebuild) spreads a fetched object's stored attributes back
+            into the upsert payload, and a workspace can already hold values or
+            names that predate this contract -- the manual edit API accepted
+            anything before its field allowlist landed. An implementation that
+            enforced the full contract on a rewrite would make those objects
+            permanently unmodifiable, gaining nothing it could not already store.
+            So: ``lightrag.utils.graph_attribute_value_rejection`` at the
+            ingress, ``xml_attribute_value_rejection`` (or the equivalent for
+            that store) inside it.
 
         Args:
             node_id: The ID of the node to insert or update
@@ -777,6 +1116,20 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             A list of all node labels in the graph, sorted alphabetically
         """
 
+    async def iter_labels(self, batch_size: int) -> AsyncIterator[list[str]]:
+        """Yield all graph labels in bounded batches.
+
+        Whole-graph maintenance tools use this instead of ``get_all_labels`` so
+        their client-side memory does not grow with the graph. Backends must
+        override this method with native cursor, keyset, or in-memory graph
+        iteration; the default fails closed because collecting
+        ``get_all_labels`` and slicing it would violate that contract.
+        """
+        raise StorageCapabilityError(
+            f"{type(self).__name__} does not support bounded label iteration"
+        )
+        yield []  # pragma: no cover - make this an async generator
+
     @abstractmethod
     async def get_knowledge_graph(
         self, node_label: str, max_depth: int = 3, max_nodes: int = 1000
@@ -792,6 +1145,83 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         Returns:
             KnowledgeGraph object containing nodes and edges, with an is_truncated flag
             indicating whether the graph was truncated due to max_nodes limit
+
+        Ranks by node degree, descending, and **ties break on the label,
+        ascending** — the same tie-break :meth:`get_popular_labels` documents,
+        for the same reason. Degree alone does not order a real graph: leaf
+        entities of degree 1 or 2 outnumber everything else, so the ``max_nodes``
+        cutoff almost always lands inside a band of equal-degree entities, and
+        whatever orders that band decides which nodes the caller ever sees.
+        Left to the backend's natural order that is node INSERTION order (a
+        stable sort in Python, an unconstrained plan order in SQL/Cypher), so
+        re-ingesting the same corpus with the documents in a different order
+        returned a different graph at the same ``max_nodes`` — the defect fixed
+        for ``get_popular_labels`` first, then here.
+
+        Order the labels by code point (SQL ``COLLATE "C"``, not a locale
+        collation) so every backend agrees with Python's ``str`` comparison.
+
+        **Scope: the ``*`` whole-graph ranking.** The non-wildcard path -- BFS
+        expansion from a start ``node_label`` -- is deliberately NOT bound by
+        it, and a backend that admits same-depth nodes in traversal order there
+        is compliant. Only one level of that path could ever be affected: once
+        ``max_nodes`` is filled no deeper level contributes a node at all, so
+        the rule would decide nothing beyond which same-depth neighbours of the
+        single straddling level survive.
+
+        Buying that decision is not worth its price. The only caller is the
+        graph view (``GET /graphs``), whose consumer treats ``nodes`` and
+        ``edges`` as sets: the WebUI recomputes each node's degree from the
+        returned edges to size it and never reads the order a backend produced.
+        Against that, ranking a level requires seeing the whole level AND its
+        global degrees before the cap, which on a graph database costs the
+        traversal's early exit (the cap can no longer stop the expansion), a
+        degree count over the entire reached neighbourhood, and -- once the
+        surviving set is no longer the traversal's own subgraph -- a second,
+        unbounded relationship match to rebuild the edges. Those are real
+        query-plan costs paid on every truncated view, in exchange for a
+        marginally better neighbour choice in one level that the consumer
+        cannot distinguish.
+
+        Level-internal admission order is therefore backend-defined. Backends
+        where the ranking is a local sort pay approximately nothing and do
+        apply it: :class:`~lightrag.kg.networkx_impl.NetworkXStorage` and
+        :class:`~lightrag.kg.pgtable_impl.PGTableGraphStorage` order every
+        level, while ``MongoGraphStorage`` (default ``bidirectional`` mode) and
+        :class:`~lightrag.kg.opensearch_impl.OpenSearchGraphStorage` rank the
+        level straddling the cap, gated on overflow so a subgraph that fits
+        pays nothing at all. Neo4j, Memgraph and ``PGGraphStorage`` (Apache AGE)
+        admit in traversal order. A new backend should rank its levels where
+        its query language makes that free, and is under no obligation to
+        reshape a traversal to achieve it.
+        This is a resolved decision, not an outstanding gap.
+
+        **Known deviation -- PGGraphStorage (Apache AGE)** ranks the ``*`` view
+        on ``degree DESC, v.id ASC``, the internal vertex id, not the label.
+        Selecting only ``v.id`` lets the vertex scan be index-only; the label
+        lives in the vertex ``properties``, so ordering on it forces a full heap
+        read (~1.5x buffers, ~25% wall clock on a 200k-vertex/600k-edge graph),
+        and no index removes that -- the ORDER BY leads with an aggregate
+        computed from the edge table. The id is an insertion counter, so that
+        backend's view is stable for a given database but still varies with
+        ingestion order across databases holding the same graph, and its
+        :meth:`get_popular_labels` (which DOES order by label) can disagree with
+        its graph view at the same cutoff. Every other backend orders its ``*``
+        ranking on the label; do not copy the deviation into a new one.
+
+        **Known approximation -- OpenSearchGraphStorage** applies the rule, but
+        only to the candidates its degree aggregations surfaced, and that set is
+        approximate: the two endpoint aggregations are each capped at
+        ``max_nodes``, so an entity whose in- and out-degree both fall outside
+        their respective top-N never reaches the ranking however high its
+        undirected degree is, and terms aggregations are count-approximate
+        across shards. Not addressed; it needs a storage-shape change,
+        not an ordering one.
+
+        This constrains WHICH nodes survive truncation, not the order of
+        :class:`KnowledgeGraph.nodes` in the response — implementations
+        materialize that list from a dict or a subgraph view, and callers that
+        need a specific presentation order must sort it themselves.
         """
 
     @abstractmethod
@@ -811,6 +1241,18 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             A list of all edges, where each edge is a dictionary of its properties
         """
 
+    async def iter_edges(self, batch_size: int) -> AsyncIterator[list[dict]]:
+        """Yield all graph edges in bounded batches.
+
+        The returned dictionaries follow ``get_all_edges`` and carry
+        ``source`` and ``target``. See :meth:`iter_labels` for the fail-closed
+        compatibility rule.
+        """
+        raise StorageCapabilityError(
+            f"{type(self).__name__} does not support bounded edge iteration"
+        )
+        yield []  # pragma: no cover - make this an async generator
+
     @abstractmethod
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
         """Get popular labels(entity names) by node degree (most connected entities)
@@ -820,6 +1262,39 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
         Returns:
             List of labels sorted by degree (highest first)
+
+        Ranks the WHOLE node set: an isolated (degree-0) entity ranks last, but
+        it still ranks. Implementations that derive degrees from their edge
+        store must therefore not let a node absent from that store fall out of
+        the result. Ties break on the label, ascending.
+
+        The expected shape is two phases, because the second one almost never
+        runs. Rank the entities that HAVE edges first — the cheap path, and any
+        graph with more than ``limit`` connected entities fills every slot there
+        — then top the result up from the isolated entities only when that comes
+        up short. The top-up is bounded by the shortfall (never more than
+        ``limit`` rows), which is what keeps it affordable even where it means a
+        sequential scan of the node store. Coming up short also means the
+        connected set is now known in full, so every remaining entity is
+        isolated by definition.
+
+        Driving the whole ranking off the node store instead is simpler to
+        write and gives the same answer, but it pays a full pass over the nodes
+        on every call — on a large graph, to produce a result the first phase
+        already had.
+
+        The result is best-effort about the reverse direction: a backend that
+        derives degrees from its edge store MAY also surface an id that has
+        edges but no node document. Only a data-quality defect produces one —
+        the write paths materialize both endpoints of every edge — and
+        confirming every ranked id against the node store would cost a join or
+        an extra round trip on a hot, interactive endpoint. Callers must
+        therefore tolerate a returned label whose :meth:`get_node` comes back
+        empty, rather than assume every label resolves.
+
+        An empty list means the graph holds no entities. A backend error MUST
+        raise instead — ``/graph/label/popular`` renders both, and the two are
+        indistinguishable to the user once the error is swallowed.
         """
 
     @abstractmethod
@@ -832,6 +1307,10 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
         Returns:
             List of matching labels sorted by relevance
+
+        As with :meth:`get_popular_labels`, an empty list means "nothing
+        matched" — a backend error MUST raise rather than return it. A blank
+        query is a real empty result, not an error.
         """
 
 
@@ -864,7 +1343,9 @@ class DocProcessingStatus:
     Always a hint-stripped basename (e.g. ``abc.docx``) or the literal
     ``"unknown_source"`` sentinel; never carries directory components or
     parser ``[hint]`` segments. UI display, filename-based dedup, and
-    citation paths all share this value.
+    citation paths all share this value. Duplicate-attempt rows deliberately
+    reuse the primary document's basename, so this field is not a unique key
+    and does not by itself prove ownership of a physical source file.
     """
     status: DocStatus
     """Current processing status"""
@@ -907,6 +1388,25 @@ class DocProcessingStatus:
                 and self.status == DocStatus.PROCESSED
             ):
                 self.status = DocStatus.PREPROCESSED
+
+    @classmethod
+    def from_stored(cls, data: dict[str, Any]) -> "DocProcessingStatus":
+        """Construct from a stored doc_status row, ignoring undeclared fields.
+
+        Producers evolve independently of this schema: RAG-Anything writes
+        ``scheme_name``/``multimodal_content``, other LightRAG versions write
+        fields an installed release does not declare yet (or no longer does).
+        ``DocProcessingStatus(**row)`` raises ``TypeError`` on any such field,
+        which makes every read path treat the row as malformed and drop it
+        from listings — the document silently disappears from the WebUI and
+        the API even though its record is intact (HKUDS/RAG-Anything#73).
+
+        Extra fields are ignored for construction only; the stored row is
+        not modified. A *missing required* field still raises ``TypeError``
+        — tolerance is strictly for extras, not for malformed rows.
+        """
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 class CursorPosition:
@@ -1084,12 +1584,6 @@ class DocStatusStorage(BaseKVStorage, ABC):
     @abstractmethod
     async def get_status_counts(self) -> dict[str, int]:
         """Get counts of documents in each status"""
-
-    @abstractmethod
-    async def get_docs_by_status(
-        self, status: DocStatus
-    ) -> dict[str, DocProcessingStatus]:
-        """Get all documents with a specific status"""
 
     @abstractmethod
     async def get_docs_by_statuses(
@@ -1581,6 +2075,7 @@ class DeletionResult:
     message: str
     status_code: int = 200
     file_path: str | None = None
+    """Canonical source basename; another status row may reference it too."""
 
 
 # Unified Query Result Data Structures for Reference List Support
@@ -1596,12 +2091,21 @@ class QueryResult:
         response_iterator: Streaming response iterator for streaming responses
         raw_data: Complete structured data including references and metadata
         is_streaming: Whether this is a streaming result
+        llm_generated: Whether the answering LLM actually wrote this result.
+            False for every result a query path produces WITHOUT calling it:
+            the canned ``PROMPTS["fail_response"]`` returned when no context
+            could be built, and the ``only_need_context`` / ``only_need_prompt``
+            debug outputs (retrieved context and constructed prompt). Consumers
+            that must label machine-written text (the WebUI's AI-content
+            notice) need this distinction, and no consumer can recover it from
+            the text alone.
     """
 
     content: Optional[str] = None
     response_iterator: Optional[AsyncIterator[str]] = None
     raw_data: Optional[Dict[str, Any]] = None
     is_streaming: bool = False
+    llm_generated: bool = True
 
     @property
     def reference_list(self) -> List[Dict[str, str]]:

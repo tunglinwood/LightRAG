@@ -22,17 +22,11 @@ import threading
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-
-class LLMBridgeCancelled(RuntimeError):
-    """The parse was cancelled (or the rag shut down) during an LLM wait."""
-
-
-class LLMBridgePipelineCancelled(LLMBridgeCancelled):
-    """The active document pipeline was cancelled by its caller."""
-
-
-class LLMBridgeShutdown(LLMBridgeCancelled):
-    """The RAG parser executor is shutting down."""
+from lightrag.parser.exceptions import (
+    ParseCancelled,
+    first_cancellation,
+    normalize_cancel_events,
+)
 
 
 class SyncLLMBridge:
@@ -58,32 +52,21 @@ class SyncLLMBridge:
         submit: Callable[..., Coroutine[Any, Any, str]],
         *,
         cancel_events: tuple[
-            threading.Event | tuple[threading.Event, type[LLMBridgeCancelled]], ...
+            threading.Event | tuple[threading.Event, type[ParseCancelled]], ...
         ] = (),
         poll_interval: float = 1.0,
     ) -> None:
         self._loop = loop
         self._submit = submit
-        normalized_events: list[tuple[threading.Event, type[LLMBridgeCancelled]]] = []
-        for entry in cancel_events:
-            if isinstance(entry, tuple):
-                event, exception_type = entry
-            else:
-                event, exception_type = entry, LLMBridgeCancelled
-            if event is not None:
-                normalized_events.append((event, exception_type))
-        self._cancel_events = tuple(normalized_events)
+        self._cancel_events = normalize_cancel_events(cancel_events)
         self._poll_interval = max(0.01, float(poll_interval))
         # The loop thread id at construction time. Calling the bridge from
         # that thread would block the loop the coroutine needs — a guaranteed
         # deadlock — so __call__ turns it into an immediate error.
         self._loop_thread_id = threading.get_ident()
 
-    def _cancellation_exception(self, message: str) -> LLMBridgeCancelled | None:
-        for event, exception_type in self._cancel_events:
-            if event.is_set():
-                return exception_type(message)
-        return None
+    def _cancellation_exception(self, message: str) -> ParseCancelled | None:
+        return first_cancellation(self._cancel_events, message)
 
     def __call__(self, prompt: str, *, system_prompt: str | None = None) -> str:
         if threading.get_ident() == self._loop_thread_id:
@@ -122,4 +105,4 @@ class SyncLLMBridge:
             except concurrent.futures.TimeoutError:
                 continue
             except concurrent.futures.CancelledError as exc:
-                raise LLMBridgeCancelled("LLM call cancelled") from exc
+                raise ParseCancelled("LLM call cancelled") from exc

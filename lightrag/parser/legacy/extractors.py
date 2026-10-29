@@ -81,17 +81,25 @@ def _extract_docx(file_bytes: bytes) -> str:
 
 
 def _extract_pptx(file_bytes: bytes) -> str:
-    """Extract PPTX content (synchronous)."""
+    """Extract PPTX text, including nested groups, in shape order (synchronous)."""
+    from collections.abc import Iterator
+
     from pptx import Presentation  # type: ignore
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    from pptx.shapes.shapetree import GroupShapes, SlideShapes
 
     pptx_file = BytesIO(file_bytes)
     prs = Presentation(pptx_file)
-    content = ""
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if hasattr(shape, "text"):
-                content += shape.text + "\n"
-    return content
+
+    def iter_text(shapes: SlideShapes | GroupShapes) -> Iterator[str]:
+        for shape in shapes:
+            # Groups have no text of their own; their children can include groups.
+            if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                yield from iter_text(shape.shapes)
+            elif hasattr(shape, "text"):
+                yield shape.text + "\n"
+
+    return "".join(text for slide in prs.slides for text in iter_text(slide.shapes))
 
 
 def _extract_xlsx(file_bytes: bytes) -> str:
@@ -168,6 +176,14 @@ _BINARY_EXTRACTORS = {
     "xlsx": _extract_xlsx,
 }
 
+# OPC/OOXML formats — all ZIP archives, all parsed locally by a library that
+# materializes the uncompressed parts (python-docx / python-pptx / openpyxl).
+# They share the decompression budget: guarding only .docx leaves .pptx and
+# .xlsx (registered above, reachable by default routing) exposed to the same
+# zip-bomb class (GHSA-2wpj-ffvv-2pq8) — .xlsx worse, since _extract_xlsx
+# deliberately load_workbook()s the bytes twice.
+_ZIP_OFFICE_SUFFIXES = frozenset({"docx", "pptx", "xlsx"})
+
 
 def _decode_text(file_bytes: bytes) -> str:
     """UTF-8 decode with the upload-path validation, raised on failure."""
@@ -188,15 +204,35 @@ def _decode_text(file_bytes: bytes) -> str:
 
 
 def extract_text(
-    file_bytes: bytes, suffix: str, *, pdf_password: str | None = None
+    file_bytes: bytes,
+    suffix: str,
+    *,
+    pdf_password: str | None = None,
+    file_path: str | None = None,
 ) -> str:
     """Extract plain text from ``file_bytes`` based on ``suffix`` (no dot).
 
     Synchronous; callers run it in a thread.  Raises
     :class:`LegacyExtractionError` (or the extractor's own exception) on
     failure.
+
+    ``file_path`` names the source in the decompression-budget error message;
+    it falls back to the suffix so a direct caller that omits it still gets a
+    usable message.
     """
     suffix = suffix.lower().lstrip(".")
+
+    # Decompression budget for the OPC/OOXML formats, enforced BEFORE the
+    # extractor library opens the archive (GHSA-2wpj-ffvv-2pq8). The native
+    # engine guards .docx; the default routing (``*:native-teP,*:legacy-R``)
+    # falls back here and reaches .pptx/.xlsx too, which native never handles,
+    # so the guard belongs at this dispatcher rather than in one per-format
+    # branch. Reads the ZIP central directory once and decompresses nothing.
+    if suffix in _ZIP_OFFICE_SUFFIXES:
+        from lightrag.parser.docx.zip_budget import enforce_docx_decompression_budget
+
+        enforce_docx_decompression_budget(file_bytes, file_path or suffix)
+
     extractor = _BINARY_EXTRACTORS.get(suffix)
     if extractor is _extract_pdf_pypdf:
         return _extract_pdf_pypdf(file_bytes, pdf_password)

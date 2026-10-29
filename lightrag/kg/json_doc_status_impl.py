@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import copy
 import hashlib
 import heapq
 import json
@@ -28,12 +29,15 @@ from lightrag.file_atomic import reap_orphan_tmp_files
 from lightrag.utils import (
     _cooperative_yield,
     load_json,
+    log_without_raising,
     logger,
     validate_workspace,
+    commit_in_storage_io,
     write_json,
     get_pinyin_sort_key,
 )
 from lightrag.exceptions import (
+    CommitBookkeepingError,
     SourceConflictRepairCASError,
     StorageControlPlaneError,
     StorageNotInitializedError,
@@ -55,41 +59,28 @@ from .shared_storage import (
 class JsonDocStatusStorage(DocStatusStorage):
     """JSON-file-backed document-status storage, sharing memory across processes.
 
-    Uses the **same shared-memory + dirty-flag protocol** as
-    ``JsonKVStorage`` — see that class's docstring for the canonical
-    description of:
-        * how ``self._data`` is a cross-process
-          ``multiprocessing.Manager().dict()`` proxy obtained via
-          ``get_namespace_data``;
-        * how ``try_initialize_namespace`` ensures exactly one process
-          reads the JSON file on first init;
-        * how ``set_all_update_flags`` marks dirty state (semantics
-          *reversed* from the file-backed classes
-          ``NanoVectorDBStorage`` / ``FaissVectorDBStorage`` /
-          ``NetworkXStorage``);
-        * how ``index_done_callback`` flushes and calls
-          ``clear_all_update_flags``;
-        * why ``_storage_lock`` wraps **every** ``self._data`` access
-          (not just commit / reload).
+    Runs the **same shared-memory + dirty-flag protocol** as
+    ``JsonKVStorage``, reimplemented rather than inherited: ``self._data``
+    is a cross-process ``Manager().dict()`` proxy, not a per-process
+    copy, so there is nothing to reload and adding a ``_get_*`` entry
+    method would be wrong. ``storage_updated`` here means *"dirty data
+    still to flush"* — the REVERSE of what the same flag means on
+    ``NanoVectorDBStorage`` / ``FaissVectorDBStorage`` /
+    ``NetworkXStorage``. Hold ``_storage_lock`` over **every**
+    ``self._data`` access, read or write. Mechanism and rationale:
+    ``docs/design/FileBackedSnapshotContract.md``; a change here is
+    almost always a change ``JsonKVStorage`` needs too.
 
-    Differences from ``JsonKVStorage`` (in this class only):
-        * ``upsert`` calls ``index_done_callback`` synchronously after
-          mutating shared memory, so doc-status changes hit disk
-          immediately rather than being deferred to the pipeline's
-          batched ``_insert_done()``. Rationale: doc-status is the
-          recovery anchor for the ingest pipeline — if the process
-          crashes after an in-memory upsert but before the next batch
-          commit, the doc must still be visible as PENDING/PROCESSING
-          on restart. The other writes (``delete``, ``drop``) follow
-          the standard deferred-commit pattern.
-        * Pre-upsert preparation (``chunks_list`` default) runs
-          *outside* the lock because it only mutates the caller-
-          supplied dict, not the shared store.
-        * Read methods are richer (``get_docs_by_status`` /
-          ``get_docs_by_track_id`` / ``get_docs_paginated`` /
-          ``get_doc_by_file_path`` / etc.), but they all follow the
-          same "acquire ``_storage_lock``, scan ``self._data``, copy
-          values out before returning" template.
+    Rules this class adds on top of that protocol:
+        * ``upsert``, ``update_doc_status_fields`` and the
+          source-conflict repair flush synchronously — they ``await
+          index_done_callback()`` before returning. Doc-status is the
+          ingest pipeline's recovery anchor, so a crash must not lose
+          the fact that a document was enqueued. ``delete`` stays
+          deferred; ``drop`` flushes like the others.
+        * Reads copy or convert rows out of ``self._data`` before
+          returning them — never hand a caller a live reference into
+          the shared proxy.
 
     Non-pipeline write paths:
         * ``drop`` — destructive, **not** serialized; the caller must
@@ -176,7 +167,9 @@ class JsonDocStatusStorage(DocStatusStorage):
             for id in ids:
                 data = self._data.get(id, None)
                 if data:
-                    ordered_results.append(data.copy())
+                    ordered_results.append(
+                        copy.deepcopy(data) if isinstance(data, dict) else data
+                    )
                 else:
                     ordered_results.append(None)
         return ordered_results
@@ -191,12 +184,6 @@ class JsonDocStatusStorage(DocStatusStorage):
                 counts[doc["status"]] += 1
         return counts
 
-    async def get_docs_by_status(
-        self, status: DocStatus
-    ) -> dict[str, DocProcessingStatus]:
-        """Get all documents with a specific status"""
-        return await self.get_docs_by_statuses([status])
-
     async def get_docs_by_statuses(
         self, statuses: list[DocStatus], strict: bool = False
     ) -> dict[str, DocProcessingStatus]:
@@ -204,8 +191,8 @@ class JsonDocStatusStorage(DocStatusStorage):
 
         Acquires the storage lock once and scans the in-memory dict once,
         filtering against a set of status values.  More efficient than N separate
-        get_docs_by_status() calls, which would acquire the lock N times and scan
-        the data N times.  ``strict=True`` raises on any record that cannot be
+        per-status reads, which would acquire the lock N times and scan the data
+        N times.  ``strict=True`` raises on any record that cannot be
         converted (complete-or-raise scheduling contract, see base class).
         """
         if not statuses:
@@ -234,39 +221,50 @@ class JsonDocStatusStorage(DocStatusStorage):
     async def get_docs_by_track_id(
         self, track_id: str
     ) -> dict[str, DocProcessingStatus]:
-        """Get all documents with a specific track_id"""
+        """Get all documents with a specific track_id.
+
+        Relaxed read path (no ``strict`` variant): this backs the
+        ``/documents/track_status`` display endpoint, not the scheduling
+        control plane, so an unusable row is skipped-and-logged rather than
+        failing the whole listing. That matters because ``track_id`` groups a
+        whole upload BATCH — raising here would hide every healthy sibling
+        document behind one bad row.
+        """
         result = {}
         async with self._storage_lock:
             for k, v in self._data.items():
-                if v.get("track_id") == track_id:
-                    try:
-                        # Make a copy of the data to avoid modifying the original
-                        data = v.copy()
-                        # Remove deprecated content field if it exists
-                        data.pop("content", None)
-                        # Normalize missing or null file_path
-                        if not data.get("file_path"):
-                            data["file_path"] = "no-file-path"
-                        # Ensure new fields exist with default values
-                        if "metadata" not in data:
-                            data["metadata"] = {}
-                        if "error_msg" not in data:
-                            data["error_msg"] = None
-                        result[k] = DocProcessingStatus(**data)
-                    except KeyError as e:
-                        logger.error(
-                            f"[{self.workspace}] Missing required field for document {k}: {e}"
-                        )
-                        continue
+                if not isinstance(v, dict):
+                    # Logged, never silently dropped: a non-mapping record is
+                    # corruption an operator needs to see, and this is the only
+                    # place it surfaces for this track_id. The sibling scans
+                    # report it too (``get_docs_by_statuses`` reaches it via the
+                    # TypeError from its in-``try`` ``v["status"]`` subscript).
+                    logger.error(
+                        f"[{self.workspace}] doc_status record {k} is not a mapping"
+                    )
+                    continue
+                if v.get("track_id") != track_id:
+                    continue
+                try:
+                    result[k] = self._doc_processing_status_from_row(v)
+                except (KeyError, TypeError) as e:
+                    logger.error(
+                        f"[{self.workspace}] Missing required field for document {k}: {e}"
+                    )
+                    continue
         return result
 
     async def index_done_callback(self) -> None:
         """Flush dirty shared memory to disk and clear all dirty flags.
 
         Identical commit protocol to ``JsonKVStorage.index_done_callback``
-        (snapshot the shared dict → ``write_json`` → if sanitization
-        happened reload the cleaned data → ``clear_all_update_flags``).
+        (snapshot the shared dict → ``write_json`` off the event loop → if
+        sanitization happened reload the cleaned data → ``clear_all_update_flags``).
         See ``JsonKVStorage`` docstring for details.
+
+        This is the highest-frequency writer of the three file backends:
+        ``upsert`` persists on every call, so a purge journalling four phases
+        per document commits this file four times for that document alone.
         """
         async with self._storage_lock:
             if self.storage_updated.value:
@@ -277,23 +275,95 @@ class JsonDocStatusStorage(DocStatusStorage):
                 # only reads its argument, so the shallow copy is safe there too.
                 data_dict = self._data.copy()
                 logger.debug(
-                    f"[{self.workspace}] Process {os.getpid()} doc status writting {len(data_dict)} records to {self.namespace}"
+                    f"[{self.workspace}] Process {os.getpid()} doc status writing {len(data_dict)} records to {self.namespace}"
                 )
 
-                # Write JSON and check if sanitization was applied
-                needs_reload = write_json(data_dict, self._file_name)
+                # Off the event loop: this rewrites the whole file, which on a
+                # large corpus takes seconds during which the single worker
+                # serving HTTP would otherwise be blocked. Only the write moves
+                # -- `data_dict` is snapshotted above, on the loop, under the
+                # lock, so the worker thread touches nothing shared.
+                write_outcome: dict[str, bool] = {}
+                reconcile_failure: list[Exception] = []
 
-                # If data was sanitized, reload cleaned data to update shared memory
-                if needs_reload:
-                    logger.info(
-                        f"[{self.workspace}] Reloading sanitized data into shared memory for {self.namespace}"
+                def _write() -> None:
+                    write_outcome["needs_reload"] = write_json(
+                        data_dict, self._file_name
                     )
-                    cleaned_data = load_json(self._file_name)
-                    if cleaned_data is not None:
-                        self._data.clear()
-                        self._data.update(cleaned_data)
 
-                await clear_all_update_flags(self.namespace, workspace=self.workspace)
+                async def _committed() -> None:
+                    # Reconciliation belongs INSIDE the write's uncancellable
+                    # region. The sanitized file is already published at this
+                    # point, so a cancellation landing between the two would
+                    # leave the shared dict holding the rows that failed to
+                    # encode — diverging from disk until some later flush
+                    # happens to sanitize again. Before the offload the write
+                    # and this branch were one unpreemptable synchronous block,
+                    # which is the guarantee being restored here.
+                    #
+                    # Still not offloaded itself: it writes back into the shared
+                    # dict, and it only runs for payloads that fail to encode.
+                    if write_outcome.get("needs_reload"):
+                        logger.info(
+                            f"[{self.workspace}] Reloading sanitized data into shared memory for {self.namespace}"
+                        )
+                        cleaned_data = load_json(self._file_name)
+                        if cleaned_data is not None:
+                            try:
+                                self._data.clear()
+                                self._data.update(cleaned_data)
+                            except Exception as exc:
+                                # NOT publication, and not absorbable. On a
+                                # shared ``Manager().dict()`` these are two
+                                # separate RPCs, so a failure between them
+                                # leaves the shared dict EMPTY while the file on
+                                # disk holds the correct sanitized snapshot —
+                                # and the dirty flags are still set, so the next
+                                # flush would write that empty dict straight
+                                # over it, losing every row in the namespace.
+                                # Recorded so the handler below re-raises
+                                # instead of reporting a healthy deferred
+                                # publication.
+                                reconcile_failure.append(exc)
+                                raise
+
+                    await clear_all_update_flags(
+                        self.namespace, workspace=self.workspace
+                    )
+
+                try:
+                    await commit_in_storage_io(_write, _committed)
+                except CommitBookkeepingError as e:
+                    if reconcile_failure:
+                        # Fail loud. What is unreliable now is the shared
+                        # in-memory view, and no later flush heals it — a later
+                        # flush is what would PUBLISH it. The file on disk is
+                        # the correct snapshot, so the recovery is to stop
+                        # writing to this workspace and restart the workers,
+                        # which reload it. Re-raised as the original failure
+                        # rather than as CommitBookkeepingError: callers read
+                        # that type as "committed, only publication deferred"
+                        # and some deliberately absorb it.
+                        raise reconcile_failure[0]
+                    # Past the guard above, the only thing that can have
+                    # failed is the dirty-flag clear — the file is published and
+                    # the shared dict matches it. That heals on the next flush:
+                    # the flags stay set, so the next index_done_callback
+                    # rewrites this same snapshot and retries the clear.
+                    #
+                    # Not re-raising matters more here than anywhere else:
+                    # `upsert` flushes synchronously precisely so the doc-status
+                    # row is durable before it returns, so reporting that landed
+                    # write as a failure would abort an ingest whose recovery
+                    # anchor is already on disk.
+                    log_without_raising(
+                        logger.error,
+                        f"[{self.workspace}] Doc status for {self.namespace} was "
+                        f"written to {self._file_name}, but its post-write "
+                        f"bookkeeping failed: {e.__cause__}. The dirty flags stay "
+                        "set, so the next commit rewrites this snapshot and "
+                        "retries them.",
+                    )
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         """Insert/update doc-status records and **persist immediately**.
@@ -314,8 +384,8 @@ class JsonDocStatusStorage(DocStatusStorage):
                ``set_all_update_flags`` to mark every process dirty.
             3. Await ``index_done_callback`` for an immediate flush.
 
-        See ``JsonKVStorage`` class docstring for the shared-memory +
-        dirty-flag protocol that underpins step 2.
+        See the contract doc, *Reversed flag semantics*, for the
+        shared-memory + dirty-flag protocol that underpins step 2.
         """
         if not data:
             return
@@ -352,7 +422,8 @@ class JsonDocStatusStorage(DocStatusStorage):
 
     async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
         async with self._storage_lock:
-            return self._data.get(id)
+            data = self._data.get(id)
+            return copy.deepcopy(data) if isinstance(data, dict) else data
 
     async def get_docs_paginated(
         self,
@@ -394,66 +465,78 @@ class JsonDocStatusStorage(DocStatusStorage):
         if sort_direction.lower() not in ["asc", "desc"]:
             sort_direction = "desc"
 
-        # For JSON storage, we load all data and sort/filter in memory
-        all_docs = []
-
+        # Everything below — filtering, hydratability validation, sorting,
+        # page selection, and the final page's deep-copy hydration — runs
+        # inside ONE uninterrupted lock hold. Nothing in this block awaits,
+        # so no concurrent upsert/delete can land between the scan and the
+        # final hydration; splitting these into separate lock acquisitions
+        # let a status update/delete land in that gap, producing a response
+        # that mixed two snapshots (e.g. a status=pending filter returning an
+        # already-updated "processed" row, or overcounting a row that a
+        # concurrent delete then removed before it could be hydrated).
+        #
+        # The scan and validation below are still cheap per document — no
+        # nested-structure copying, just a throwaway shallow
+        # DocProcessingStatus construction (see ``_row_is_hydratable``) — so
+        # holding the lock across them does not reintroduce the "deep-copy
+        # the whole corpus" cost. Only the final page (bounded by page_size,
+        # <=200) is ever deep-copied.
         async with self._storage_lock:
+            projections: list[tuple[Any, str]] = []
             for doc_id, doc_data in self._data.items():
-                # Apply status filter
                 if (
                     status_filter_values is not None
                     and doc_data.get("status") not in status_filter_values
                 ):
                     continue
-
-                try:
-                    # Prepare document data
-                    data = doc_data.copy()
-                    data.pop("content", None)
-                    if not data.get("file_path"):
-                        data["file_path"] = "no-file-path"
-                    if "metadata" not in data:
-                        data["metadata"] = {}
-                    if "error_msg" not in data:
-                        data["error_msg"] = None
-
-                    doc_status = DocProcessingStatus(**data)
-
-                    # Add sort key for sorting
-                    if sort_field == "id":
-                        doc_status._sort_key = doc_id
-                    elif sort_field == "file_path":
-                        # Use pinyin sorting for file_path field to support Chinese characters
-                        file_path_value = getattr(doc_status, sort_field, "")
-                        doc_status._sort_key = get_pinyin_sort_key(file_path_value)
-                    else:
-                        doc_status._sort_key = getattr(doc_status, sort_field, "")
-
-                    all_docs.append((doc_id, doc_status))
-
-                except KeyError as e:
-                    logger.error(
-                        f"[{self.workspace}] Error processing document {doc_id}: {e}"
-                    )
+                # Validate via a real (throwaway) construction attempt rather
+                # than checking a fixed set of required-field names: a row
+                # with an extra/unexpected field fails construction too, and
+                # must be excluded from total_count for the same reason a
+                # missing field is — otherwise total_count could count rows
+                # the page-hydration step below can never actually return.
+                if not self._row_is_hydratable(doc_id, doc_data):
                     continue
 
-        # Sort documents
-        reverse_sort = sort_direction.lower() == "desc"
-        all_docs.sort(
-            key=lambda x: getattr(x[1], "_sort_key", ""), reverse=reverse_sort
-        )
+                if sort_field == "id":
+                    sort_key = doc_id
+                elif sort_field == "file_path":
+                    # Use pinyin sorting for file_path field to support Chinese
+                    # characters; "no-file-path" mirrors the fallback applied
+                    # during hydration (_doc_processing_status_from_row) so
+                    # sort order matches what the hydrated page would use.
+                    sort_key = get_pinyin_sort_key(
+                        doc_data.get("file_path") or "no-file-path"
+                    )
+                else:
+                    sort_key = doc_data.get(sort_field, "")
+                projections.append((sort_key, doc_id))
 
-        # Remove sort key from documents
-        for doc_id, doc in all_docs:
-            if hasattr(doc, "_sort_key"):
-                delattr(doc, "_sort_key")
+            total_count = len(projections)
 
-        total_count = len(all_docs)
+            reverse_sort = sort_direction.lower() == "desc"
+            projections.sort(key=lambda t: t[0], reverse=reverse_sort)
 
-        # Apply pagination
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        paginated_docs = all_docs[start_idx:end_idx]
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            page_doc_ids = [doc_id for _, doc_id in projections[start_idx:end_idx]]
+
+            # Deep-copy and hydrate ONLY the requested page. Each doc_id here
+            # was validated as hydratable above in this same uninterrupted
+            # critical section, so the row is guaranteed present and usable.
+            paginated_docs: list[tuple[str, DocProcessingStatus]] = []
+            for doc_id in page_doc_ids:
+                row = self._data[doc_id]
+                # Pagination never surfaces chunks_list (DocStatusResponse
+                # doesn't expose it — see the PG backend's paged CTE, which
+                # excludes the column for the same reason), so drop it before
+                # hydration instead of deep-copying a potentially large
+                # chunk-id list only to discard it.
+                row_without_chunks = {
+                    k: v for k, v in row.items() if k != "chunks_list"
+                }
+                doc_status = self._doc_processing_status_from_row(row_without_chunks)
+                paginated_docs.append((doc_id, doc_status))
 
         return paginated_docs, total_count
 
@@ -513,7 +596,11 @@ class JsonDocStatusStorage(DocStatusStorage):
             for doc_id, doc_data in self._data.items():
                 if doc_data.get("file_path") == file_path:
                     # Return complete document data, consistent with get_by_ids method
-                    return doc_data
+                    return (
+                        copy.deepcopy(doc_data)
+                        if isinstance(doc_data, dict)
+                        else doc_data
+                    )
 
         return None
 
@@ -554,7 +641,7 @@ class JsonDocStatusStorage(DocStatusStorage):
                 if doc_data.get("file_path") == basename and not self._is_duplicate_row(
                     doc_data
                 ):
-                    return doc_id, doc_data
+                    return doc_id, copy.deepcopy(doc_data)
         return None
 
     async def resolve_doc_source_strict(
@@ -605,7 +692,7 @@ class JsonDocStatusStorage(DocStatusStorage):
             raise StorageNotInitializedError("JsonDocStatusStorage")
         async with self._storage_lock:
             row = self._data.get(id)
-        return row.copy() if isinstance(row, dict) else row
+        return copy.deepcopy(row) if isinstance(row, dict) else row
 
     async def get_doc_by_content_hash(
         self, content_hash: str, *, exclude_doc_id: str | None = None
@@ -646,7 +733,7 @@ class JsonDocStatusStorage(DocStatusStorage):
                     best = (sort_key, doc_id, doc_data)
         if best is None:
             return None
-        return best[1], best[2]
+        return best[1], copy.deepcopy(best[2]) if isinstance(best[2], dict) else best[2]
 
     # ------------------------------------------------------------------
     # Memory-bounding scheduling API (Phase 1)
@@ -717,21 +804,67 @@ class JsonDocStatusStorage(DocStatusStorage):
             return None
 
     @staticmethod
-    def _doc_processing_status_from_row(row: dict[str, Any]) -> DocProcessingStatus:
-        """Normalise a raw doc_status row into a FULL DocProcessingStatus.
-
-        Single source of the raw → status construction shared by
-        ``get_docs_by_statuses`` and the ``get_full_docs_by_ids`` hydration
-        path. Raises ``KeyError``/``TypeError`` on a malformed row; the caller
-        decides strict (raise) vs relaxed (skip).
-        """
-        data = dict(row)
+    def _normalize_status_row(data: dict[str, Any]) -> dict[str, Any]:
+        """Field normalisation shared by hydration and validation: pop the
+        deprecated ``content`` field, default missing/falsy ``file_path``,
+        default missing ``metadata``/``error_msg``. Mutates and returns
+        ``data`` in place — the caller decides whether ``data`` is a deep
+        copy (safe to expose) or a shallow/throwaway one (validation only,
+        see ``_row_is_hydratable``)."""
         data.pop("content", None)  # deprecated inline content, never a status field
         if not data.get("file_path"):
             data["file_path"] = "no-file-path"
         data.setdefault("metadata", {})
         data.setdefault("error_msg", None)
-        return DocProcessingStatus(**data)
+        return data
+
+    @classmethod
+    def _doc_processing_status_from_row(
+        cls, row: dict[str, Any]
+    ) -> DocProcessingStatus:
+        """Normalise a raw doc_status row into a FULL DocProcessingStatus.
+
+        Single source of the raw → status construction shared by
+        ``get_docs_by_statuses``, ``get_docs_paginated`` and the
+        ``get_full_docs_by_ids`` hydration path. Raises ``KeyError``/
+        ``TypeError`` on a malformed row (missing required fields); the
+        caller decides strict (raise) vs relaxed (skip). Fields the
+        dataclass does not declare are tolerated, not treated as malformed
+        — see ``DocProcessingStatus.from_stored``.
+
+        Deep-copies ``row`` before use: the returned ``DocProcessingStatus``
+        carries nested mutable fields (``metadata``, ``chunks_list``) that
+        must not alias the live storage row, or a caller mutating them would
+        corrupt persisted state without going through ``upsert`` — the same
+        class of bug fixed for the other read paths.
+        """
+        data = cls._normalize_status_row(copy.deepcopy(row))
+        return DocProcessingStatus.from_stored(data)
+
+    def _row_is_hydratable(self, doc_id: str, row: dict[str, Any]) -> bool:
+        """True if ``row`` can be hydrated into a full DocProcessingStatus.
+
+        Used by ``get_docs_paginated``'s validation pass to keep
+        ``total_count`` consistent with what the page-hydration step can
+        actually return: a row missing a required field would fail
+        construction — counting it as present without confirming that
+        would let ``total_count`` overstate what pages can actually
+        deliver. (Fields the dataclass does not declare are tolerated,
+        not treated as malformed.)
+
+        Attempts the SAME normalisation + construction as
+        ``_doc_processing_status_from_row``, but on a shallow copy that is
+        discarded immediately (never returned to a caller), so it validates
+        constructibility without paying the deep-copy cost across every
+        matching document — only the final page (bounded by page_size) is
+        ever deep-copied.
+        """
+        try:
+            DocProcessingStatus.from_stored(self._normalize_status_row(dict(row)))
+            return True
+        except (KeyError, TypeError) as e:
+            logger.error(f"[{self.workspace}] Error processing document {doc_id}: {e}")
+            return False
 
     async def get_docs_by_statuses_page(
         self,
@@ -1081,7 +1214,7 @@ class JsonDocStatusStorage(DocStatusStorage):
             ``drop`` is destructive and **not** serialized by this
             storage class. The caller must hold the pipeline ``busy``
             reservation (the ``/documents/clear`` endpoint does this)
-            before invoking it. See class docstring,
+            before invoking it. See the contract doc,
             *Non-pipeline write paths*.
 
         Returns:

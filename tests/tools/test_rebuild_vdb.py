@@ -2,21 +2,25 @@
 
 Covers:
 - rebuild: payload fidelity against the authoritative write points,
-  bidirectional edge dedup, AGE quote stripping, dirty-data skipping,
-  drop-before-upsert ordering, batching with periodic flushes, and
-  error collection on persistently failing batches.
-- check: consistent stores, missing-record detection, legacy reverse
-  relation ids not being misreported, and batching.
+  bidirectional edge dedup, quote-bearing id preservation, dirty-data
+  skipping, drop-before-upsert ordering, batching with periodic flushes,
+  and error collection on persistently failing batches.
+- check: consistent stores, missing-record detection, quote-bearing ids
+  matching the VDB and being reported verbatim, legacy reverse relation ids
+  not being misreported, and batching.
 - merge: _merge_entities_impl raising VectorStorageConsistencyError on
   persistent VDB failure without deleting source entities.
 """
 
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import lightrag.tools.rebuild_vdb as rebuild_vdb
+from lightrag.exceptions import VectorSpaceMismatchError
+from lightrag.kg.noop_vector_db_impl import NoopVectorDBStorage
+from lightrag.namespace import NameSpace
 from lightrag.tools.rebuild_vdb import (
-    _strip_agtype_quotes,
     check_vdb_consistency,
     rebuild_chunks_vdb,
     rebuild_entities_vdb,
@@ -31,9 +35,50 @@ from lightrag.utils import (
 pytestmark = pytest.mark.offline
 
 
+# An entity_id whose surrounding double quotes are part of the id itself, and
+# which the ordinary extraction path can actually produce: normalize_entity_name
+# strips an outer quote pair only when the inner content carries no double quote
+# of its own, so '"Alice"' normalizes down to 'Alice' and never reaches the
+# graph quoted, while this form survives intact. Pre-normalization data and
+# ainsert_custom_kg can carry either shape.
+#
+# The deleted _strip_agtype_quotes corrupted every id of this shape (see
+# lightrag/tools/rebuild_vdb.py history): the AGE ``agtype::text`` cast emits
+# the scalar's raw content ('Bob', not '"Bob"'), so the helper never had a cast
+# artifact to remove and only ever ate real characters. Each test below pins one
+# of its former call sites; they fail behaviourally if the strip returns.
+QUOTE_BEARING_ID = '"Al"ice"'
+
+
 # ---------------------------------------------------------------------------
 # Mocks
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_library_rebuild_rejects_noop_vector_storage_before_source_reads():
+    noop_vdb = NoopVectorDBStorage(
+        namespace="test_vectors",
+        workspace="",
+        global_config={},
+        embedding_func=None,
+    )
+    graph = SimpleNamespace(
+        get_all_nodes=AsyncMock(),
+        get_all_edges=AsyncMock(),
+    )
+    text_chunks = SimpleNamespace()
+    error_match = "NoopVectorDBStorage.*persistent vector storage"
+
+    with pytest.raises(RuntimeError, match=error_match):
+        await rebuild_entities_vdb(graph, noop_vdb, {})
+    with pytest.raises(RuntimeError, match=error_match):
+        await rebuild_relationships_vdb(graph, noop_vdb, {})
+    with pytest.raises(RuntimeError, match=error_match):
+        await rebuild_chunks_vdb(text_chunks, noop_vdb)
+
+    graph.get_all_nodes.assert_not_awaited()
+    graph.get_all_edges.assert_not_awaited()
 
 
 class MockVDB:
@@ -160,6 +205,21 @@ async def test_rebuild_entities_handles_missing_optional_fields():
 
 
 @pytest.mark.asyncio
+async def test_rebuild_entities_preserves_quote_bearing_entity_id():
+    # get_all_nodes() parses the whole ``properties`` object with json.loads, so
+    # entity_id arrives as a plain Python string and a quote here is part of the
+    # name. It must reach both the record id and entity_name unchanged, or the
+    # rebuilt entity stops matching its own graph node.
+    graph = make_graph(nodes=[node(QUOTE_BEARING_ID)])
+    vdb = MockVDB()
+
+    await rebuild_entities_vdb(graph, vdb, {})
+
+    entity_id = compute_mdhash_id(QUOTE_BEARING_ID, prefix="ent-")
+    assert vdb.records[entity_id]["entity_name"] == QUOTE_BEARING_ID
+
+
+@pytest.mark.asyncio
 async def test_rebuild_entities_skips_dirty_nodes():
     graph = make_graph(nodes=[node("Alice"), {"description": "no id"}, node("  ")])
     vdb = MockVDB()
@@ -282,15 +342,17 @@ async def test_rebuild_relationships_dedupes_bidirectional_edges():
 
 
 @pytest.mark.asyncio
-async def test_rebuild_relationships_strips_age_quotes():
-    # PG/AGE agtype::text casts wrap endpoint strings in double quotes
-    graph = make_graph(edges=[edge('"Alice"', '"Bob"')])
+async def test_rebuild_relationships_preserves_quote_bearing_endpoint_ids():
+    # get_all_edges already returns plain entity_ids, so a quote-bearing
+    # endpoint must reach the rebuilt record unchanged -- both in the payload
+    # and in the id it is hashed into.
+    graph = make_graph(edges=[edge(QUOTE_BEARING_ID, "Bob")])
     vdb = MockVDB()
 
     await rebuild_relationships_vdb(graph, vdb, {})
 
-    rel_id = compute_mdhash_id("AliceBob", prefix="rel-")
-    assert vdb.records[rel_id]["src_id"] == "Alice"
+    rel_id = compute_mdhash_id(QUOTE_BEARING_ID + "Bob", prefix="rel-")
+    assert vdb.records[rel_id]["src_id"] == QUOTE_BEARING_ID
     assert vdb.records[rel_id]["tgt_id"] == "Bob"
 
 
@@ -303,14 +365,6 @@ async def test_rebuild_relationships_skips_edges_without_endpoints():
 
     assert stats["rebuilt"] == 1
     assert stats["skipped"] == 1
-
-
-def test_strip_agtype_quotes():
-    assert _strip_agtype_quotes('"Alice"') == "Alice"
-    assert _strip_agtype_quotes("Alice") == "Alice"
-    assert _strip_agtype_quotes('"') == '"'
-    assert _strip_agtype_quotes(None) is None
-    assert _strip_agtype_quotes(3) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +502,39 @@ async def test_check_detects_missing_records():
     assert report["missing_entity_names"] == ["Bob"]
     assert report["missing_relations"] == 1
     assert report["missing_relation_pairs"] == ["Bob ~ Carol"]
+
+
+@pytest.mark.asyncio
+async def test_check_matches_quote_bearing_ids_against_the_vdb():
+    # The check hashes graph names into the ids it looks up, so rewriting a name
+    # makes it miss a record that is present. Rebuild and check must derive the
+    # same id from the same node/edge, or the tool reports phantom gaps and
+    # sends the operator into a needless (and billable) re-embed.
+    nodes = [node(QUOTE_BEARING_ID)]
+    edges = [edge(QUOTE_BEARING_ID, "Bob")]
+    graph = make_graph(nodes=nodes, edges=edges)
+    entities_vdb, relationships_vdb = seeded_vdbs(nodes, edges)
+
+    report = await check_vdb_consistency(graph, entities_vdb, relationships_vdb)
+
+    assert report["missing_entities"] == 0
+    assert report["missing_relations"] == 0
+    assert report["consistent"] is True
+
+
+@pytest.mark.asyncio
+async def test_check_reports_quote_bearing_names_verbatim():
+    # The report is what the operator greps the graph with, so a name printed
+    # here has to be the name actually stored.
+    graph = make_graph(
+        nodes=[node(QUOTE_BEARING_ID)], edges=[edge(QUOTE_BEARING_ID, "Bob")]
+    )
+
+    report = await check_vdb_consistency(graph, MockVDB(), MockVDB())
+
+    assert report["consistent"] is False
+    assert report["missing_entity_names"] == [QUOTE_BEARING_ID]
+    assert report["missing_relation_pairs"] == [f"{QUOTE_BEARING_ID} ~ Bob"]
 
 
 @pytest.mark.asyncio
@@ -611,9 +698,11 @@ async def test_merge_entity_vdb_failure_raises_consistency_error(
 async def test_merge_source_entity_delete_failure_raises_consistency_error(
     single_attempt_vdb_ops,
 ):
-    # Step 10 deletes the source node from the graph first, then its vector
-    # record. A delete failure here happens AFTER the graph node is gone, so it
-    # must fail loud with a message that does not claim the source still exists.
+    # Step 10 deletes the source entities' vector records BEFORE removing their
+    # nodes, so a delete failure here leaves the graph untouched: the sources
+    # are still present with their chunk tracking intact and a retry is safe.
+    # It still fails loud -- vector records deleted before the failure leave
+    # those entities without an embedding until a retry or an offline rebuild.
     from lightrag.utils_graph import _merge_entities_impl
 
     graph = make_merge_graph()
@@ -628,9 +717,11 @@ async def test_merge_source_entity_delete_failure_raises_consistency_error(
 
     message = str(excinfo.value)
     assert "lightrag-rebuild-vdb" in message
-    # The source node was already removed; the message must not claim otherwise.
-    graph.delete_node.assert_awaited_with("Bob")
-    assert "were not deleted" not in message
+    # The node removal never ran, and the message must say so: claiming the
+    # source was already gone would send an operator looking for a repair that
+    # is not owed, and would hide that a plain retry is the fix.
+    graph.delete_node.assert_not_awaited()
+    assert "were NOT removed from the knowledge graph" in message
     entities_vdb.delete.assert_awaited()
 
 
@@ -943,3 +1034,225 @@ def test_main_exits_zero_on_success(monkeypatch):
 
     # No SystemExit on success.
     rebuild_vdb.main()
+
+
+# ---------------------------------------------------------------------------
+# Embedding-space refusal: the tool must tolerate it, and only it
+# ---------------------------------------------------------------------------
+
+
+def _mismatch(container="entities_index"):
+    return VectorSpaceMismatchError(
+        backend="FakeVectorStorage",
+        container=container,
+        expected_model="new-model",
+        expected_dim=1024,
+        stored_model="old-model",
+        stored_dim=1024,
+    )
+
+
+class _RefusingVDB(MockVDB):
+    """A vector storage that refuses to attach until it has been dropped.
+
+    Models the contract every backend owes: the refusal leaves the instance
+    able to serve ``drop()``, and ``drop()`` re-provisions the container in the
+    current embedding space so the next ``initialize()`` attaches cleanly.
+    """
+
+    def __init__(self, refusals=1):
+        super().__init__()
+        self._refusals_left = refusals
+        self.init_calls = 0
+
+        async def _initialize():
+            self.init_calls += 1
+            if self._refusals_left > 0:
+                self._refusals_left -= 1
+                raise _mismatch()
+
+        async def _drop():
+            self.call_order.append("drop")
+            self.records.clear()
+            # A drop re-provisions the container, which is what clears the
+            # refusal; without this the tool would loop forever.
+            self._refusals_left = 0
+            return {"status": "success", "message": "data dropped"}
+
+        self.initialize = AsyncMock(side_effect=_initialize)
+        self.drop = AsyncMock(side_effect=_drop)
+
+
+def _tool_with_storages(entities, relationships, chunks):
+    tool = rebuild_vdb.RebuildTool()
+    tool.graph = SimpleNamespace(initialize=AsyncMock())
+    tool.text_chunks = SimpleNamespace(initialize=AsyncMock())
+    tool.entities_vdb = entities
+    tool.relationships_vdb = relationships
+    tool.chunks_vdb = chunks
+    for vdb in (entities, relationships, chunks):
+        if not hasattr(vdb, "initialize"):
+            vdb.initialize = AsyncMock()
+    tool.storage_names = {"graph": "g", "vector": "v", "kv": "k"}
+    tool.embedding_func = SimpleNamespace(
+        model_name="new-model", embedding_dim=1024, max_token_size=None
+    )
+    tool.embedding_available = True
+    return tool
+
+
+async def _setup_with(tool, monkeypatch):
+    """Drive the real setup_storages() with the test's fakes behind the factory.
+
+    The factory hands back exactly the objects the test built, keyed by
+    namespace, so the assertions inspect the same instances setup_storages()
+    initialized — a factory returning bare stand-ins would make every one of
+    these tests pass on an AttributeError instead of on the behaviour.
+    """
+    monkeypatch.setattr(tool, "resolve_storage_names", lambda: tool.storage_names)
+    monkeypatch.setattr(tool, "check_env_vars", lambda name: None)
+    monkeypatch.setattr(tool, "build_embedding_func", lambda: tool.embedding_func)
+    monkeypatch.setattr(
+        tool, "build_global_config", lambda: {"working_dir": "./rag_storage"}
+    )
+
+    by_namespace = {
+        NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION: tool.graph,
+        NameSpace.KV_STORE_TEXT_CHUNKS: tool.text_chunks,
+        NameSpace.VECTOR_STORE_ENTITIES: tool.entities_vdb,
+        NameSpace.VECTOR_STORE_RELATIONSHIPS: tool.relationships_vdb,
+        NameSpace.VECTOR_STORE_CHUNKS: tool.chunks_vdb,
+    }
+
+    def _fake_get_storage_class(name):
+        def _factory(*, namespace, **kwargs):
+            return by_namespace[namespace]
+
+        return _factory
+
+    import lightrag.kg.factory as factory
+
+    monkeypatch.setattr(factory, "get_storage_class", _fake_get_storage_class)
+    return await tool.setup_storages()
+
+
+@pytest.mark.asyncio
+async def test_setup_records_a_refused_vdb_instead_of_aborting(monkeypatch):
+    entities = _RefusingVDB()
+    tool = _tool_with_storages(entities, MockVDB(), MockVDB())
+
+    assert await _setup_with(tool, monkeypatch) is True
+
+    assert list(tool.incompatible_vdbs) == ["entities"]
+    assert "lightrag-rebuild-vdb" in tool.incompatible_vdbs["entities"]
+    # The sources and the healthy targets still came up.
+    tool.graph.initialize.assert_awaited()
+    tool.text_chunks.initialize.assert_awaited()
+    tool.relationships_vdb.initialize.assert_awaited()
+    tool.chunks_vdb.initialize.assert_awaited()
+    # A refusal is not a repair: nothing was dropped during setup.
+    entities.drop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_aborts_when_a_source_storage_fails(monkeypatch):
+    tool = _tool_with_storages(MockVDB(), MockVDB(), MockVDB())
+    tool.graph.initialize = AsyncMock(side_effect=RuntimeError("cluster down"))
+    assert await _setup_with(tool, monkeypatch) is False
+
+
+@pytest.mark.asyncio
+async def test_setup_aborts_on_a_non_typed_vector_failure(monkeypatch):
+    # A cluster outage must never be mistaken for a model change: the recovery
+    # for the typed refusal is destructive.
+    entities = MockVDB()
+    entities.initialize = AsyncMock(side_effect=RuntimeError("connection refused"))
+    tool = _tool_with_storages(entities, MockVDB(), MockVDB())
+    for vdb in (tool.relationships_vdb, tool.chunks_vdb):
+        vdb.initialize = AsyncMock()
+
+    assert await _setup_with(tool, monkeypatch) is False
+    assert tool.incompatible_vdbs == {}
+
+
+@pytest.mark.asyncio
+async def test_recovery_drops_then_reinitializes_the_refused_target():
+    entities = _RefusingVDB()
+    tool = _tool_with_storages(entities, MockVDB(), MockVDB())
+    with pytest.raises(VectorSpaceMismatchError):
+        await entities.initialize()  # the setup-time refusal
+    tool.incompatible_vdbs = {"entities": "refused"}
+
+    await tool.recover_incompatible(["entities", "relationships"])
+
+    entities.drop.assert_awaited_once()
+    # Two calls: the refusal, then the clean attach after the drop.
+    assert entities.init_calls == 2
+    assert tool.incompatible_vdbs == {}
+    # A target that never refused is left alone — no gratuitous drop.
+    tool.relationships_vdb.drop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_not_reinitialize_when_the_drop_fails():
+    entities = _RefusingVDB()
+    entities.drop = AsyncMock(return_value={"status": "error", "message": "no perms"})
+
+    with pytest.raises(RuntimeError, match="Failed to drop"):
+        await rebuild_vdb.clear_vector_space_refusal(entities, "entities")
+    assert entities.init_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_check_reports_the_refusal_instead_of_all_records_missing():
+    graph = make_graph(
+        nodes=[node("Alice"), node("Bob")],
+        edges=[edge("Alice", "Bob")],
+    )
+    entities_vdb, relationships_vdb = MockVDB(), MockVDB()
+
+    report = await check_vdb_consistency(
+        graph,
+        entities_vdb,
+        relationships_vdb,
+        incompatible={"entities": str(_mismatch())},
+    )
+
+    assert report["incompatible"]["entities"]
+    assert report["consistent"] is False
+    # The refused store is not probed at all, so it reports no false drift.
+    entities_vdb.get_by_ids.assert_not_awaited()
+    assert report["missing_entities"] == 0
+    assert report["graph_entities"] == 2
+    # Its healthy sibling is still probed and still reports honestly.
+    relationships_vdb.get_by_ids.assert_awaited()
+    assert report["missing_relations"] == 1
+
+
+@pytest.mark.asyncio
+async def test_check_without_refusals_is_unchanged():
+    graph = make_graph(nodes=[node("Alice")])
+    report = await check_vdb_consistency(graph, MockVDB(), MockVDB())
+    assert report["incompatible"] == {}
+    assert report["consistent"] is False  # the vdb really is empty
+    assert report["missing_entities"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_recovers_refused_targets_before_rebuilding(monkeypatch):
+    tool = _runnable_tool(monkeypatch, iter(["2", "0"]))
+    tool.setup_storages = AsyncMock(return_value=True)
+    tool.embedding_available = True
+    tool.print_source_counts = AsyncMock()
+    monkeypatch.setattr(tool, "confirm_rebuild", lambda targets: True)
+    tool.incompatible_vdbs = {"entities": "refused", "chunks": "refused"}
+    tool.recover_incompatible = AsyncMock()
+
+    ok = rebuild_vdb._new_stats("entities", 1)
+    ok["rebuilt"] = 1
+    tool.run_rebuild_entities_relations = AsyncMock(return_value=[ok])
+
+    assert await tool.run() is True
+    # Option 2 rebuilds entities + relationships only, so only those are
+    # recovered; chunks stays refused until its own rebuild.
+    tool.recover_incompatible.assert_awaited_once_with(["entities", "relationships"])

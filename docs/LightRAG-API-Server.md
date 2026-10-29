@@ -8,9 +8,9 @@ The LightRAG Server is designed to provide a Web UI and API support. The Web UI 
 
 ![image-20250323123011220](./LightRAG-API-Server.assets/image-20250323123011220.png)
 
-## Upgrading from v1.4.16 to v1.5.0rc2
+## Upgrading from v1.4.16 to v1.5.x
 
-The v1.5.0rc2 release adds the new file-processing pipeline, parser routing, multimodal analysis, role-specific LLM/VLM configuration, JSON entity extraction, and several provider/storage changes. Review the [v1.5.0rc2 release notes](https://github.com/HKUDS/LightRAG/releases/tag/v1.5.0rc2) before upgrading a production instance.
+LightRAG v1.5.x adds the new file-processing pipeline, parser routing, multimodal analysis, role-specific LLM/VLM configuration, JSON entity extraction, and several provider/storage changes. Review the [v1.5.0rc2 release notes](https://github.com/HKUDS/LightRAG/releases/tag/v1.5.0rc2) before upgrading a production instance.
 
 - To keep the old file-processing behavior while upgrading the server, set:
 
@@ -240,6 +240,19 @@ lightrag-server --port 9621
 
 The backend passes this value to FastAPI as `root_path` and injects the same runtime prefix into the WebUI. The WebUI is always mounted at `/webui` inside the server, so one frontend build can serve any prefix. See [Single-Server Multi-Site Deployment](./MultiSiteDeployment.md) for full Nginx, Docker, and Kubernetes examples.
 
+### The `/workspace` Query Entry
+
+Besides the admin WebUI at `/webui`, the server mounts a second entry at `/workspace`: a query-only UI for everyday knowledge-base users. It shows nothing but the chat surface (no document management, no knowledge graph, no query-parameter sidebar, no API-docs links) and is built for mobile use. Unauthenticated visitors see a customizable welcome page first; `/webui` keeps showing its login page directly. Both entries come from the same frontend build (`index.html` + `workspace.html`) and both honor `LIGHTRAG_API_PREFIX`.
+
+- `LIGHTRAG_DEFAULT_UI` / `--default-ui` (`webui` by default, or `workspace`) controls exactly one behavior: which entry the root path `/` redirects to. Both entries stay mounted regardless; an illegal value fails startup.
+- Query parameters on `/workspace` are **inherited, not editable**: each query uses the `querySettings` saved by `/webui` in the same browser (frontend defaults when none were saved). **This is per-browser local state, not a server-wide policy** — the two entries share one browser's storage, so an end user opening `/workspace` on their own device gets the frontend defaults, not the parameters an admin saved elsewhere. The browser scopes that storage by ORIGIN and the keys are not namespaced by `LIGHTRAG_API_PREFIX`, so sites sharing one host share these parameters too — see [MultiSiteDeployment.md](./MultiSiteDeployment.md). **Within one browser, the admin's saved query `mode` therefore decides the query entry's behavior too** — including `bypass`, which skips retrieval and sends the last 3 conversation turns straight to the LLM. The two debug switches `only_need_context` / `only_need_prompt` are the exception: `/workspace` always sends them as `false`, so a debug switch left on in `/webui` can never turn end-user answers into raw context dumps.
+- Query histories are separate per entry: admins' debugging conversations never appear in (or get sent as context from) the query entry, and vice versa.
+- `UI_TEMPLATES_DIR` points at an optional read-only, multi-language UI bundle that replaces the welcome page text, the query empty-state text and the brand logo without rebuilding the frontend, and can add a login-page blurb, a consent gate and a copyright line — see [UserDefinedUI.md](./UserDefinedUI.md) for the complete guide and `docs/ui_templates_example/` for a copyable bundle. Unset means the frontend's built-in branding, and so does a directory that holds no `manifest.json` yet — the unpopulated-mount state the shipped compose files start in, logged as a warning naming the directory. Once a `manifest.json` is there, an invalid bundle fails startup. Content changes require a restart; text is served `no-store` and logos through content-hashed immutable URLs, so no manual cache purge is needed. A locale that declares BOTH `login` (a login-page blurb) and `agreements` (one document holding the privacy policy and the model service agreement) turns on the login consent gate: the login page then shows a checkbox — "I agree to the Privacy Policy and Model Service Agreement" — whose single link opens that document, and sign-in is refused until it is ticked. Declaring only one of the two leaves the gate off, and a declared-but-empty file fails startup. The gate covers credentialed sign-in only: a deployment with authentication disabled (`AUTH_ACCOUNTS` unset) admits visitors as guests without it, because there is no identified user to hold to an agreement — configure `AUTH_ACCOUNTS` if the agreement must be accepted. Bundle locales are independent of the WebUI's own interface languages (`en`, `zh`, `zh-TW`, `fr`, `ar`, `ru`, `ja`, `de`, `uk`, `ko`, `vi`): a bundle may declare any valid BCP 47 locale, but content in a locale outside that set renders beside controls that stay in the visitor's resolved UI language, and startup logs a warning naming those locales.
+- `ENABLE_AI_CONTENT_NOTICE=true` labels every answer as AI-generated in BOTH query UIs (`/workspace` and the `/webui` retrieval panel): appended to the response-time line under each answer, worded in the interface language ("AI-generated content — please verify."). Off by default. The label is a UI element only — it is never appended to the `/query` response, to the copied message text, or to the stored chat history. The setting reaches the frontend on `/auth-status`, `/login` and `/health` as `ai_content_notice_enabled`, so both entries pick it up at boot. Only text an LLM actually wrote is labelled: `/query` and `/query/stream` report `llm_generated` per response, which is false for the canned no-context reply and for the `only_need_context` / `only_need_prompt` debug output.
+- `/health` reports `webui_available` and `workspace_available` independently; an older prebuilt frontend without `workspace.html` keeps `/webui` fully functional while `/workspace` answers with a fixed JSON notice (never a redirect to the API docs).
+
+Hiding the admin UI from query users is a UX split, **not** a security boundary: API authorization is still enforced server-side for every endpoint.
+
 > **`WHITELIST_PATHS` is written without the prefix.** Its entries are internal route paths, exactly as the routes are declared. The mount prefix is removed before matching, in both forwarding styles, so with `LIGHTRAG_API_PREFIX=/site01` the shipped default `WHITELIST_PATHS=/health,/api/*` is already correct and exempts `/site01/health` as the browser sees it. Writing the browser-visible form (`WHITELIST_PATHS=/site01/health`) matches nothing and makes those paths require authentication.
 
 ### Launching LightRAG Server with Docker
@@ -312,6 +325,10 @@ EMBEDDING_DIM=3072
 EMBEDDING_TOKEN_LIMIT=8192
 EMBEDDING_SEND_DIM=false
 EMBEDDING_USE_BASE64=true
+# Overlap (in tokens) the embedding hard fallback borrows from the previous
+# chunk's tail when a chunk still exceeds EMBEDDING_TOKEN_LIMIT after
+# chunking. Independent of CHUNK_OVERLAP_SIZE. Default 100; 0 disables it.
+# EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE=100
 
 ############################
 ### Data storage selection
@@ -420,7 +437,7 @@ Before exposing this deployment, configure authentication, API keys, and SSL in 
 Important rules before processing production data:
 
 - Choose the embedding model, embedding dimension, and asymmetric embedding settings before the first upload. Changing them later requires clearing the affected workspace/vector data and re-indexing documents.
-- Choose storage backends before the first upload. Direct migration between storage implementations is not supported.
+- Choose storage backends before the first upload. Direct migration between storage implementations is not supported, with one exception: an already-extracted graph can be moved from `PGGraphStorage` to `PGTableGraphStorage` without re-indexing — see *Graph Migration From Apache AGE To PostgreSQL Tables* below.
 - Changing `LIGHTRAG_PARSER` affects only newly uploaded files. Delete and upload an existing document again if you want it processed by a different parser route.
 
 ### Nginx Reverse Proxy Configuration
@@ -488,12 +505,7 @@ server {
    - LightRAG performs streaming validation during upload
    - Setting appropriate limits at both layers ensures better error messages and security
 6. **Server-side request limits** (see `env.example`):
-   - `MAX_REQUEST_BODY_BYTES` bounds the raw body of **every** route, counted as
-     it streams through ASGI. Unlike `MAX_UPLOAD_SIZE` (which bounds one uploaded
-     file after multipart parsing), it also stops a body that understates or
-     omits its `Content-Length`, answering **413** before the whole body is read.
-     It is layered, because routes differ by orders of magnitude in what they
-     legitimately carry:
+   - `MAX_REQUEST_BODY_BYTES` bounds the raw body of **every** route, counted as it streams through ASGI. Unlike `MAX_UPLOAD_SIZE` (which bounds one uploaded file after multipart parsing), it also stops a body that understates or omits its `Content-Length`, answering **413** before the whole body is read. It is layered, because routes differ by orders of magnitude in what they legitimately carry:
 
      | Route | Ceiling |
      |---|---|
@@ -501,32 +513,12 @@ server {
      | `/documents/text`, `/documents/texts` | **50 MiB**, built in, when `MAX_REQUEST_BODY_BYTES` is not set |
      | `/documents/upload` | `MAX_UPLOAD_SIZE` + 1 MiB of multipart overhead |
 
-     Setting `MAX_REQUEST_BODY_BYTES` to any positive value makes it govern
-     every non-upload route, ingestion included — including when that value
-     happens to equal the 1 MiB default, which is the behaviour this knob had
-     before the tiers existed. Setting it to `0` turns off every ceiling,
-     including the derived upload one, and the server warns at startup.
-   - **Input field ceilings** apply to the model-facing fields of `/query*`,
-     `/api/chat` and `/api/generate`: 64 KiB per query or prompt, 32 KiB per
-     message, 128 KiB of model-facing text per request, 128 messages, and upper
-     bounds on `top_k` / `chunk_top_k` (1000) and the `max_*_tokens` budgets
-     (1,000,000). These are fixed rather than configurable — a limit that keeps
-     an unauthenticated caller from choosing how much CPU the server spends is
-     worth nothing if it can be misconfigured away. `/query*` answers **422** for
-     an over-limit field (FastAPI's own validation response); `/api/*` answers
-     **413**.
-   - `MAX_TEXTS_PER_REQUEST` bounds how many texts one `/documents/texts` request
-     may carry, answering **413** before any per-text storage lookup. It bounds
-     the fan-out of a single request, so — unlike the capacity limit below — it is
-     not a "retry later" condition: an oversized batch never fits and must be
-     split.
-   - `MAX_PENDING_DOCUMENTS` bounds how many documents may be active
-     (`PENDING`/`PARSING`/`ANALYZING`/`PROCESSING`) or reserved by an in-flight
-     request. Over capacity the server answers **429** with a `Retry-After`
-     header and a detail naming the current count, the requested count and the
-     capacity — refused *before* the body is transferred. `/documents/scan` and
-     manual retries exceed the cap on purpose; the documents they create make
-     ordinary uploads wait.
+     Setting `MAX_REQUEST_BODY_BYTES` to any positive value makes it govern every non-upload route, ingestion included — including when that value happens to equal the 1 MiB default, which is the behaviour this knob had before the tiers existed. Setting it to `0` turns off every ceiling, including the derived upload one, and the server warns at startup.
+   - **Input field ceilings** apply to the model-facing fields of `/query*`, `/api/chat` and `/api/generate`: 64 KiB per query or prompt, 32 KiB per message, 128 KiB of model-facing text per request, 128 messages, and upper bounds on `top_k` / `chunk_top_k` (1000) and the `max_*_tokens` budgets (1,000,000). These are fixed rather than configurable — a limit that keeps an unauthenticated caller from choosing how much CPU the server spends is worth nothing if it can be misconfigured away. `/query*` answers **422** for an over-limit field (FastAPI's own validation response); `/api/*` answers **413**.
+   - **Non-empty query**: every path refuses a query that is empty or only whitespace after trimming — `bypass`, Open WebUI metadata tasks and `/api/generate` included. Exemption from the RAG minimum below is not exemption from having to carry a prompt.
+   - **RAG query minimum**: retrieval modes require an English-equivalent query length of at least 3 after trimming outer whitespace. Each Chinese, Japanese or Korean character counts as 2 and every other Unicode character counts as 1. This applies to the core query APIs, `/query*`, and the RAG branches of `/api/chat`; `bypass`, Open WebUI metadata tasks forwarded directly to the LLM, and `/api/generate` are exempt from the minimum only. `/query` and `/query/stream` answer **422**, `/query/data` **400**, and `/api/*` **400**.
+   - `MAX_TEXTS_PER_REQUEST` bounds how many texts one `/documents/texts` request may carry, answering **413** before any per-text storage lookup. It bounds the fan-out of a single request, so — unlike the capacity limit below — it is not a "retry later" condition: an oversized batch never fits and must be split.
+   - `MAX_PENDING_DOCUMENTS` bounds how many documents may be active (`PENDING`/`PARSING`/`ANALYZING`/`PROCESSING`) or reserved by an in-flight request. Over capacity the server answers **429** with a `Retry-After` header and a detail naming the current count, the requested count and the capacity — refused *before* the body is transferred. `/documents/scan` and manual retries exceed the cap on purpose; the documents they create make ordinary uploads wait.
 
 ### Offline Deployment
 
@@ -576,7 +568,8 @@ Though LightRAG Server uses one worker to process the document indexing pipeline
 WORKERS=2
 ### Number of parallel files to process in one batch
 MAX_PARALLEL_INSERT=3
-### Max concurrent requests to the LLM (MAX_ASYNC is still accepted as a deprecated alias)
+### Base LLM concurrency and the per-document chunk-extraction task limit
+### (MAX_ASYNC is still accepted as a deprecated alias)
 MAX_ASYNC_LLM=4
 ```
 
@@ -628,6 +621,8 @@ Open WebUI uses an LLM to do the session title and session keyword generation ta
 The default query mode is `mix` if you send a message (query) from the Ollama interface of LightRAG. You can select query mode by sending a message with a query prefix.
 
 A query prefix in the query string can determine which LightRAG query mode is used to generate the response for the query. The supported prefixes include:
+
+RAG queries must have an English-equivalent length of at least 3 after the prefix is removed; each Chinese, Japanese or Korean character counts as 2. Direct-LLM `/bypass` requests do not use this minimum, but no request may carry an empty query — a prefix that consumes the whole message (`/local[hint]`) is refused with **400**.
 
 ```
 /local
@@ -752,7 +747,7 @@ The API Server can be configured in two ways (highest priority first):
 * Command line arguments
 * Environment variables or .env file
 
-Most of the configurations come with default settings; check out the details in the sample file: `.env.example`. Storage configuration should also be set through environment variables or the `.env` file.
+Most of the configurations come with default settings; check out the details in the sample file: `env.example`. Storage configuration should also be set through environment variables or the `.env` file.
 
 ### LLM and Embedding Backend Supported
 
@@ -801,7 +796,9 @@ lightrag-server --embedding-binding ollama --help
 lightrag-server --embedding-binding gemini --help
 ```
 
-> Please use OpenAI-compatible method to access LLMs deployed by OpenRouter or vLLM/SGLang. You can pass additional parameters to OpenRouter or vLLM/SGLang through the `OPENAI_LLM_EXTRA_BODY` environment variable to disable reasoning mode or achieve other personalized controls.
+> **Every provider option, in one place:** the `--help` output covers only the binding you pass and prints no default values or environment-variable names. [LLM and Embedding Provider Options Reference](./LLMProviderOptions.md) lists every `OPENAI_LLM_*`, `OLLAMA_LLM_*`, `GEMINI_LLM_*`, `BEDROCK_LLM_*`, `OLLAMA_EMBEDDING_*`, and `GEMINI_EMBEDDING_*` variable with its type and meaning, plus the resolution rules (unset means "not sent", value syntax, which options each driver actually forwards, and why provider options do not invalidate the LLM cache).
+>
+> Please use OpenAI-compatible method to access LLMs deployed by OpenRouter, [OrcaRouter](https://www.orcarouter.ai), or vLLM/SGLang. You can pass additional parameters to these providers through the `OPENAI_LLM_EXTRA_BODY` environment variable to disable reasoning mode or achieve other personalized controls.
 
 Set the max_tokens to **prevent excessively long or endless output loop** during the entity relationship extraction phase for Large Language Model (LLM) responses.  The purpose of setting max_tokens parameter is to truncate LLM output before timeouts occur, thereby preventing document extraction failures. This addresses issues where certain text blocks (e.g., tables or citations) containing numerous entities and relationships can lead to overly long or even endless loop outputs from LLMs. This setting is particularly crucial for locally deployed, smaller-parameter models. Max tokens value can be calculated by this formula: `LLM_TIMEOUT * llm_output_tokens/second` (i.e. `240s * 50 tokens/s = 12000`, max_tokens should smaller than 12000)
 
@@ -906,24 +903,71 @@ LightRAG uses 4 types of storage for different purposes:
 * GRAPH_STORAGE: entity relation graph
 * DOC_STATUS_STORAGE: document indexing status
 
-LightRAG Server offers various storage implementations, with the default being an in-memory database that persists data to the WORKING_DIR directory. Additionally, LightRAG supports a wide range of storage solutions including PostgreSQL, MongoDB, FAISS, Milvus, Qdrant, Neo4j, Memgraph, Redis, and OpenSearch. For detailed information on supported storage options, please refer to the storage section in the README.md file located in the root directory.
+Each storage type offers multiple implementations. By default, LightRAG Server uses in-memory databases with data persisted to the WORKING_DIR directory: the whole dataset resides in the server process's memory and the files serve only as persistence, so capacity is bounded by available RAM. The defaults are suitable **only for small-scale testing, evaluation, and debugging, and are not recommended for production** — for production, PostgreSQL is the recommended backend. The implementations currently available for each storage type are listed below:
 
-**Milvus Index Configuration:** LightRAG now supports configurable index types for Milvus vector storage (AUTOINDEX, HNSW, HNSW_SQ, IVF_FLAT, etc.) through environment variables. HNSW_SQ requires Milvus 2.6.8+ and provides significant memory savings. See the "Using Milvus for Vector Storage" section in the main README.md for complete configuration options.
+| Storage Type | Available Implementations (Default First) |
+|---|---|
+| KV_STORAGE | `JsonKVStorage`, `RedisKVStorage`, `PGKVStorage`, `MongoKVStorage`, `OpenSearchKVStorage` |
+| VECTOR_STORAGE | `NanoVectorDBStorage`, `MilvusVectorDBStorage`, `PGVectorStorage`, `FaissVectorDBStorage`, `QdrantVectorDBStorage`, `MongoVectorDBStorage`, `OpenSearchVectorDBStorage` |
+| GRAPH_STORAGE | `NetworkXStorage`, `Neo4JStorage`, `PGTableGraphStorage`, `PGGraphStorage`, `MongoGraphStorage`, `MemgraphStorage`, `OpenSearchGraphStorage` |
+| DOC_STATUS_STORAGE | `JsonDocStatusStorage`, `RedisDocStatusStorage`, `PGDocStatusStorage`, `MongoDocStatusStorage`, `OpenSearchDocStatusStorage` |
+
+For production deployments, PostgreSQL (recommended), MongoDB, or OpenSearch can provide all four storage types through a single backend. You can also select a specialized database for each storage type, such as Milvus or Qdrant for vector storage and Neo4j or Memgraph for graph storage.
+
+**PostgreSQL Graph Storage — prefer `PGTableGraphStorage`:** For new PostgreSQL deployments, `PGTableGraphStorage` is the recommended `GRAPH_STORAGE` implementation and supersedes `PGGraphStorage`. It keeps the entity-relation graph in ordinary tables — JSONB properties plus B-tree indexes — instead of going through Apache AGE, which brings two practical advantages:
+
+* **No extension to install.** `PGGraphStorage` requires the Apache AGE extension, which most managed PostgreSQL services (Amazon RDS, Cloud SQL, Supabase, Neon) do not offer — so the graph layer frequently could not run on the same database as the other three storage types. `PGTableGraphStorage` runs on any stock PostgreSQL 14+ and creates the tables it needs during `initialize()`. For a Docker deployment this means the official `pgvector/pgvector:pg18` image is sufficient; the AGE-bundled `gzdaniel/postgres-for-rag:pg18-age-pgvector` image is only needed by `PGGraphStorage`.
+* **Substantially faster.** Queries are plain indexed SQL rather than Cypher over `agtype`, and `get_knowledge_graph` uses a frontier-capped BFS bounded by `max_nodes`. From the measurements published with [PR #3103](https://github.com/HKUDS/LightRAG/pull/3103) (PostgreSQL 18, an 8k-node / ~40k-edge graph, both backends `VACUUM ANALYZE`d before measuring): `get_knowledge_graph` p50 **39 ms vs 1,099 ms (~28×)**, bulk graph load **3.0 s vs 434 s**, mixed-workload throughput **1,431 vs 73 RPS**.
+
+Both implementations read the same `POSTGRES_*` environment variables, but they store the graph in different places — `PGTableGraphStorage` in its own `lightrag_graph_nodes` / `lightrag_graph_edges` tables, `PGGraphStorage` inside an AGE graph. Switching an existing deployment is therefore not an in-place change: after switching, the previously extracted graph is simply not visible to the new backend. Either re-index the documents, or move the existing graph across with the offline migration tool described in *Graph Migration From Apache AGE To PostgreSQL Tables* below (the LLM cache can be carried over separately — see *LLM Cache Migration Between Storage Types*). `PGGraphStorage` remains supported for deployments already running on AGE.
+
+The environment variables required at startup for each storage implementation are listed below. Implementations not listed require no additional configuration and rely only on file persistence under WORKING_DIR.
+
+| Storage Implementation | Required Environment Variables |
+|---|---|
+| `PGKVStorage` / `PGVectorStorage` / `PGGraphStorage` / `PGTableGraphStorage` / `PGDocStatusStorage` | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DATABASE` (plus `POSTGRES_HOST` and `POSTGRES_PORT`) |
+| `Neo4JStorage` | `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` |
+| `MongoKVStorage` / `MongoVectorDBStorage` / `MongoGraphStorage` / `MongoDocStatusStorage` | `MONGO_URI`, `MONGO_DATABASE` (`MongoVectorDBStorage` requires a MongoDB deployment that supports Atlas Search / Vector Search) |
+| `RedisKVStorage` / `RedisDocStatusStorage` | `REDIS_URI` |
+| `MilvusVectorDBStorage` | `MILVUS_URI`, `MILVUS_DB_NAME` |
+| `QdrantVectorDBStorage` | `QDRANT_URL` (`QDRANT_API_KEY` is optional) |
+| `MemgraphStorage` | `MEMGRAPH_URI` |
+| `OpenSearchKVStorage` / `OpenSearchVectorDBStorage` / `OpenSearchGraphStorage` / `OpenSearchDocStatusStorage` | `OPENSEARCH_HOSTS` |
+
+The `WORKSPACE` environment variable isolates data for multiple LightRAG instances on the same backend (valid characters are `a-z`, `A-Z`, `0-9`, and `_`). Each storage backend also provides a backend-specific override such as `POSTGRES_WORKSPACE` or `NEO4J_WORKSPACE`. These overrides are retained only for compatibility with legacy configurations; under normal circumstances, use `WORKSPACE` consistently.
+
+The table above lists only the connection parameters required at startup. Each storage implementation also provides many optional tuning environment variables, including connection pool sizes, SSL settings, sharding thresholds for batch writes and deletions, and vector index parameters. For the complete list and default values, see the repository's root-level `env.example`, where the variables are grouped by storage backend and include detailed comments.
+
+**Milvus Index Configuration:** LightRAG now supports configurable index types for Milvus vector storage (AUTOINDEX, HNSW, HNSW_SQ, IVF_FLAT, etc.) through environment variables. HNSW_SQ requires Milvus 2.6.8+ and provides significant memory savings. For the complete configuration options, see [MilvusConfigurationGuide.md](./MilvusConfigurationGuide.md).
 
 You can select the storage implementation by configuring environment variables. For instance, prior to the initial launch of the API server, you can set the following environment variable to specify your desired storage implementation:
 
 ```
 LIGHTRAG_KV_STORAGE=PGKVStorage
 LIGHTRAG_VECTOR_STORAGE=PGVectorStorage
-LIGHTRAG_GRAPH_STORAGE=PGGraphStorage
+LIGHTRAG_GRAPH_STORAGE=PGTableGraphStorage
 LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage
 ```
 
-You cannot change storage implementation selection after adding documents to LightRAG. Data migration from one storage implementation to another is not supported yet. For further information, please read the sample `.env.example` file.
+You cannot change storage implementation selection after adding documents to LightRAG. Data migration from one storage implementation to another is not supported yet, except for the graph moving from `PGGraphStorage` to `PGTableGraphStorage` (see *Graph Migration From Apache AGE To PostgreSQL Tables* below) and the LLM cache (see *LLM Cache Migration Between Storage Types* below). For further information, please read the sample `env.example` file.
+
+> The [dev-lancedb](https://github.com/HKUDS/LightRAG/tree/dev-lancedb) development branch provides community-contributed LanceDB storage implementations for all four storage types: key-value (KV), vector, graph, and document status. The [dev-nebula-graph](https://github.com/HKUDS/LightRAG/tree/dev-nebula-graph) development branch provides a community-contributed Nebula graph storage implementation. Developers who need these storage options are welcome to try them and help improve them.
 
 ### LLM Cache Migration Between Storage Types
 
 When switching the storage implementation in LightRAG, the LLM cache can be migrated from the existing storage to the new one. Subsequently, when re-uploading files to the new storage, the pre-existing LLM cache will significantly accelerate file processing. For detailed instructions on using the LLM cache migration tool, please refer to [README_MIGRATE_LLM_CACHE.md](../lightrag/tools/README_MIGRATE_LLM_CACHE.md)
+
+### Graph Migration From Apache AGE To PostgreSQL Tables
+
+Deployments already running `PGGraphStorage` can move their extracted graph to `PGTableGraphStorage` without re-processing the source documents. An offline tool copies the graph through the public storage API:
+
+```bash
+# Stop every LightRAG writer first. Dry run by default — migrates nothing.
+python -m lightrag.tools.migrate_graph_storage
+python -m lightrag.tools.migrate_graph_storage --apply
+```
+
+Only the graph moves; vector and KV data are untouched and stay valid, because the migrated graph keeps the same entity and relation identities. The tool requires an empty target graph slice and refuses, before writing anything, on every construct it can see that would not survive the move — a node without a usable identity, a duplicate node id, a reciprocal edge pair, or a value PostgreSQL `jsonb` cannot store. If a write fails it removes exactly what that run wrote. One limit worth knowing: Apache AGE enumerates edges with `SELECT DISTINCT`, so two byte-identical relationships between the same pair arrive as one row and the tool cannot see that the graph's degree will change. Re-indexing remains the general guidance for changing storage backends — this is an advanced path for one specific pair. For preconditions, the report format, and the failure handling, refer to [README_MIGRATE_GRAPH_STORAGE.md](../lightrag/tools/README_MIGRATE_GRAPH_STORAGE.md)
 
 ### LightRAG API Server Command Line Options
 
@@ -934,7 +978,7 @@ When switching the storage implementation in LightRAG, the LLM cache can be migr
 | `--working-dir` | `./rag_storage` | Working directory for RAG storage |
 | `--input-dir` | `./inputs` | Directory containing uploaded/input documents |
 | `--timeout` | `150` | Gunicorn worker timeout and fallback request timeout |
-| `--max-async` | `4` | Maximum concurrent LLM operations |
+| `--max-async` | `4` | Base maximum LLM concurrency; also the per-document chunk-extraction task limit (each entity/relation merge phase uses twice this task limit) |
 | `--log-level` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) |
 | `--verbose` | `False` | Verbose debug output, effective with debug logging |
 | `--key` | `None` | API key for authentication |
@@ -1210,7 +1254,7 @@ For the full routing syntax, supported extensions, parser cache behavior, chunke
 
 ### Pipeline Concurrency
 
-`MAX_PARALLEL_INSERT` controls how many files are processed in parallel. `MAX_ASYNC_LLM` (deprecated alias: `MAX_ASYNC`) controls concurrent LLM calls, including extraction, merging, query keyword generation, and final answer generation. Optional staged-pipeline variables such as `MAX_PARALLEL_PARSE_NATIVE`, `MAX_PARALLEL_PARSE_MINERU`, `MAX_PARALLEL_PARSE_DOCLING`, and `MAX_PARALLEL_ANALYZE` can be used for parser-heavy deployments.
+`MAX_PARALLEL_INSERT` controls how many files are processed in parallel; it does not set the per-document chunk or graph-merge task limit. `MAX_ASYNC_LLM` (deprecated alias: `MAX_ASYNC`) is the base LLM concurrency and, for each document, caps chunk entity/relation extraction tasks at `MAX_ASYNC_LLM` and each entity-merge or relation-merge phase at `2 × MAX_ASYNC_LLM` tasks. The Extract role's actual LLM requests use `EXTRACT_MAX_ASYNC_LLM` when configured, otherwise `MAX_ASYNC_LLM`; this role override does not change the pipeline task limits. Optional staged-pipeline variables such as `MAX_PARALLEL_PARSE_NATIVE`, `MAX_PARALLEL_PARSE_MINERU`, `MAX_PARALLEL_PARSE_DOCLING`, and `MAX_PARALLEL_ANALYZE` can be used for parser-heavy deployments. See [File Processing Pipeline Specification](./FileProcessingPipeline.md#86-pipeline-concurrency-parameters) for the complete topology.
 
 Uploads and text inserts can be accepted while the processing loop is busy; the running loop is nudged to pick up the new pending work. Destructive jobs such as document clear/delete and the classification phase of `/documents/scan` still reject concurrent enqueues to protect storage consistency. Failed files can be reprocessed from the WebUI or by triggering `/documents/scan`.
 
@@ -1220,6 +1264,8 @@ All supported backends (`lollms`, `ollama`, `openai` / OpenAI-compatible, `azure
 
 - Swagger UI: http://localhost:9621/docs
 - ReDoc: http://localhost:9621/redoc
+
+Set `ENABLE_API_DOCS=false` to disable the interactive documentation entirely — `/docs`, `/redoc`, `/openapi.json` and the bundled Swagger UI assets all return 404 (recommended for hardened production deployments). `/health` reports the state as `api_docs_available`, and the WebUI hides its API-docs entry point accordingly.
 
 You can test the API endpoints using the provided curl commands or through the Swagger UI interface. Make sure to:
 

@@ -25,6 +25,8 @@ from typing import Any, Union
 
 from lightrag.utils import (
     TruncatedResponse,
+    empty_length_truncated_hint,
+    format_response_diagnostics,
     logger,
     wrap_embedding_func_with_attrs,
 )
@@ -196,6 +198,7 @@ async def bedrock_complete_if_cache(
     endpoint_url: str | None = None,
     image_inputs: list[Any] | None = None,
     timeout: int | None = None,
+    token_tracker: Any | None = None,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
     """Call Amazon Bedrock Converse API with LightRAG-compatible shims.
@@ -375,9 +378,18 @@ async def bedrock_complete_if_cache(
                             text = delta.get("text")
                             if text:
                                 yield text
-                        # Handle other event types that might indicate stream end
-                        elif "messageStop" in event:
-                            break
+                        elif "metadata" in event and token_tracker is not None:
+                            usage = event["metadata"].get("usage") or {}
+                            if usage:
+                                token_tracker.add_usage(
+                                    {
+                                        "prompt_tokens": usage.get("inputTokens", 0),
+                                        "completion_tokens": usage.get(
+                                            "outputTokens", 0
+                                        ),
+                                        "total_tokens": usage.get("totalTokens", 0),
+                                    }
+                                )
 
                 except Exception as e:
                     # Convert to appropriate exception type
@@ -444,12 +456,63 @@ async def bedrock_complete_if_cache(
                 None,
             )
 
+            stop_reason = response.get("stopReason")
+
+            usage = response.get("usage") or {}
+            if token_tracker is not None and usage:
+                token_tracker.add_usage(
+                    {
+                        "prompt_tokens": usage.get("inputTokens", 0),
+                        "completion_tokens": usage.get("outputTokens", 0),
+                        "total_tokens": usage.get("totalTokens", 0),
+                    }
+                )
+
             if not content or content.strip() == "":
-                raise BedrockError("Received empty content from Bedrock API")
+                # Already a failure before this change; what was missing is the
+                # diagnosis. Name the token limit when that is the cause, so
+                # doc_status.error_msg tells the operator which knob to turn
+                # instead of just "empty content".
+                reasoning_len = sum(
+                    len(
+                        (block["reasoningContent"].get("reasoningText") or {}).get(
+                            "text"
+                        )
+                        or ""
+                    )
+                    for block in response["output"]["message"]["content"]
+                    if isinstance(block, dict)
+                    and isinstance(block.get("reasoningContent"), dict)
+                )
+                usage = response.get("usage") or {}
+                diagnostics = format_response_diagnostics(
+                    stopReason=stop_reason,
+                    outputTokens=usage.get("outputTokens"),
+                    reasoning_content_len=reasoning_len,
+                )
+                if stop_reason == "max_tokens":
+                    hint = empty_length_truncated_hint(
+                        "consider raising BEDROCK_LLM_MAX_TOKENS or disabling "
+                        "thinking mode",
+                        reasoning_consumed_budget=bool(reasoning_len),
+                    )
+                elif reasoning_len:
+                    hint = (
+                        "model returned reasoning-only output (reasoning blocks "
+                        "are discarded on this path); consider disabling "
+                        "thinking mode for this role"
+                    )
+                else:
+                    hint = "model produced no output"
+                error_message = (
+                    f"Received empty content from Bedrock API ({diagnostics}): {hint}"
+                )
+                logger.error(error_message)
+                raise BedrockError(error_message)
 
             # Flag token-limit truncation (Converse API stopReason ==
             # "max_tokens") so the cache layer skips persisting partial output.
-            if response.get("stopReason") == "max_tokens":
+            if stop_reason == "max_tokens":
                 logger.warning(
                     "Bedrock response truncated by token limit "
                     f"(stopReason=max_tokens, content_len={len(content)}), returning partial content"

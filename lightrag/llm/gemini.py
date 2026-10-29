@@ -20,11 +20,15 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
+    retry_if_exception,
     retry_if_exception_type,
 )
 
+from lightrag.exceptions import EmptyTruncatedResponseError
 from lightrag.utils import (
     TruncatedResponse,
+    empty_length_truncated_hint,
+    format_response_diagnostics,
     logger,
     remove_think_tags,
     safe_unicode_decode,
@@ -41,6 +45,7 @@ if not pm.is_installed("google-api-core"):
 
 from google import genai  # type: ignore
 from google.genai import types  # type: ignore
+from google.genai import errors as google_genai_errors  # type: ignore
 from google.api_core import exceptions as google_api_exceptions  # type: ignore
 
 
@@ -48,6 +53,26 @@ class InvalidResponseError(Exception):
     """Custom exception class for triggering retry mechanism when Gemini returns empty responses"""
 
     pass
+
+
+def _is_retryable_gemini_client_error(exc: BaseException) -> bool:
+    """True for a rate-limit response, the one 4xx worth a fresh attempt.
+
+    ``google-genai`` (the client this module actually calls through
+    ``client.aio.models.*``) raises its own ``google.genai.errors``
+    hierarchy, not ``google.api_core.exceptions`` -- that module belongs to
+    the older Vertex AI client libraries and is never raised on this
+    request path. Its 5xx failures surface as ``ServerError``, matched
+    directly in the retry predicate below. A 429 rate-limit response,
+    however, surfaces as the generic 4xx ``ClientError`` rather than a
+    distinct "resource exhausted" type, so it must be matched by status
+    code; every other ``ClientError`` (bad request, bad auth, not found)
+    stays non-retryable.
+    """
+    return (
+        isinstance(exc, google_genai_errors.ClientError)
+        and getattr(exc, "code", None) == 429
+    )
 
 
 _DEFAULT_GEMINI_BASE_URLS = {
@@ -279,6 +304,8 @@ def _extract_response_text(
         | retry_if_exception_type(google_api_exceptions.DeadlineExceeded)
         | retry_if_exception_type(google_api_exceptions.Aborted)
         | retry_if_exception_type(google_api_exceptions.Unknown)
+        | retry_if_exception_type(google_genai_errors.ServerError)
+        | retry_if_exception(_is_retryable_gemini_client_error)
         | retry_if_exception_type(InvalidResponseError)
     ),
 )
@@ -298,6 +325,7 @@ async def gemini_complete_if_cache(
     generation_config: dict[str, Any] | None = None,
     timeout: int | None = None,
     image_inputs: list[Any] | None = None,
+    max_tokens: int | None = None,
     **_: Any,
 ) -> str | AsyncIterator[str]:
     """
@@ -343,6 +371,9 @@ async def gemini_complete_if_cache(
         hashing_kv: Storage interface (for interface parity with other bindings).
         enable_cot: Whether to include Chain of Thought content in the response.
         timeout: Request timeout in seconds (will be converted to milliseconds for Gemini API).
+        max_tokens: Generic output-length cap (as forwarded via LightRAG's
+            provider-agnostic ``llm_model_kwargs``). Mapped to Gemini's native
+            ``max_output_tokens`` unless ``generation_config`` already sets it.
         **_: Additional keyword arguments (ignored).
 
     Returns:
@@ -387,6 +418,14 @@ async def gemini_complete_if_cache(
         prompt_sections.append(history_block)
     prompt_sections.append(f"[user] {prompt}")
     combined_prompt = "\n".join(prompt_sections)
+
+    if max_tokens is not None and (
+        generation_config is None or generation_config.get("max_output_tokens") is None
+    ):
+        generation_config = {
+            **(generation_config or {}),
+            "max_output_tokens": max_tokens,
+        }
 
     config_obj = _build_generation_config(
         generation_config,
@@ -536,28 +575,17 @@ async def gemini_complete_if_cache(
         # Filter out thought content, return only regular content
         final_text = regular_text or ""
 
-    if not final_text:
-        raise InvalidResponseError("Gemini response did not contain any text content.")
-
-    if "\\u" in final_text:
-        final_text = safe_unicode_decode(final_text.encode("utf-8"))
-
-    final_text = remove_think_tags(final_text)
-
-    # Flag token-limit truncation so the cache layer skips persisting partial
-    # output. Must stay the last transformation of final_text: any later
-    # string operation would rebuild a plain str and drop the marker.
     candidates = getattr(response, "candidates", None)
     finish_reason = (
         getattr(candidates[0], "finish_reason", None) if candidates else None
     )
-    if finish_reason == types.FinishReason.MAX_TOKENS:
-        logger.warning(
-            "Gemini response truncated by token limit "
-            f"(finish_reason=MAX_TOKENS, content_len={len(final_text)}), returning partial content"
-        )
-        final_text = TruncatedResponse(final_text)
+    length_limited = finish_reason == types.FinishReason.MAX_TOKENS
 
+    # Count usage BEFORE the empty-response validation below: the request
+    # consumed its budget whether or not the response is usable — a thinking
+    # model that burned the whole output budget on its reasoning trace is
+    # exactly the case that raises, and omitting it would under-report by a
+    # full-budget generation. The streaming path already tracks in a finally.
     usage = getattr(response, "usage_metadata", None)
     if token_tracker and usage:
         token_tracker.add_usage(
@@ -567,6 +595,79 @@ async def gemini_complete_if_cache(
                 "total_tokens": getattr(usage, "total_token_count", 0),
             }
         )
+
+    def _empty_response_error(thought_len: int) -> Exception:
+        """Diagnose an empty Gemini response the way the OpenAI binding does.
+
+        The exception TYPE selects the retry policy: token-limit exhaustion is
+        deterministic for a given prompt and output budget, so it returns
+        ``EmptyTruncatedResponseError`` — absent from the retry predicate —
+        and fails after ONE request instead of buying two more full-budget
+        generations plus backoff. Every other empty response keeps the
+        retryable ``InvalidResponseError``: those are sampling artifacts a
+        fresh attempt can genuinely fix.
+        """
+        usage_metadata = getattr(response, "usage_metadata", None)
+        diagnostics = format_response_diagnostics(
+            finish_reason=getattr(finish_reason, "name", finish_reason),
+            candidates_token_count=getattr(
+                usage_metadata, "candidates_token_count", None
+            ),
+            thoughts_token_count=getattr(usage_metadata, "thoughts_token_count", None),
+            thought_len=thought_len,
+        )
+        if length_limited:
+            hint = empty_length_truncated_hint(
+                "consider raising GEMINI_LLM_MAX_OUTPUT_TOKENS or disabling "
+                "thinking mode",
+                reasoning_consumed_budget=bool(thought_len),
+            )
+        elif thought_len:
+            hint = (
+                "model returned reasoning-only output (thoughts are stripped "
+                "on this path); consider disabling thinking mode for this role"
+            )
+        else:
+            hint = "model produced no output"
+        message = f"Received empty content from Gemini API ({diagnostics}): {hint}"
+        logger.error(message)
+        if length_limited:
+            return EmptyTruncatedResponseError(message)
+        return InvalidResponseError(message)
+
+    if not final_text:
+        raise _empty_response_error(len((thought_text or "").strip()))
+
+    if "\\u" in final_text:
+        final_text = safe_unicode_decode(final_text.encode("utf-8"))
+
+    final_text = remove_think_tags(final_text)
+
+    # A thinking model that spent its whole budget on the reasoning trace
+    # reaches here with final_text == "<think>...</think>", which the line
+    # above strips to nothing: empty AFTER sanitization is the same broken
+    # response as empty before it, and used to be returned as a successful
+    # (if truncated) empty string. Only escalated for the token-limit case,
+    # which is deterministic and actionable; a reasoning-only response that
+    # ended normally keeps its previous behavior with a warning.
+    if not final_text.strip():
+        if length_limited:
+            raise _empty_response_error(len((thought_text or "").strip()))
+        logger.warning(
+            "Gemini response contained only reasoning content "
+            f"(finish_reason={getattr(finish_reason, 'name', finish_reason)}), "
+            "returning empty content"
+        )
+
+    # Flag token-limit truncation so the cache layer skips persisting partial
+    # output. Must stay the last transformation of final_text: any later
+    # string operation would rebuild a plain str and drop the marker.
+    if length_limited:
+        logger.warning(
+            "Gemini response truncated by token limit "
+            f"(finish_reason=MAX_TOKENS, content_len={len(final_text)}), returning partial content"
+        )
+        final_text = TruncatedResponse(final_text)
 
     logger.debug("Gemini response length: %s", len(final_text))
     return final_text
@@ -622,6 +723,8 @@ async def gemini_model_complete(
         | retry_if_exception_type(google_api_exceptions.DeadlineExceeded)
         | retry_if_exception_type(google_api_exceptions.Aborted)
         | retry_if_exception_type(google_api_exceptions.Unknown)
+        | retry_if_exception_type(google_genai_errors.ServerError)
+        | retry_if_exception(_is_retryable_gemini_client_error)
     ),
 )
 async def gemini_embed(

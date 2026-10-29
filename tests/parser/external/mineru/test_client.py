@@ -50,6 +50,22 @@ class _FakeResponse:
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
 
+    async def aiter_bytes(self):
+        yield self.content
+
+
+class _FakeStreamContext:
+    """Async context manager mirroring ``httpx.AsyncClient.stream()``."""
+
+    def __init__(self, response: _FakeResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self._response
+
+    async def __aexit__(self, *_: Any) -> None:
+        pass
+
 
 class _FakeAsyncClient:
     """Routes calls through a per-test dispatcher."""
@@ -101,6 +117,14 @@ class _FakeAsyncClient:
     ) -> _FakeResponse:
         self.gets.append(url)
         return _CURRENT.dispatcher.get(url, params=params, headers=headers)
+
+    def stream(self, method: str, url: str, **kwargs: Any) -> _FakeStreamContext:
+        assert method == "GET", f"unexpected stream method {method}"
+        # Delegates to the same dispatcher.get() every existing test fixture
+        # already implements, rather than requiring every _Dispatcher
+        # subclass to separately implement streaming.
+        self.gets.append(url)
+        return _FakeStreamContext(_CURRENT.dispatcher.get(url, **kwargs))
 
 
 class _Dispatcher:
@@ -1069,3 +1093,65 @@ async def test_client_local_encodes_task_id_into_url_path_segments(
         assert "?" not in url
         assert "/admin" not in url
     assert manifest.task_id == _LocalInjectionDispatcher.TASK_ID
+
+
+@pytest.mark.offline
+async def test_client_local_result_bundle_entry_budget_is_enforced(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MinerU's result bundle must go through the shared zip-bomb budget.
+
+    _download_zip previously hand-rolled ZipFile.extractall with only a
+    path-traversal check, so a compromised/misbehaving endpoint (the default
+    MINERU_ENDPOINT is the remote mineru.net API) could expand a bundle
+    unbounded onto disk. It now routes through safe_extract_zip with the
+    result_bundle_limits() budget; a low PARSER_RESULT_BUNDLE_MAX_ENTRIES
+    trips before anything is written.
+    """
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://127.0.0.1:8000")
+    monkeypatch.setenv("MINERU_POLL_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("PARSER_RESULT_BUNDLE_MAX_ENTRIES", "1")  # flat zip has 2
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDF" * 50)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    _CURRENT.dispatcher = _LocalFlatZipDispatcher()
+    with pytest.raises(RuntimeError, match="entries"):
+        await MinerURawClient().download_into(raw, src)
+
+    # Nothing from the bundle was extracted.
+    assert not (raw / "content_list.json").exists()
+
+
+@pytest.mark.offline
+async def test_client_local_result_bundle_byte_budget_is_enforced(
+    tmp_path: Path,
+    fake_httpx: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The uncompressed-size gate is live-read too."""
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://127.0.0.1:8000")
+    monkeypatch.setenv("MINERU_POLL_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv(
+        "PARSER_RESULT_BUNDLE_MAX_TOTAL_BYTES", "1"
+    )  # any real zip trips
+
+    src = tmp_path / "demo.pdf"
+    src.write_bytes(b"PDF" * 50)
+    raw = tmp_path / "demo.mineru_raw"
+    raw.mkdir()
+
+    _CURRENT.dispatcher = _LocalFlatZipDispatcher()
+    # stream_capped_get has its own separate PARSER_RESULT_BUNDLE_DOWNLOAD_MAX_BYTES
+    # budget (unset here, so it stays at its generous default) and does not
+    # consult this uncompressed-size cap -- only safe_extract_zip's
+    # declared-size check below sees it.
+    with pytest.raises(RuntimeError, match="uncompressed size"):
+        await MinerURawClient().download_into(raw, src)
+    assert not (raw / "content_list.json").exists()

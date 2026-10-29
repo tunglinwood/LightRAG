@@ -34,6 +34,7 @@
       <a href="README-zh.md"><img src="https://img.shields.io/badge/🇨🇳中文版-1a1a2e?style=for-the-badge"></a>
       <a href="README.md"><img src="https://img.shields.io/badge/🇺🇸English-1a1a2e?style=for-the-badge"></a>
       <a href="README-ja.md"><img src="https://img.shields.io/badge/🇯🇵日本語版-1a1a2e?style=for-the-badge"></a>
+      <a href="README-id.md"><img src="https://img.shields.io/badge/🇮🇩Bahasa%20Indonesia-1a1a2e?style=for-the-badge"></a>
     </p>
     <p>
       <a href="https://pepy.tech/projects/lightrag-hku"><img src="https://static.pepy.tech/personalized-badge/lightrag-hku?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads"></a>
@@ -220,7 +221,7 @@ make env-security-check # 任意: 現在の .env のセキュリティリスク�
 Native docx パーサーのオプトイン式エンジンパラメータ `smart_heading` は、文分割 / NER のヒューリスティック判定に spaCy を使用します。spaCy ランタイムは `api` extra に含まれています — 追加で必要なのは、バージョン固定された 2 つの言語モデル（`zh_core_web_sm` / `en_core_web_sm` 3.8.0、PyPI 未公開の GitHub release wheel）のインストールだけです：
 
 ```bash
-lightrag-download-cache --spacy --spacy-install
+lightrag-download-cache --spacy-install
 ```
 
 smart_heading はファイル / ルール単位（例：`LIGHTRAG_PARSER=docx:native(smart_heading=true)`）でも、`.env` でグローバルにも有効化できます：
@@ -232,6 +233,27 @@ DOCX_SMART_HEADING=true
 ```
 
 グローバルスイッチが有効な場合（または `LIGHTRAG_PARSER` ルールに `native(smart_heading=true)` が含まれる場合）、サーバーは起動時にモデルの存在を検証し、欠落していればインストール手順を示して即座に失敗します（fail-fast）。smart_heading を一切使わないデプロイメントにはモデルは不要です。Docker のメインイメージにはモデルが同梱されています（lite イメージには含まれません）。オフライン環境については[オフラインデプロイメントガイド](./docs/OfflineDeployment.md)を参照してください。
+
+### オプション：SVG ラスタライズ用の libcairo（native md/textpack）
+
+Native markdown/textpack パーサーは、埋め込まれた SVG 画像を `cairosvg` 経由で PNG にラスタライズします。`cairosvg` は cairo への cffi バインディングです：`pip install cairosvg`（`api` extra に含まれる）は常に成功しますが、実際にレンダリングが動作するのは、ネイティブの `libcairo` 共有ライブラリもホストに存在する場合に限られます — pip/uv はシステムライブラリをインストールできません。欠落している場合、ラスタライズは実行時に失敗し、該当の SVG はスキップされます（ドキュメントの他の部分には影響しません）。サーバーは起動時にこの機能を検証し、欠落していれば目立つ黄色の警告を表示するため、この問題がドキュメント処理時まで気づかれずに隠れてしまうことを防ぎます。
+
+各プラットフォーム向けのシステムパッケージをインストールしてください：
+
+```bash
+# Debian / Ubuntu（公式 Docker イメージには既に含まれています）
+sudo apt-get install -y libcairo2
+
+# RHEL / Fedora
+sudo dnf install -y cairo
+
+# macOS（Homebrew）
+brew install cairo
+
+# Windows：libcairo-2.dll を同梱する GTK3 ランタイムをインストールしてください
+```
+
+埋め込み SVG を含む markdown/textpack ドキュメントを処理しないデプロイメントでは、この起動時の警告は無視して構いません。
 
 ## LightRAG について
 
@@ -247,7 +269,7 @@ DOCX_SMART_HEADING=true
 - **増分更新と部分削除:** LightRAG は、グラフベースのナレッジベースにおける増分更新と部分削除の難しさを解決し、動的なデータ環境でも情報を最新の状態に保ちます。ドキュメントを削除する際には、インデックス構築時の LLM キャッシュを利用して、影響を受けるエンティティと関係を迅速に再構築できるため、ナレッジベースの更新効率が大幅に向上します。
 - **複数のドキュメント解析エンジン:** LightRAG のドキュメント処理パイプラインは MinerU、Docling、Native に加え、サードパーティ製解析エンジンの拡張にも対応しています。LightRAG 独自の Native エンジンは、Word および Markdown ドキュメント内の画像、表、数式を効率的に解析でき、マルチモーダルコンテンツを多く含むドキュメントの処理に特に適しています。また、Word ドキュメントの章見出しを自動的に検出・修正し、アウトラインが不規則なドキュメントでもコンテンツ抽出の品質を高め、章単位のテキストチャンク化に適した基盤を整えます。
 - **複数のテキストチャンク戦略:** LightRAG は、`固定長チャンク (F)`、`再帰文字チャンク (R)`、`ベクトルセマンティックチャンク (V)`、`段落セマンティックチャンク (P)` の 4 種類の戦略をサポートします。LightRAG 独自の `段落セマンティックチャンク (P)` は、**チャンク境界をドキュメント本来の意味的な境界**（見出し、段落、表）にできる限り合わせます。これにより、見出しと本文の不一致や、長い表を分割した際のヘッダー行の欠落といった問題を軽減します。
-- **複数のストレージバックエンド:** LightRAG のデフォルトの KV、ベクトル、グラフストレージには、ローカルファイルに永続化するインメモリデータベースが使用されており、プロジェクトをすばやく評価するのに適しています。また、大規模データセットを扱う本番環境向けに、主要なストレージバックエンドを幅広くサポートしています。
+- **複数のストレージバックエンド:** LightRAG のデフォルトの KV、ベクトル、グラフストレージには、ローカルファイルに永続化するインメモリデータベースが使用されており、**小規模データでのテストや評価にのみ適しており、本番環境には適していません**。また、大規模データセットを扱う本番環境向けに、主要なストレージバックエンド（PostgreSQL 推奨）を幅広くサポートしています。
 
 ### マルチモーダル機能のアップグレード
 
@@ -313,8 +335,9 @@ VLM_LLM_MODEL=<your_vlm_model_name>
 
 大規模なドキュメント処理では、並行性を高める必要があります。ファイルの並行処理に関連する主要な環境変数は以下のとおりです:
 
-- **MAX_ASYNC_LLM/EXTRACT_ASYNC_LLM**: LLM モデルの最大並行数を制御します。
-- **MAX_PARALLEL_INSERT**: 並行処理されるファイルの最大数を制御します。1つのファイル内のテキスト・表・数式・画像の処理も並行して行われます。`MAX_PARALLEL_INSERT` は理想的には `MAX_ASYNC_LLM` の約1/3に設定すべきです。
+- **MAX_ASYNC_LLM**: LLM ロールの基本並行数を設定します（`MAX_ASYNC` は非推奨の互換エイリアスとして引き続き使用できます）。ファイル処理では、1 文書内の各チャンクに対するエンティティ/関係抽出 task 数もこれで上限が決まり、各エンティティ結合または関係結合フェーズはその 2 倍まで task を実行できます。
+- **EXTRACT_MAX_ASYNC_LLM**: 抽出および結合時の要約に対する、Extract ロールの実際の LLM リクエスト上限を任意で上書きします。未設定時は `MAX_ASYNC_LLM` を継承し、上記のパイプライン task 上限は変更しません。
+- **MAX_PARALLEL_INSERT**: 並行処理するファイル数を制御し、1 文書内の chunk やグラフ結合 task の上限は制御しません。`MAX_ASYNC_LLM` の約 1/3 を目安に設定してください。
 - **MAX_PARALLEL_PARSE_MINERU**: MinerU 解析で並行処理されるファイル数を制御します。
 - **MAX_PARALLEL_PARSE_DOCLING**: Docling 解析で並行処理されるファイル数を制御します。
 - **EMBEDDING_FUNC_MAX_ASYNC**: 埋め込みモデルの最大並行数を制御します。
@@ -337,7 +360,11 @@ LightRAG は4種類のバックエンドストレージを必要とします:
 - **GRAPH_STORAGE**: 知識グラフの保存に使用します。
 - **DOC_STATUS_STORAGE**: ドキュメントリストの保存に使用します。
 
-デフォルトでは、LightRAG のストレージバックエンドはファイル永続化されたインメモリデータベースです。これらのデフォルトストレージは開発・デバッグ用途のみを想定しており、本番環境には適していません。本番環境で、4種類すべてのストレージを単一のバックエンドで扱いたい場合は、PostgreSQL、MongoDB、または OpenSearch を選択できます。あるいは、ベクトルストレージに Milvus や Qdrant、グラフストレージに Neo4j や Memgraph を使用するなど、ベクトルやグラフのストレージに専用データベースを選択することもできます。
+**4種類のデフォルトストレージはすべてインメモリデータベースです**（`JsonKVStorage`、`NanoVectorDBStorage`、`NetworkXStorage`、`JsonDocStatusStorage`）：データ全体がサーバープロセスのメモリ上に常駐し、`WORKING_DIR` 配下のローカルファイルは永続化のためだけに使われるため、容量は利用可能な RAM に制限されます。したがってデフォルトストレージは**小規模データでのテスト・評価・開発デバッグ専用であり、本番環境には適していません**。
+
+本番環境では **PostgreSQL を推奨します** — 単独で4種類すべてのストレージを担えます。MongoDB と OpenSearch も単一バックエンドの選択肢です。あるいは、ベクトルストレージに Milvus や Qdrant、グラフストレージに Neo4j や Memgraph を使用するなど、ベクトルやグラフのストレージに専用データベースを選択することもできます。
+
+ストレージ種別ごとの実装一覧は [Storage Types Supported](./docs/LightRAG-API-Server.md#storage-types-supported) を参照してください。
 
 ### ドキュメント処理に関するその他の重要な設定
 
@@ -365,6 +392,17 @@ LightRAG は4種類のバックエンドストレージを必要とします:
 - **MAX_ENTITY_TOKENS / MAX_RELATION_TOKENS / MAX_TOTAL_TOKENS**: LLM コンテキストに送信される取得コンテンツのトークン長を制御します。取得コンテンツは `entities`、`relations`、`text chunks` の3つの部分から構成されます。エンティティと関係の長さは独立して制御でき、テキストチャンクの長さは総長からエンティティと関係の長さを差し引いて決まります。
 - **ENABLE_CONTENT_HEADINGS**: テキストチャンクが存在するセクション見出しを LLM に送信するかどうかを制御します。デフォルトで有効で、LLM により豊富なコンテキストを提供し、回答品質を向上させます。
 - **ENABLE_LLM_CACHE**: クエリ結果をキャッシュするかどうか。デフォルトで有効です。同一のクエリ質問、クエリモード、LLM モデルパラメータであれば同じ結果を返します。
+- **USER_PROMPT_PREFIX / USER_PROMPT_PREFIX_FILE**: すべてのリクエストの `user_prompt` の前に連結されるグローバル指示（回答プロンプトの「Additional Instructions」セクション）で、LLM の出力を運用側から一括してカスタマイズできます。連結は逐語的でセパレータは挿入されないため、値の末尾に `\n\n` を自分で付けてください。リクエストの `user_prompt` が空の場合、この前置きだけが LLM に送られる指示になります。無効化できるのは API フィールド `disable_user_prompt_prefix` のみで、読み取りや置き換えはできません。長文や複数段落には `USER_PROMPT_PREFIX_FILE`（`PROMPT_DIR/user_prompt` 配下の `.md`/`.txt` ファイル名）を使用してください。`.env` の値は 1 行に収める必要があります。
+
+### WebUI エントリとデフォルトエントリ
+
+サーバーは単一のフロントエンドビルドから 2 つの WebUI エントリをマウントします。**`/webui`** は管理コンソールで、ドキュメント管理、ナレッジグラフの閲覧、そして完全なクエリパラメータパネルを備えたクエリデバッグを提供します。**`/workspace`** は日常的にナレッジベースを使う利用者向けのクエリ専用エントリで、チャット画面のみを表示し（ドキュメント管理、ナレッジグラフ、クエリパラメータのサイドバー、API ドキュメントへのリンクはありません）、モバイル利用を想定しています。サインインしていない訪問者には最初にウェルカムページが表示されます。
+
+- **LIGHTRAG_DEFAULT_UI**: ルートパス `/` がどのエントリにリダイレクトするか — `webui`（デフォルト）または `workspace`。制御するのは**この 1 つの挙動だけ**です。いずれの値でも両方のエントリはマウントされたままで、それぞれの URL からアクセスできます。それ以外の値は起動に失敗します。主な利用者が管理者ではなくクエリ利用者である場合は `workspace` を設定してください。
+- **UI_TEMPLATES_DIR**: ウェルカムページ、ログインページの文言、クエリの空状態、ブランドロゴ、著作権表示を独自のものに差し替える多言語バンドル（任意）を指定します。WebUI の再ビルドは不要です。[UserDefinedUI.md](./docs/UserDefinedUI.md) を参照してください。
+- **ENABLE_AI_CONTENT_NOTICE**: 両方のクエリ UI（`/workspace` と `/webui` の検索パネル）で、**LLM が生成した**回答に AI 生成である旨のラベルを付けます。モデルが書いていないテキスト（コンテキストが見つからない場合の定型応答や、管理パネルのデバッグ出力）にはラベルは付きません。デフォルトは無効です。これは UI 要素のみで、API レスポンスや保存されるチャット履歴には入りません。
+
+エンドユーザーを `/workspace` に誘導する前に知っておくべきことが 2 つあります。1 つ目は、そこでのクエリパラメータが**継承のみで編集不可**である点です。各クエリは同じブラウザーで `/webui` が保存した設定（未保存の場合はフロントエンドのデフォルト値）を使用します。これはブラウザーごとのローカル状態であり、サーバー全体のポリシーではありません。2 つ目は、管理 UI を隠すことは UX 上の分離であって**セキュリティ境界ではない**点です。API は引き続きサーバー側ですべてのエンドポイントを認可します。クエリエントリの完全な挙動については [LightRAG-API-Server.md](./docs/LightRAG-API-Server.md#the-workspace-query-entry) を参照してください。
 
 ## SDK としての LightRAG の利用
 
@@ -408,7 +446,7 @@ python examples/lightrag_openai_demo.py
 
 ストリーミング応答の実装例については、`examples/lightrag_openai_compatible_demo.py` を参照してください。実行前に、サンプルコードの LLM と埋め込みの設定を適宜変更してください。
 
-**注記1**: デモプログラムを実行する際は、テストスクリプトによって異なる埋め込みモデルが使用される場合があることに注意してください。別の埋め込みモデルに切り替える場合は、データディレクトリ（`./dickens`）をクリアする必要があります。そうしないとプログラムでエラーが発生する可能性があります。LLM キャッシュを保持したい場合は、データディレクトリをクリアする際に `kv_store_llm_response_cache.json` ファイルを残すことができます。
+**注記1**: デモプログラムを実行する際は、テストスクリプトによって異なる埋め込みモデルが使用される場合があることに注意してください。あるモデルが書き込んだベクトルは別のモデルでは使えないため、埋め込みモデルを切り替えたらベクトルを再構築する必要があります。**デモ**データに限れば、デモディレクトリ（`./dickens`）を削除して再実行するのが最も簡単です（コーパスは小さく使い捨てです）。LLM キャッシュを残したい場合は `kv_store_llm_response_cache.json` を保持してください。一方、**実運用では作業ディレクトリを削除しないでください**。そこにはナレッジグラフとテキストチャンクが保存されており、削除すると再埋め込みで済む作業が全ドキュメントの再取り込みになります。代わりに `lightrag-rebuild-vdb` を実行してください（[Switching embedding models](./docs/ProgramingWithCore.md#switching-embedding-models) を参照）。
 
 **注記2**: 公式にサポートされているサンプルコードは `lightrag_openai_demo.py` と `lightrag_openai_compatible_demo.py` のみです。その他のサンプルファイルはコミュニティによる貢献であり、完全なテストと最適化を経ていません。
 
@@ -485,6 +523,7 @@ LightRAG は、農業、コンピュータサイエンス、法律、混合ド�
 | ドキュメント | 内容 |
 |---|---|
 | [RoleSpecificLLMConfiguration.md](./docs/RoleSpecificLLMConfiguration.md) [🇨🇳](./docs/RoleSpecificLLMConfiguration-zh.md) | ロール別（`EXTRACT` / `QUERY` / `KEYWORD` / `VLM`）の LLM・VLM 設定 |
+| [LLMProviderOptions.md](./docs/LLMProviderOptions.md) | provider 生成オプションの完全リファレンス（`OPENAI_LLM_*`、`OLLAMA_LLM_*`、`GEMINI_LLM_*`、`BEDROCK_LLM_*`、`*_EMBEDDING_*`、英語） |
 | [AsymmetricEmbedding.md](./docs/AsymmetricEmbedding.md) | クエリ／文書の非対称 embedding（`EMBEDDING_ASYMMETRIC`）とモデルごとのプレフィックス |
 | [MilvusConfigurationGuide.md](./docs/MilvusConfigurationGuide.md) | `vector_db_storage_cls_kwargs` を通じた Milvus インデックスパラメータのチューニング |
 
@@ -520,7 +559,7 @@ default モードのキャッシュ（抽出・要約・マルチモーダル解
 
 同一の正規 source key を主張するドキュメントを一覧表示し、運用者が選ばなかった候補を重複としてマークします。ツールが勝者を自動で決めることはなく、内容を削除することもありません。
 
-**`download_cache.py`** — `lightrag-download-cache [--spacy --spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
+**`download_cache.py`** — `lightrag-download-cache [--spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
 
 オフラインデプロイおよび docx の `smart_heading` エンジンパラメータに必要な tiktoken エンコーディングとバージョン固定済み spaCy モデルを事前ダウンロードします。
 

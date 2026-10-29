@@ -48,6 +48,11 @@ DEFAULT_HEADING_LEVEL_MAX_CHARS = 80
 # Separator for: description, source_id and relation-key fields(Can not be changed after data inserted)
 GRAPH_FIELD_SEP = "<SEP>"
 
+# Historical placeholders written when a manually-created relation did not
+# provide a real source. They remain readable for compatibility but are not
+# evidence and therefore do not contribute to the relation weight floor.
+RELATION_NO_EVIDENCE_SOURCE_IDS = frozenset({"manual_creation", "UNKNOWN"})
+
 # Query and retrieval configuration defaults
 DEFAULT_TOP_K = 40
 DEFAULT_CHUNK_TOP_K = 20
@@ -150,6 +155,88 @@ DEFAULT_CHUNK_P_SIZE = 2000
 # pipe-separated) read live by the chunker at run time.
 DEFAULT_P_REFERENCES_TAIL_N = 0
 DEFAULT_P_REFERENCES_HEADINGS = ("References", "Bibliography", "参考文献")
+
+# Decompression budget for the native DOCX engine. A .docx is a ZIP, so the
+# bytes it costs to parse are its UNCOMPRESSED size, which no other control on
+# the ingestion path bounds: MAX_UPLOAD_SIZE bounds the compressed artifact on
+# disk and MAX_REQUEST_BODY_BYTES bounds the request body. A 449 KiB .docx
+# declaring 200 MiB of document.xml passed both and drove peak RSS past 1.1 GB
+# (GHSA-2wpj-ffvv-2pq8).
+#
+# Both quantities come from the ZIP central directory, so the check costs one
+# infolist() and no decompression. A central directory that UNDERSTATES a
+# member is self-limiting rather than a bypass: CPython's zipfile stops
+# decompressing at the declared file_size and then fails the CRC, so a liar
+# buys at most the size it declared — which is the size this budget bounds.
+#
+# The ratio gate is what actually closes the amplification: 512 MiB alone would
+# still let a ~1 MB upload expand 500x. It is enforced both archive-wide and
+# against the cumulative expansion by which individual members exceed their
+# ratio budgets, so member splitting cannot dilute it. The allowance is the
+# fixed DEFAULT_DOCX_RATIO_FLOOR_BYTES plus archive bytes outside those members
+# at 1:1: real stored media can support repetitive XML, while padding cannot buy
+# another ratio-cap multiple of expansion.
+# The same budget governs the other OPC/OOXML formats the legacy engine parses
+# locally — .pptx (python-pptx) and .xlsx (openpyxl) are the identical ZIP-bomb
+# class — so the DOCX_* knobs below bound all three, enforced in the legacy
+# ``extract_text`` dispatcher as well as the native docx engine.
+# Env: DOCX_MAX_UNCOMPRESSED_BYTES / DOCX_MAX_COMPRESSION_RATIO /
+# DOCX_RATIO_FLOOR_BYTES / DOCX_MAX_ENTRIES, read live at parse time.
+DEFAULT_DOCX_MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+DEFAULT_DOCX_MAX_COMPRESSION_RATIO = 100
+# RATIO_FLOOR_BYTES exempts small content from the two ratio views above; it is
+# not a gate itself. Archive-wide it acts as a size THRESHOLD: the ratio is only
+# checked once the uncompressed total exceeds it. Per member it acts as a fixed
+# ALLOWANCE, added to the 1:1 supporting-archive-bytes budget for the cumulative
+# excess by which over-ratio members overrun their individual ratio budgets — so
+# it is an amount of tolerated expansion there, not a file-size cut-off. A
+# non-positive value removes the exemption (strictest) in both views, it does not
+# disable the ratio gate. See lightrag/parser/docx/zip_budget.py.
+DEFAULT_DOCX_RATIO_FLOOR_BYTES = 16 * 1024 * 1024
+# Member-count ceiling. Its "checked after the central-directory walk" scope
+# note lives once, on the lightrag/parser/docx/zip_budget.py module docstring.
+DEFAULT_DOCX_MAX_ENTRIES = 10_000
+
+# Native DOCX embedded-image export budgets. Unlike the archive-wide limits
+# above, these cap the bytes materialized into ``*.blocks.assets``: one image
+# and the sum retained for one document. Sized like the native Markdown image
+# budgets so DEFAULT_MAX_PARALLEL_PARSE_NATIVE=5 keeps attacker-controlled
+# output bounded across concurrent parses. Env: NATIVE_DOCX_IMAGE_MAX_BYTES /
+# NATIVE_DOCX_IMAGE_MAX_TOTAL_BYTES, read live for each parse. Non-positive
+# values fall back to these safe defaults rather than disabling the guard.
+DEFAULT_NATIVE_DOCX_IMAGE_MAX_BYTES = 25 * 1024 * 1024
+DEFAULT_NATIVE_DOCX_IMAGE_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+
+# Zip-bomb guards for the result BUNDLE an external parser engine (docling,
+# mineru) returns — a zip fetched from an operator-configured server and
+# extracted locally. Distinct from the DOCX_* budget above (attacker-uploaded
+# source), this is defense-in-depth against a compromised/misbehaving endpoint.
+# The .textpack extraction guard shares these defaults (attacker-uploaded, so
+# it stays env-less). docling and mineru live-read the env pair below; a
+# non-positive value disables that one gate. Env: PARSER_RESULT_BUNDLE_MAX_ENTRIES
+# / PARSER_RESULT_BUNDLE_MAX_TOTAL_BYTES.
+DEFAULT_PARSER_RESULT_BUNDLE_MAX_ENTRIES = 10_000
+DEFAULT_PARSER_RESULT_BUNDLE_MAX_TOTAL_BYTES = 512 * 1024 * 1024  # 512 MiB
+
+# Overall wall-clock budget for downloading the result bundle from docling
+# or mineru, on top of (not instead of) the per-read httpx timeout each
+# client already sets. A per-read timeout only bounds a single socket
+# operation — a peer trickling one byte per interval keeps resetting it
+# and can hold the download open indefinitely. Env:
+# PARSER_RESULT_BUNDLE_DOWNLOAD_TIMEOUT.
+DEFAULT_PARSER_RESULT_BUNDLE_DOWNLOAD_TIMEOUT = 300  # 5 minutes
+
+# Cap on the raw HTTP response body streamed off the wire while downloading
+# the result bundle, checked chunk-by-chunk before the bytes are ever handed
+# to safe_extract_zip. Deliberately a separate knob from
+# DEFAULT_PARSER_RESULT_BUNDLE_MAX_TOTAL_BYTES above: that one bounds the
+# *uncompressed* size a zip's central directory declares (safe_extract_zip's
+# zip-bomb check), while this bounds the *compressed* bytes actually received
+# — different budgets an operator may need to tune independently. Same
+# default value only because it's a reasonable starting point for both, not
+# because the two are meant to move together. Env:
+# PARSER_RESULT_BUNDLE_DOWNLOAD_MAX_BYTES.
+DEFAULT_PARSER_RESULT_BUNDLE_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024  # 512 MiB
 
 # Native docx smart_heading (opt-in engine param) tunables. Each DEFAULT_*
 # below has a matching env var (drop the DEFAULT_ prefix) read at run time
@@ -284,15 +371,15 @@ PARSER_ENGINE_NATIVE = "native"
 PARSER_ENGINE_MINERU = "mineru"
 PARSER_ENGINE_DOCLING = "docling"
 PARSED_DIR_NAME = "__parsed__"  # Dir for parsed files (renamed from __enqueued__)
-# Reserved doc_status.metadata key holding the custom-chunk patch journal
-# (issue #3400 Phase 3). While present, the document has an in-flight or
+# Reserved doc_status.metadata key holding the custom-chunk patch journal.
+# While present, the document has an in-flight or
 # failed ainsert_custom_chunks operation: the pipeline must NOT process the
 # row as ordinary ingestion, resets must NOT strip it, and deletion must
 # include its staged chunk IDs. Lives here (not utils_pipeline) so that
 # base.py can derive the scheduling projection without an import cycle.
 CUSTOM_CHUNK_PATCH_METADATA_KEY = "custom_chunk_patch"
 # Reserved doc_status.metadata key recording how far this document's KG write
-# has progressed (issue #3400 fail-closed purge). Stamped ``pre_graph`` when the
+# has progressed (fail-closed purge). Stamped ``pre_graph`` when the
 # document enters PROCESSING and promoted to ``graph_mutation_started`` only
 # once the write-ahead recovery anchors are durable — i.e. the value answers
 # "could this document have touched the graph?" without reading the graph.
@@ -300,12 +387,12 @@ CUSTOM_CHUNK_PATCH_METADATA_KEY = "custom_chunk_patch"
 # clean up staged chunks even with no anchor rows, because no graph mutation
 # can have happened yet. MONOTONIC and never cleared: a PROCESSED document
 # keeps ``graph_mutation_started`` (its anchors serve as the proof from then
-# on). Absent means UNKNOWN — a pre-#3416 document, which fails closed.
+# on). Absent means UNKNOWN — a document predating it, which fails closed.
 KG_WRITE_STATE_METADATA_KEY = "kg_write_state"
 KG_WRITE_STATE_PRE_GRAPH = "pre_graph"
 KG_WRITE_STATE_GRAPH_MUTATION_STARTED = "graph_mutation_started"
 # Reserved doc_status.metadata key holding the whole-document purge journal
-# (issue #3400 fail-closed purge). Required BY fail-closed, not merely nice to
+# (fail-closed purge). Required BY fail-closed, not merely nice to
 # have: purge's last step deletes the recovery anchors, so without a journal a
 # failure in any later step (LLM cache, full_docs) would make the retry see
 # "anchors missing" and refuse forever. The journal distinguishes "anchors were
@@ -338,6 +425,14 @@ DUPLICATE_DEMOTION_METADATA_KEYS: tuple[str, ...] = (
 # a stale generated summary while real raw-document summaries are preserved —
 # keep every producer on this constant so the match never drifts.
 FILE_EXTRACTION_SUMMARY_PREFIX = "[File Extraction]"
+# Hard ceiling for a doc_status ``content_summary``. PostgreSQL declares the
+# column as ``varchar(255)``; the other backends are unconstrained, so this is
+# the narrowest storage the value must fit. Producers that BUILD a summary from
+# unbounded text (an error message, a document body) must budget against this
+# rather than against ``get_content_summary``'s own default, or a long enough
+# input makes the whole upsert fail on PostgreSQL — including the FAILED
+# transition itself, which then leaves the document stuck in PARSING.
+DOC_STATUS_CONTENT_SUMMARY_MAX_LENGTH = 255
 
 # Suffixes for parser artifact subdirectories under ``<input>/__parsed__/``.
 # Centralising them here keeps the sidecar writer, engine cache modules and
@@ -361,7 +456,7 @@ PROCESS_OPTION_IMAGES = "i"  # Enable VLM analysis for drawings/images
 PROCESS_OPTION_TABLES = "t"  # Enable VLM analysis for tables
 PROCESS_OPTION_EQUATIONS = "e"  # Enable VLM analysis for equations
 PROCESS_OPTION_SKIP_KG = "!"  # Skip entity/relation extraction (no KG build)
-ProcessChunkingOption: TypeAlias = Literal["F", "R", "V", "P"]
+ProcessChunkingOption: TypeAlias = Literal["F", "R", "V", "P", "C"]
 PROCESS_OPTION_CHUNK_FIXED: ProcessChunkingOption = (
     "F"  # Fixed-length / separator chunking (default)
 )
@@ -374,6 +469,9 @@ PROCESS_OPTION_CHUNK_VECTOR: ProcessChunkingOption = (
 PROCESS_OPTION_CHUNK_PARAGRAH: ProcessChunkingOption = (
     "P"  # Paragrah-driven semantic chunking
 )
+PROCESS_OPTION_CHUNK_CUSTOM: ProcessChunkingOption = (
+    "C"  # Explicitly invoke LightRAG.chunking_func
+)
 
 PROCESS_OPTION_CHUNK_CHARS: frozenset[ProcessChunkingOption] = frozenset(
     {
@@ -381,6 +479,7 @@ PROCESS_OPTION_CHUNK_CHARS: frozenset[ProcessChunkingOption] = frozenset(
         PROCESS_OPTION_CHUNK_RECURSIVE,
         PROCESS_OPTION_CHUNK_VECTOR,
         PROCESS_OPTION_CHUNK_PARAGRAH,
+        PROCESS_OPTION_CHUNK_CUSTOM,
     }
 )
 SUPPORTED_PROCESS_OPTIONS = frozenset(
@@ -393,18 +492,18 @@ SUPPORTED_PROCESS_OPTIONS = frozenset(
         PROCESS_OPTION_CHUNK_RECURSIVE,
         PROCESS_OPTION_CHUNK_VECTOR,
         PROCESS_OPTION_CHUNK_PARAGRAH,
+        PROCESS_OPTION_CHUNK_CUSTOM,
     }
 )
 
 DEFAULT_MAX_PARALLEL_ANALYZE = 5  # Multimodal analysis (VLM) concurrency
 
 # Per-engine parsing concurrency defaults.  mineru / docling are
-# resource-intensive (GPU/CPU + memory), so they default to a modest amount of
-# parallelism (2); lower to 1 when resources are tight, or raise via the
-# MAX_PARALLEL_PARSE_* env vars when you have spare capacity.
+# resource-intensive (GPU/CPU + memory), so they default to a single worker;
+# raise via the MAX_PARALLEL_PARSE_* env vars when you have spare capacity.
 DEFAULT_MAX_PARALLEL_PARSE_NATIVE = 5
-DEFAULT_MAX_PARALLEL_PARSE_MINERU = 2
-DEFAULT_MAX_PARALLEL_PARSE_DOCLING = 2
+DEFAULT_MAX_PARALLEL_PARSE_MINERU = 1
+DEFAULT_MAX_PARALLEL_PARSE_DOCLING = 1
 
 # Staged pipeline queue size defaults.
 DEFAULT_QUEUE_SIZE_PARSE = 20
@@ -515,7 +614,8 @@ MAX_RESPONSE_TYPE_CHARS = 256
 MAX_QUERY_TOP_K = 1000
 MAX_QUERY_TOKEN_BUDGET = 1_000_000
 
-# Submission ceilings for the two single-worker CPU pools (tokenizer, chunking).
+# Submission ceilings for the three single-worker pools (tokenizer, chunking,
+# storage IO).
 # A ``ThreadPoolExecutor`` wait queue is unbounded, and freeing the event loop
 # means more requests can be in flight at once, so submissions need their own
 # limit. Deliberately fixed process-wide constants rather than anything derived
@@ -528,6 +628,20 @@ MAX_QUERY_TOKEN_BUDGET = 1_000_000
 # not refusal.
 TOKENIZER_SUBMIT_LIMIT = 8
 CHUNKING_SUBMIT_LIMIT = 8
+# Storage IO is not CPU-bound like the other two, but it needs the same ceiling
+# for a sharper reason: ``_flush_storages`` gathers ``index_done_callback`` over
+# every storage at once (a dozen for a default deployment), and a purge issues
+# several such flushes per document. Each waiter here holds its namespace lock,
+# so the ceiling also bounds how many namespaces can be locked waiting for one
+# worker.
+STORAGE_IO_SUBMIT_LIMIT = 8
+
+# The Milvus pool is the exception to the single-worker shape above: its work is
+# blocking gRPC I/O, not CPU, so one worker would serialize every search in the
+# process behind one flush. This one constant is BOTH the worker count and the
+# submission ceiling, so a submission over the limit waits on the semaphore
+# instead of growing the executor's unbounded wait queue.
+MILVUS_SUBMIT_LIMIT = 8
 
 # Per-workspace ceiling on manual retry requests that have been published but
 # not yet ACKed (LR2 §10.1). The channel is sticky — a request survives until an
@@ -600,6 +714,13 @@ DEFAULT_MM_IMAGE_MIN_PIXEL = 64
 # Embedding configuration defaults
 DEFAULT_EMBEDDING_FUNC_MAX_ASYNC = 8  # Default max async for embedding functions
 DEFAULT_EMBEDDING_BATCH_NUM = 10  # Default batch size for embedding computations
+
+# Overlap (in tokens) borrowed from the previous chunk's tail when the
+# embedding hard fallback has to token-window-split a chunk that is still
+# over the embedding model's context limit after chunking. Independent from
+# the semantic chunker's own `chunk_overlap_token_size` — see
+# `LightRAG.embedding_chunk_overlap_token_size`.
+DEFAULT_EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE = 100
 
 # Gunicorn worker timeout
 DEFAULT_TIMEOUT = 300

@@ -173,6 +173,10 @@ def test_filename_parser_directives_decodes_engine_and_options():
 
     assert filename_parser_directives("paper.[native-iet].docx") == ("native", "iet")
     assert filename_parser_directives("memo.[native-R!].md") == ("native", "R!")
+    assert filename_parser_directives("custom.[native-Cite].docx") == (
+        "native",
+        "Cite",
+    )
     assert filename_parser_directives("report.[-!].pdf") == (None, "!")
     assert filename_parser_directives("doc.[mineru].docx") == ("mineru", "")
     assert filename_parser_directives("foo.docx") == (None, "")
@@ -256,6 +260,11 @@ def test_parse_process_options_decodes_flags():
     opts = parse_process_options("P")
     assert opts.chunking == "P"
 
+    opts = parse_process_options("Cite!")
+    assert opts.chunking == "C"
+    assert opts.chunking_explicit
+    assert opts.images and opts.tables and opts.equations and opts.skip_kg
+
     opts = parse_process_options("")
     assert not (opts.images or opts.tables or opts.equations or opts.skip_kg)
     assert opts.chunking == "F"
@@ -267,9 +276,13 @@ def test_validate_process_options_rejects_invalid_combos():
 
     assert validate_process_options("iet") == []
     assert validate_process_options("R!") == []
+    assert validate_process_options("Cite!") == []
     # F+R conflict is reported.
     errs = validate_process_options("FR")
     assert any("multiple chunking modes" in m for m in errs)
+    errs = validate_process_options("CF")
+    assert any("multiple chunking modes" in m for m in errs)
+    assert any("F/R/V/P/C" in m for m in errs)
     # Lowercase chunking selectors are not valid.
     errs = validate_process_options("f")
     assert any("'f'" in m for m in errs)
@@ -284,6 +297,7 @@ def test_lightrag_parser_rule_supports_options_suffix(monkeypatch):
     monkeypatch.delenv("DOCLING_ENDPOINT", raising=False)
     # Valid options suffix passes validation.
     validate_parser_routing_config("docx:native-iet,*:legacy")
+    validate_parser_routing_config("docx:native-Cite,*:legacy")
 
     # Invalid options suffix is rejected with the rule label and message.
     with pytest.raises(ParserRoutingConfigError, match="multiple chunking modes"):
@@ -375,6 +389,8 @@ def test_carry_over_keys_grouped_by_stage():
         "source_file",
         "parse_warnings",
         "chunk_opts",
+        # Non-authoritative registry observation, grouped with chunk options.
+        "custom_chunker",
         "parse_start_time",
         "parse_end_time",
         "parse_stage_skipped",
@@ -2083,7 +2099,7 @@ def test_enqueue_dedupes_by_filename_and_content_hash(tmp_path):
             third_id = compute_mdhash_id("third.txt", prefix="doc-")
             assert await rag.full_docs.get_by_id(third_id) is None
 
-            failed_docs = await rag.doc_status.get_docs_by_status(DocStatus.FAILED)
+            failed_docs = await rag.doc_status.get_docs_by_statuses([DocStatus.FAILED])
             kinds = {
                 getattr(doc, "metadata", {}).get("duplicate_kind")
                 for doc in failed_docs.values()
@@ -2123,7 +2139,7 @@ def test_enqueue_dedupes_parser_hinted_filename_variants(tmp_path):
             )
             assert (await rag.full_docs.get_by_id(first_id))["content"] == "alpha body"
 
-            failed_docs = await rag.doc_status.get_docs_by_status(DocStatus.FAILED)
+            failed_docs = await rag.doc_status.get_docs_by_statuses([DocStatus.FAILED])
             # The duplicate record stores the canonical basename — hint is
             # not preserved anywhere in the new schema.
             assert any(
@@ -2187,7 +2203,7 @@ def test_enqueue_without_file_paths_uses_content_ids(tmp_path):
                 assert full_doc.get("content_hash")
                 assert status.get("content_hash") == full_doc.get("content_hash")
 
-            failed_docs = await rag.doc_status.get_docs_by_status(DocStatus.FAILED)
+            failed_docs = await rag.doc_status.get_docs_by_statuses([DocStatus.FAILED])
             duplicate_failures = [
                 doc
                 for doc in failed_docs.values()
@@ -2350,7 +2366,7 @@ def test_enqueue_rejects_removed_or_unknown_docs_format(tmp_path):
                     lightrag_document_paths="__parsed__/doc.blocks.jsonl",
                 )
             # Nothing was enqueued by the rejected calls.
-            failed = await rag.doc_status.get_docs_by_status(DocStatus.FAILED)
+            failed = await rag.doc_status.get_docs_by_statuses([DocStatus.FAILED])
             assert failed == {}
         finally:
             await rag.finalize_storages()
@@ -2483,9 +2499,9 @@ def test_state_machine_upsert_preserves_content_hash(tmp_path):
 
             # Simulate the production state-machine upsert pattern: read
             # status_doc, then write a new payload that includes content_hash.
-            status_doc = (await rag.doc_status.get_docs_by_status(DocStatus.PENDING))[
-                doc_id
-            ]
+            status_doc = (
+                await rag.doc_status.get_docs_by_statuses([DocStatus.PENDING])
+            )[doc_id]
             for next_status in (
                 DocStatus.PARSING,
                 DocStatus.ANALYZING,

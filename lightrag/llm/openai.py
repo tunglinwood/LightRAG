@@ -14,6 +14,7 @@ if not pm.is_installed("openai"):
 
 from openai import (
     APIConnectionError,
+    APIStatusError,
     RateLimitError,
     APITimeoutError,
     InternalServerError,
@@ -23,16 +24,20 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
+    retry_if_exception,
     retry_if_exception_type,
 )
 from lightrag.utils import (
     wrap_embedding_func_with_attrs,
     safe_unicode_decode,
+    empty_length_truncated_hint,
     logger,
     TruncatedResponse,
 )
 
 from lightrag.api import __api_version__
+from lightrag.exceptions import EmptyTruncatedResponseError
+from lightrag.llm._error_utils import is_permanent_rate_limit_error
 
 import numpy as np
 import base64
@@ -89,6 +94,40 @@ class TransientBadRequestError(Exception):
     """
 
     pass
+
+
+# Retry ownership moved wholly to tenacity when the client stopped carrying the
+# SDK's own loop (``max_retries=0``), so the outer loop has to cover everything
+# the SDK's body-blind ``_should_retry`` used to: 408 request timeouts and 409
+# lock timeouts. Neither is matched by any other predicate here -- ``_make_status_error``
+# maps 409 to ConflictError and has no branch for 408 at all, so it arrives as a
+# bare APIStatusError. (429 and >=500 are covered by the RateLimitError and
+# InternalServerError predicates.)
+_TRANSIENT_STATUS_CODES = frozenset({408, 409})
+
+
+def _is_transient_status_error(error: BaseException) -> bool:
+    """tenacity predicate: retry the transient statuses the SDK used to retry."""
+    return (
+        isinstance(error, APIStatusError)
+        and getattr(error, "status_code", None) in _TRANSIENT_STATUS_CODES
+    )
+
+
+def _is_retryable_rate_limit_error(error: BaseException) -> bool:
+    """tenacity predicate: retry 429s, except permanent spend stops.
+
+    Used instead of ``retry_if_exception_type(RateLimitError)`` so the original
+    RateLimitError still propagates to callers unchanged (upstream
+    ``except RateLimitError`` / ``isinstance`` checks keep working, and the
+    doc-status failure summary carries the provider's own message -- the
+    LiteLLM budget figures, or OpenAI's billing pointer -- instead of an opaque
+    RetryError). See :mod:`lightrag.llm._error_utils` for what counts as
+    permanent.
+    """
+    return isinstance(error, RateLimitError) and not is_permanent_rate_limit_error(
+        error
+    )
 
 
 def _validate_openai_response_format(response_format: Any | None) -> None:
@@ -155,10 +194,26 @@ def create_openai_async_client(
         timeout: Request timeout in seconds.
         client_configs: Additional configuration options for the AsyncOpenAI client.
             These will override any default configurations but will be overridden by
-            explicit parameters (api_key, base_url).
+            explicit parameters (api_key, base_url). Pass ``max_retries`` here to
+            re-enable the SDK's own retry loop (see below).
 
     Returns:
         An AsyncOpenAI or AsyncAzureOpenAI client instance.
+
+    Retry ownership: the client is built with ``max_retries=0`` so the tenacity
+    decorators on ``openai_complete_if_cache`` / ``openai_embed`` are the only
+    retry layer. The SDK defaults to ``max_retries=2`` and its ``_should_retry``
+    is body-blind -- it retries every 429, including the permanent spend stops
+    (LiteLLM ``budget_exceeded``, OpenAI ``insufficient_quota``) that the
+    tenacity predicate exists to fail fast on, so those would still cost three
+    HTTP requests plus SDK backoff per call. It also multiplied with the outer
+    loop, making a transient failure cost up to 3x3 requests. Overridable
+    through ``client_configs`` for anyone who wants the SDK's ``Retry-After``
+    handling back.
+
+    Taking ownership means covering everything the SDK's loop covered:
+    connection errors, timeouts, 429 and >=500 already had predicates, and
+    ``_is_transient_status_error`` adds the 408 / 409 the SDK also retried.
     """
     if use_azure:
         from openai import AsyncAzureOpenAI
@@ -173,6 +228,8 @@ def create_openai_async_client(
 
         # Create a merged config dict with precedence: explicit params > client_configs
         merged_configs = {
+            # Retry ownership belongs to the tenacity decorators; see docstring.
+            "max_retries": 0,
             **client_configs,
             "api_key": api_key,
         }
@@ -205,6 +262,8 @@ def create_openai_async_client(
 
         # Create a merged config dict with precedence: explicit params > client_configs > defaults
         merged_configs = {
+            # Retry ownership belongs to the tenacity decorators; see docstring.
+            "max_retries": 0,
             **client_configs,
             "default_headers": default_headers,
             "api_key": api_key,
@@ -230,7 +289,9 @@ def create_openai_async_client(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
     retry=(
-        retry_if_exception_type(RateLimitError)
+        retry_if_exception(_is_retryable_rate_limit_error)
+        # 408 / 409 -- retried by the SDK loop this client no longer runs.
+        | retry_if_exception(_is_transient_status_error)
         | retry_if_exception_type(APIConnectionError)
         | retry_if_exception_type(APITimeoutError)
         | retry_if_exception_type(InvalidResponseError)
@@ -336,7 +397,10 @@ async def openai_complete_if_cache(
     Raises:
         InvalidResponseError: If the response from OpenAI is invalid or empty.
         APIConnectionError: If there is a connection error with the OpenAI API.
-        RateLimitError: If the OpenAI API rate limit is exceeded.
+        RateLimitError: If the OpenAI API rate limit is exceeded. Retried
+            with backoff, except for a permanent spend stop (a LiteLLM Proxy
+            ``budget_exceeded`` or an OpenAI ``insufficient_quota``), which
+            fails fast.
         APITimeoutError: If the OpenAI API request times out.
     """
     if history_messages is None:
@@ -456,7 +520,10 @@ async def openai_complete_if_cache(
             logger.warning(f"Failed to close OpenAI client: {close_error}")
         raise
     except RateLimitError as e:
-        logger.error(f"OpenAI API Rate Limit Error: {e}")
+        if is_permanent_rate_limit_error(e):
+            logger.error(f"OpenAI API Spend Limit Reached (not retrying): {e}")
+        else:
+            logger.error(f"OpenAI API Rate Limit Error: {e}")
         try:
             await openai_async_client.close()
         except Exception as close_error:
@@ -514,6 +581,7 @@ async def openai_complete_if_cache(
             cot_active = False
             cot_started = False
             initial_content_seen = False
+            closing_via_generator_exit = False
 
             try:
                 iteration_started = True
@@ -609,12 +677,29 @@ async def openai_complete_if_cache(
                     logger.debug(f"Streaming token usage (from API): {token_counts}")
                 elif token_tracker:
                     logger.debug("No usage information available in streaming response")
+            except GeneratorExit:
+                # Consumer disconnect mid-COT: tell the finally block below to
+                # skip its yield, which would otherwise abort cleanup with
+                # "async generator ignored GeneratorExit".
+                closing_via_generator_exit = True
+                raise
             except Exception as e:
                 # Ensure COT is properly closed before handling exception
                 if enable_cot and cot_active:
                     try:
                         yield "</think>"
                         cot_active = False
+                    except GeneratorExit:
+                        # Consumer disconnect while closing COT on the error
+                        # path. GeneratorExit is a BaseException, so neither
+                        # the handler below nor the co-sibling ``except
+                        # GeneratorExit`` above sees it. Without this clause
+                        # the finally block yields into a closing generator,
+                        # aclose() raises "async generator ignored
+                        # GeneratorExit", and the frame is abandoned before
+                        # the stream and the client are ever closed.
+                        closing_via_generator_exit = True
+                        raise
                     except Exception as close_error:
                         logger.warning(
                             f"Failed to close COT tag during exception handling: {close_error}"
@@ -643,8 +728,9 @@ async def openai_complete_if_cache(
                     )
                 raise
             finally:
-                # Final safety check for unclosed COT tags
-                if enable_cot and cot_active:
+                # Final safety check for unclosed COT tags, skipped while
+                # closing via GeneratorExit (see the except clause above).
+                if enable_cot and cot_active and not closing_via_generator_exit:
                     try:
                         yield "</think>"
                         cot_active = False
@@ -687,6 +773,21 @@ async def openai_complete_if_cache(
 
     else:
         try:
+            # Count usage BEFORE the validation raises below: the request
+            # consumed its budget whether or not the response is usable — a
+            # reasoning model that burned the whole output budget on its
+            # trace is exactly the case that raises, and omitting it would
+            # under-report by a full-budget generation.
+            if token_tracker and hasattr(response, "usage"):
+                token_counts = {
+                    "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
+                    "completion_tokens": getattr(
+                        response.usage, "completion_tokens", 0
+                    ),
+                    "total_tokens": getattr(response.usage, "total_tokens", 0),
+                }
+                token_tracker.add_usage(token_counts)
+
             if (
                 not response
                 or not response.choices
@@ -767,16 +868,9 @@ async def openai_complete_if_cache(
                         f"reasoning_content_len={reasoning_len}"
                     )
                     if finish_reason == "length":
-                        hint = (
-                            "generation hit the token limit before emitting "
-                            "any content"
-                            + (
-                                " (budget consumed by reasoning)"
-                                if reasoning_len
-                                else ""
-                            )
-                            + "; consider raising max_tokens or disabling "
-                            "thinking mode"
+                        hint = empty_length_truncated_hint(
+                            "consider raising max_tokens or disabling thinking mode",
+                            reasoning_consumed_budget=bool(reasoning_len),
                         )
                     elif reasoning_len:
                         hint = (
@@ -786,17 +880,30 @@ async def openai_complete_if_cache(
                         )
                     else:
                         hint = "model produced no output"
-                    logger.error(
+                    error_message = (
                         f"Received empty content from OpenAI API "
                         f"({diagnostics}): {hint}"
                     )
+                    logger.error(error_message)
                     try:
                         await openai_async_client.close()
                     except Exception as close_error:
                         logger.warning(f"Failed to close OpenAI client: {close_error}")
-                    raise InvalidResponseError(
-                        f"Received empty content from OpenAI API ({diagnostics})"
-                    )
+                    # The hint rides along into the exception (and therefore
+                    # into doc_status.error_msg) rather than living only in the
+                    # server log: the operator reading the failed document is
+                    # the one who has to turn the knob.
+                    #
+                    # The TYPE selects the retry policy: token-limit exhaustion
+                    # is deterministic for a given prompt and output budget, so
+                    # it raises EmptyTruncatedResponseError — absent from the
+                    # retry predicate — and fails after one request instead of
+                    # buying two more full-budget generations plus backoff.
+                    # The other empty modes stay retryable: those are sampling
+                    # artifacts a fresh attempt can genuinely fix.
+                    if finish_reason == "length":
+                        raise EmptyTruncatedResponseError(error_message)
+                    raise InvalidResponseError(error_message)
 
             # Apply Unicode decoding to final content if needed
             if r"\u" in final_content:
@@ -812,16 +919,6 @@ async def openai_complete_if_cache(
                     f"(finish_reason=length, content_len={len(final_content)}), returning partial content"
                 )
                 final_content = TruncatedResponse(final_content)
-
-            if token_tracker and hasattr(response, "usage"):
-                token_counts = {
-                    "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
-                    "completion_tokens": getattr(
-                        response.usage, "completion_tokens", 0
-                    ),
-                    "total_tokens": getattr(response.usage, "total_tokens", 0),
-                }
-                token_tracker.add_usage(token_counts)
 
             logger.debug(f"Response content len: {len(final_content)}")
             verbose_debug(f"Response: {response}")
@@ -945,7 +1042,9 @@ async def nvidia_openai_complete(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=60),
     retry=(
-        retry_if_exception_type(RateLimitError)
+        retry_if_exception(_is_retryable_rate_limit_error)
+        # 408 / 409 -- retried by the SDK loop this client no longer runs.
+        | retry_if_exception(_is_transient_status_error)
         | retry_if_exception_type(APIConnectionError)
         | retry_if_exception_type(APITimeoutError)
         # Retry transient HTTP 5xx (OpenAI 500 / proxy upstream errors).
@@ -1015,7 +1114,10 @@ async def openai_embed(
 
     Raises:
         APIConnectionError: If there is a connection error with the OpenAI API.
-        RateLimitError: If the OpenAI API rate limit is exceeded.
+        RateLimitError: If the OpenAI API rate limit is exceeded. Retried
+            with backoff, except for a permanent spend stop (a LiteLLM Proxy
+            ``budget_exceeded`` or an OpenAI ``insufficient_quota``), which
+            fails fast.
         APITimeoutError: If the OpenAI API request times out.
     """
     # Apply context-based prefixes if provided
@@ -1034,7 +1136,16 @@ async def openai_embed(
                 truncated_texts.append(text)
                 continue
 
-            tokens = encoding.encode(text)
+            # disallowed_special=() is required, not an optimization: tiktoken
+            # defaults to disallowed_special=ALL and raises ValueError as soon as
+            # the text merely CONTAINS a literal special-token string such as
+            # "<|endoftext|>". Since this encode runs for every non-empty text
+            # once truncation is enabled, one chunk of user content quoting that
+            # marker -- common in documentation, notes, or captured model output
+            # -- failed the whole embedding batch regardless of its length. The
+            # markers must be encoded as ordinary text, exactly as
+            # Tokenizer.encode does for every other tokenizing path.
+            tokens = encoding.encode(text, disallowed_special=())
             if len(tokens) > max_token_size:
                 truncated_tokens = tokens[:max_token_size]
                 truncated_texts.append(encoding.decode(truncated_tokens))
@@ -1205,6 +1316,7 @@ async def azure_openai_embed(
     context: str = "document",
     query_prefix: str | None = None,
     document_prefix: str | None = None,
+    max_token_size: int | None = None,
 ) -> np.ndarray:
     """Azure OpenAI embedding wrapper function.
 
@@ -1213,6 +1325,12 @@ async def azure_openai_embed(
 
     All parameters from the underlying openai_embed are exposed to ensure
     full feature parity and API consistency.
+
+    ``max_token_size`` must stay a named parameter here: EmbeddingFunc.__call__
+    injects it from the @wrap_embedding_func_with_attrs decorator only when
+    the wrapped function's own signature declares it, and it is then
+    forwarded to openai_embed.func to truncate oversized texts before they
+    reach the Azure API, exactly as the standard OpenAI binding does.
 
     IMPORTANT - Decorator Usage:
 
@@ -1275,6 +1393,7 @@ async def azure_openai_embed(
         base_url=base_url,
         api_key=api_key,
         embedding_dim=embedding_dim,
+        max_token_size=max_token_size,
         token_tracker=token_tracker,
         client_configs=client_configs,
         use_azure=True,

@@ -361,6 +361,37 @@ class MemgraphStorage(BaseGraphStorage):
                     )  # Ensure the result is consumed even on error
                 raise
 
+    async def iter_labels(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if self._driver is None:
+            raise RuntimeError(
+                "Memgraph driver is not initialized. Call 'await initialize()' first."
+            )
+        workspace_label = self._get_workspace_label()
+        async with self._driver.session(
+            database=self._DATABASE, default_access_mode="READ"
+        ) as session:
+            result = await session.run(
+                f"""
+                MATCH (n:`{workspace_label}`)
+                WHERE n.entity_id IS NOT NULL
+                RETURN DISTINCT n.entity_id AS label
+                ORDER BY label
+                """
+            )
+            batch: list[str] = []
+            try:
+                async for record in result:
+                    batch.append(record["label"])
+                    if len(batch) == batch_size:
+                        yield batch
+                        batch = []
+                if batch:
+                    yield batch
+            finally:
+                await result.consume()
+
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
         """Retrieves all edges (relationships) for a particular node identified by its label.
 
@@ -369,7 +400,9 @@ class MemgraphStorage(BaseGraphStorage):
 
         Returns:
             list[tuple[str, str]]: List of (source_label, target_label) tuples representing edges
-            None: If no edges found
+            None: If the node does not exist. An existing node with no relations
+                returns ``[]`` — the BaseGraphStorage contract, as implemented by
+                NetworkXStorage. A query error is neither value: it propagates.
 
         Raises:
             Exception: If there is an error executing the query
@@ -394,7 +427,14 @@ class MemgraphStorage(BaseGraphStorage):
                     results = await session.run(query, entity_id=source_node_id)
 
                     edges = []
+                    # Any row at all means the anchor MATCH bound n, i.e. the
+                    # node exists: an isolated node still yields exactly one row
+                    # (via OPTIONAL MATCH) carrying a NULL connected_entity_id.
+                    # Zero rows is the only "no such node" signal, and it must
+                    # not be reported as an empty edge list.
+                    node_matched = False
                     async for record in results:
+                        node_matched = True
                         node_entity_id = record["node_entity_id"]
                         connected_entity_id = record["connected_entity_id"]
                         start_entity_id = record["start_entity_id"]
@@ -409,7 +449,7 @@ class MemgraphStorage(BaseGraphStorage):
                             edges.append((connected_entity_id, node_entity_id))
 
                     await results.consume()  # Ensure results are consumed
-                    return edges
+                    return edges if node_matched else None
                 except Exception as e:
                     logger.error(
                         f"[{self.workspace}] Error getting edges for node {source_node_id}: {str(e)}"
@@ -1061,12 +1101,16 @@ class MemgraphStorage(BaseGraphStorage):
                         if count_result:
                             await count_result.consume()
 
-                    # Run main query to get nodes with highest degree
+                    # Run main query to get nodes with highest degree.
+                    # Degree descending, then entity_id ascending: the tie-break
+                    # is the BaseGraphStorage contract, and without it the
+                    # LIMIT cut an unordered band of equal-degree entities, so
+                    # the same graph returned different nodes run to run.
                     main_query = f"""
                     MATCH (n:`{workspace_label}`)
                     OPTIONAL MATCH (n)-[r]-()
                     WITH n, COALESCE(count(r), 0) AS degree
-                    ORDER BY degree DESC
+                    ORDER BY degree DESC, n.entity_id ASC
                     LIMIT $max_nodes
                     WITH collect({{node: n}}) AS filtered_nodes
                     UNWIND filtered_nodes AS node_info
@@ -1229,9 +1273,18 @@ class MemgraphStorage(BaseGraphStorage):
         async with self._driver.session(
             database=self._DATABASE, default_access_mode="READ"
         ) as session:
+            # `-[r]-` is undirected with both endpoints free, so the pattern
+            # matcher yields one row per orientation of every relationship --
+            # {a:X, b:Y} and {a:Y, b:X}. Every edge is created through an
+            # undirected MERGE (see upsert_edge), which still gives the
+            # relationship exactly one physical direction in storage, so a
+            # DIRECTED match (`-[r]->`) returns it exactly once with no
+            # DISTINCT and no client-side dedup set -- unlike id(r)-based
+            # dedup, this stays O(1) client memory regardless of graph size,
+            # which iter_edges' batch/yield contract requires.
             query = f"""
-            MATCH (a:`{workspace_label}`)-[r]-(b:`{workspace_label}`)
-            RETURN DISTINCT a.entity_id AS source, b.entity_id AS target, properties(r) AS properties
+            MATCH (a:`{workspace_label}`)-[r]->(b:`{workspace_label}`)
+            RETURN a.entity_id AS source, b.entity_id AS target, properties(r) AS properties
             """
             result = await session.run(query)
             edges = []
@@ -1242,6 +1295,43 @@ class MemgraphStorage(BaseGraphStorage):
                 edges.append(edge_properties)
             await result.consume()
             return edges
+
+    async def iter_edges(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if self._driver is None:
+            raise RuntimeError(
+                "Memgraph driver is not initialized. Call 'await initialize()' first."
+            )
+        workspace_label = self._get_workspace_label()
+        async with self._driver.session(
+            database=self._DATABASE, default_access_mode="READ"
+        ) as session:
+            # Same undirected-double-count trap as get_all_edges, same fix:
+            # a DIRECTED match returns each relationship exactly once with
+            # no client-side dedup set, keeping this generator's memory use
+            # bounded by batch_size regardless of graph size.
+            result = await session.run(
+                f"""
+                MATCH (a:`{workspace_label}`)-[r]->(b:`{workspace_label}`)
+                RETURN a.entity_id AS source, b.entity_id AS target,
+                       properties(r) AS properties
+                """
+            )
+            batch: list[dict] = []
+            try:
+                async for record in result:
+                    edge = dict(record["properties"])
+                    edge["source"] = record["source"]
+                    edge["target"] = record["target"]
+                    batch.append(edge)
+                    if len(batch) == batch_size:
+                        yield batch
+                        batch = []
+                if batch:
+                    yield batch
+            finally:
+                await result.consume()
 
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
         """Get popular labels by node degree (most connected entities)
@@ -1283,10 +1373,14 @@ class MemgraphStorage(BaseGraphStorage):
                 )
                 return labels
         except Exception as e:
+            # Raise, never return []: an empty list here is indistinguishable
+            # from "the graph has no entities". /graph/label/popular already
+            # turns an exception into a 500, so swallowing it handed the WebUI a
+            # 200 with an empty entity picker while the database was down.
             logger.error(f"[{self.workspace}] Error getting popular labels: {str(e)}")
             if result is not None:
                 await result.consume()
-            return []
+            raise
 
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
         """Search labels(entity names) with fuzzy matching
@@ -1341,7 +1435,9 @@ class MemgraphStorage(BaseGraphStorage):
                 )
                 return labels
         except Exception as e:
+            # Same reasoning as get_popular_labels: "no match" and "the query
+            # failed" must not share a return value.
             logger.error(f"[{self.workspace}] Error searching labels: {str(e)}")
             if result is not None:
                 await result.consume()
-            return []
+            raise

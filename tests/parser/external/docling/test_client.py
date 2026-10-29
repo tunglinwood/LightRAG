@@ -25,6 +25,7 @@ from urllib.parse import quote
 
 import pytest
 
+from lightrag.parser.external.docling import client as client_mod
 from lightrag.parser.external.docling.client import (
     CONVERT_PATH,
     POLL_PATH,
@@ -96,6 +97,49 @@ class _Recorder:
 _CURRENT: dict[str, _Recorder] = {}
 
 
+class _FakeStreamContext:
+    """Async context manager mirroring ``httpx.AsyncClient.stream()``.
+
+    Yields a response-like object exposing ``.aiter_bytes()`` so the
+    production stream_capped_get helper can iterate it exactly like a real
+    streamed httpx response.
+    """
+
+    def __init__(self, response: "_FakeStreamResponse") -> None:
+        self._response = response
+
+    async def __aenter__(self) -> "_FakeStreamResponse":
+        return self._response
+
+    async def __aexit__(self, *_: Any) -> None:
+        pass
+
+
+class _FakeStreamResponse:
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        text: str = "",
+        content: bytes = b"",
+        headers: dict[str, str] | None = None,
+        chunk_size: int = 1 << 16,
+    ) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.content = content or text.encode("utf-8")
+        self.headers = headers or {}
+        self._chunk_size = chunk_size
+
+    def json(self) -> Any:
+        return json.loads(self.text) if self.text else {}
+
+    async def aiter_bytes(self):
+        data = self.content
+        for i in range(0, len(data), self._chunk_size):
+            yield data[i : i + self._chunk_size]
+
+
 class _FakeAsyncClient:
     def __init__(self, *_: Any, **__: Any) -> None:
         pass
@@ -160,19 +204,28 @@ class _FakeAsyncClient:
             if recorder.terminal_status != "success":
                 payload["error_message"] = "synthetic-failure"
             return _FakeResponse(status_code=200, text=json_dump(payload))
-        if RESULT_PATH.format(task_id=encoded) in url:
+        raise AssertionError(f"unexpected GET {url}")
+
+    def stream(self, method: str, url: str, **_: Any) -> "_FakeStreamContext":
+        recorder = _CURRENT["recorder"]
+        encoded = quote(recorder.task_id, safe="")
+        if method == "GET" and RESULT_PATH.format(task_id=encoded) in url:
             recorder.result_calls += 1
             if recorder.result_status_code != 200:
-                return _FakeResponse(
-                    status_code=recorder.result_status_code,
-                    text=recorder.result_text or "",
+                return _FakeStreamContext(
+                    _FakeStreamResponse(
+                        status_code=recorder.result_status_code,
+                        text=recorder.result_text or "",
+                    )
                 )
-            return _FakeResponse(
-                status_code=200,
-                content=recorder.result_content or recorder.zip_bytes,
-                headers={"content-type": recorder.result_content_type},
+            return _FakeStreamContext(
+                _FakeStreamResponse(
+                    status_code=200,
+                    content=recorder.result_content or recorder.zip_bytes,
+                    headers={"content-type": recorder.result_content_type},
+                )
             )
-        raise AssertionError(f"unexpected GET {url}")
+        raise AssertionError(f"unexpected stream {method} {url}")
 
 
 def json_dump(payload: Any) -> str:
@@ -839,3 +892,90 @@ async def test_docling_client_default_upload_filename_falls_back_to_source_name(
 
     name, _blob, _ctype = recorder.post_calls[0]["files"]["files"]
     assert name == "demo.pdf"
+
+
+async def test_docling_result_zip_is_extracted_under_a_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source_pdf: Path
+) -> None:
+    # ``safe_extract_zip`` defaults both guards to unlimited, so an
+    # unbudgeted call inherits no zip-bomb protection at all. The docling
+    # server is operator-configured rather than attacker-supplied, which
+    # makes this depth rather than the defect in GHSA-2wpj-ffvv-2pq8 — but
+    # the call has to pass real values for the guards to exist.
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=_fake_zip_with_main_json("demo"),
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+
+    seen: dict[str, object] = {}
+    real = client_mod.safe_extract_zip
+
+    def _spy(payload, dest_dir, **kwargs):
+        seen.update(kwargs)
+        return real(payload, dest_dir, **kwargs)
+
+    monkeypatch.setattr(client_mod, "safe_extract_zip", _spy)
+
+    await DoclingRawClient().download_into(tmp_path / "demo.docling_raw", source_pdf)
+
+    assert isinstance(seen.get("max_entries"), int)
+    assert seen["max_entries"] > 0
+    assert isinstance(seen.get("max_total_bytes"), int)
+    assert seen["max_total_bytes"] > 0
+
+
+async def test_docling_oversized_result_zip_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source_pdf: Path
+) -> None:
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=_fake_zip_with_main_json("demo"),
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+    monkeypatch.setenv("PARSER_RESULT_BUNDLE_MAX_TOTAL_BYTES", "8")
+
+    with pytest.raises(RuntimeError) as exc:
+        await DoclingRawClient().download_into(
+            tmp_path / "demo.docling_raw", source_pdf
+        )
+    # stream_capped_get has its own separate PARSER_RESULT_BUNDLE_DOWNLOAD_MAX_BYTES
+    # budget (unset here, so it stays at its generous default) and does not
+    # consult this uncompressed-size cap -- only safe_extract_zip's
+    # declared-size check below sees it. See
+    # test_docling_declared_size_lies_but_raw_response_is_small for more
+    # coverage of that same check.
+    assert "uncompressed size" in str(exc.value)
+
+
+async def test_docling_result_bundle_budget_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source_pdf: Path
+) -> None:
+    """A non-positive env value disables that gate (maps to None = unlimited).
+
+    Passing 0 straight into safe_extract_zip would refuse every bundle; the
+    live-read must map non-positive to None so an operator whose legitimate
+    result bundle exceeds the default ceiling can raise/disable it without a
+    code change.
+    """
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=_fake_zip_with_main_json("demo"),
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+    # A ceiling below the real bundle size that would refuse it if honored...
+    monkeypatch.setenv("PARSER_RESULT_BUNDLE_MAX_TOTAL_BYTES", "8")
+    monkeypatch.setenv("PARSER_RESULT_BUNDLE_MAX_ENTRIES", "1")
+
+    with pytest.raises(RuntimeError):
+        await DoclingRawClient().download_into(
+            tmp_path / "demo.docling_raw", source_pdf
+        )
+
+    # ...disabled by a non-positive value, the bundle extracts normally.
+    monkeypatch.setenv("PARSER_RESULT_BUNDLE_MAX_TOTAL_BYTES", "0")
+    monkeypatch.setenv("PARSER_RESULT_BUNDLE_MAX_ENTRIES", "0")
+    await DoclingRawClient().download_into(tmp_path / "demo2.docling_raw", source_pdf)

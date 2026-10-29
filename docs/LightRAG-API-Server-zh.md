@@ -8,9 +8,9 @@ LightRAG 服务器旨在提供 Web 界面和 API 支持。Web 界面便于文档
 
 ![image-20250323123011220](./LightRAG-API-Server.assets/image-20250323123011220.png)
 
-## 从 v1.4.16 升级到 v1.5.0rc2
+## 从 v1.4.16 升级到 v1.5.x
 
-v1.5.0rc2 引入了新的文件处理流水线、解析器路由、多模态分析、基于角色的 LLM/VLM 配置、JSON 实体抽取以及若干 provider / storage 变更。升级生产实例前，请先阅读 [v1.5.0rc2 发布说明](https://github.com/HKUDS/LightRAG/releases/tag/v1.5.0rc2)。
+v1.5.x 引入了新的文件处理流水线、解析器路由、多模态分析、基于角色的 LLM/VLM 配置、JSON 实体抽取以及若干 provider / storage 变更。升级生产实例前，请先阅读 [v1.5.0rc2 发布说明](https://github.com/HKUDS/LightRAG/releases/tag/v1.5.0rc2)。
 
 - 如果希望升级服务器但保持旧版文件处理行为，请设置：
 
@@ -240,6 +240,19 @@ lightrag-server --port 9621
 
 后端会把该值作为 FastAPI 的 `root_path`，并把同一个运行时前缀注入 WebUI。WebUI 在服务端内部始终挂载到 `/webui`，因此同一份前端构建产物可以服务任意前缀。完整的 Nginx、Docker 和 Kubernetes 示例请参阅 [Single-Server Multi-Site Deployment](./MultiSiteDeployment.md)。
 
+### `/workspace` 查询入口
+
+除 `/webui` 后台管理界面外，服务端还挂载第二个入口 `/workspace`：面向日常查询用户的纯问答界面。它只提供聊天界面（无文档管理、无知识图谱、无查询参数侧栏、无 API 文档入口），并针对移动端优化。未登录访问 `/workspace` 先看到可定制的欢迎页；`/webui` 保持直接显示登录页。两个入口来自同一次前端构建（`index.html` + `workspace.html`），都支持 `LIGHTRAG_API_PREFIX`。
+
+- `LIGHTRAG_DEFAULT_UI` / `--default-ui`（默认 `webui`，可选 `workspace`）只控制一件事：根路径 `/` 跳转到哪个入口。两个入口始终都会挂载；非法值会导致启动失败。
+- `/workspace` 的查询参数**只继承、不可编辑**：每次查询使用同一浏览器中 `/webui` 保存的 `querySettings`（未保存时使用前端默认值）。**这是按浏览器的本地状态，不是服务端全局策略**——两个入口共享同一个浏览器的本地存储，因此最终用户在自己的设备上打开 `/workspace` 时用到的是前端默认值，而不是管理员在别处保存的参数。浏览器按**源**（origin）隔离该存储，而存储键尚未按 `LIGHTRAG_API_PREFIX` 分区，所以部署在同一主机上的多个站点之间也共享这些参数——参见 [MultiSiteDeployment.md](./MultiSiteDeployment.md)。**因此在同一浏览器内，后台保存的查询 `mode` 同时决定查询入口的行为**——包括 `bypass`（跳过检索、携带最近 3 轮对话直接询问 LLM）。唯二例外是调试开关 `only_need_context` / `only_need_prompt`：`/workspace` 始终以 `false` 提交，管理员调试后忘记关闭也不会让查询用户拿到原始上下文而非答案。
+- 两个入口的查询历史相互独立：管理员的调试对话不会出现在查询入口（也不会作为其 `bypass` 上下文发送），反之亦然。
+- `UI_TEMPLATES_DIR` 指向可选的只读多语言 UI Bundle，可在不重建前端的情况下替换欢迎页文案、查询空白态文案和品牌 Logo，并可为登录页添加定制文案、协议同意勾选框与版权声明——完整说明参见 [UserDefinedUI-zh.md](./UserDefinedUI-zh.md)，可直接复制的示例包见 `docs/ui_templates_example/`。未设置即使用前端内置品牌内容；指向的目录中还没有 `manifest.json` 时同样如此（即仓库自带 compose 文件的「挂载点尚未填充」状态，启动时记录一条写明该目录的警告）。一旦目录中存在 `manifest.json`，Bundle 非法就会导致启动失败。修改内容需重启；文案以 `no-store` 提供、Logo 通过内容哈希的 immutable URL 提供，无需手动清缓存。 若某个 locale 同时声明了 `login`（登录页定制文案）与 `agreements`（把《用户隐私协议》和《模型服务协议》合并在一起的单份文档），则该 locale 启用登录页协议同意勾选框：登录页显示「同意《用户隐私协议》和《模型服务协议》」，其中的唯一链接弹窗展示该文档，未勾选则不允许登录。仅声明其中一项时该功能不启用；声明了但内容为空的文件会导致启动失败。该门禁仅覆盖账号密码登录：未配置 `AUTH_ACCOUNTS` 的免登录部署会以 guest 身份直接放行，不受门禁约束——没有认证就没有可被约束的用户身份，若必须要求接受协议，请配置 `AUTH_ACCOUNTS`。 Bundle 的语言集合与 WebUI 自身的界面语言（`en`、`zh`、`zh-TW`、`fr`、`ar`、`ru`、`ja`、`de`、`uk`、`ko`、`vi`）相互独立：Bundle 可声明任意合法 BCP 47 locale，但界面语言之外的 locale，其内容虽能正确渲染，周围的按钮与设置仍停留在访问者解析出的 UI 语言上；启动时会记录一条警告列出这些 locale。
+- `ENABLE_AI_CONTENT_NOTICE=true` 会在**两个查询界面**（`/workspace` 与 `/webui` 的检索面板）中，在每条回答底部的响应时间行末尾追加 AI 生成内容提示（不独占一行），文案随界面语言变化（中文为“由AI生成、请注意鉴别”）。默认关闭。该提示只是界面元素：不会写入 `/query` 响应、不会进入复制的消息文本，也不会存入聊天历史。开关通过 `/auth-status`、`/login` 与 `/health` 的 `ai_content_notice_enabled` 字段下发，两个入口在启动时读取。只有确实由 LLM 生成的文本才会被标注：`/query` 与 `/query/stream` 逐条响应返回 `llm_generated`，无检索上下文时的固定回复以及 `only_need_context` / `only_need_prompt` 调试输出均为 false。
+- `/health` 分别报告 `webui_available` 与 `workspace_available`；旧构建产物缺少 `workspace.html` 时 `/webui` 完整可用，`/workspace` 返回固定 JSON 提示（绝不重定向到 API 文档）。
+
+对查询用户隐藏后台界面是 UX 分流，**不是**安全边界：所有接口的授权仍由服务端强制执行。
+
 > **`WHITELIST_PATHS` 不带前缀书写。** 它的条目是内部路由路径，与路由声明时完全一致。匹配前会先剥离挂载前缀，两种转发方式下都是如此。因此在 `LIGHTRAG_API_PREFIX=/site01` 下，出厂默认的 `WHITELIST_PATHS=/health,/api/*` 本身就是正确的，会豁免浏览器所见的 `/site01/health`。若按浏览器可见形式书写（`WHITELIST_PATHS=/site01/health`），则匹配不到任何路径，反而会让这些路径要求认证。
 
 ### 使用 Docker 启动 LightRAG 服务器
@@ -312,6 +325,10 @@ EMBEDDING_DIM=3072
 EMBEDDING_TOKEN_LIMIT=8192
 EMBEDDING_SEND_DIM=false
 EMBEDDING_USE_BASE64=true
+# 分块后若单个 chunk 仍超过 EMBEDDING_TOKEN_LIMIT，embedding 硬回退切分时
+# 从上一片内容尾部借用的重叠 token 数。独立于 CHUNK_OVERLAP_SIZE。
+# 默认 100；0 表示禁用该回退的重叠。
+# EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE=100
 
 ############################
 ### Data storage selection
@@ -420,7 +437,7 @@ docker compose -f docker-compose.final.yml up -d
 处理生产数据前请注意：
 
 - 首次上传前确定 Embedding 模型、向量维度和非对称嵌入设置。之后修改这些配置需要清空对应 workspace/向量数据并重新索引文档。
-- 首次上传前确定存储后端。当前不支持在不同存储实现之间直接迁移。
+- 首次上传前确定存储后端。当前不支持在不同存储实现之间直接迁移，但有一个例外：已抽取的图可以从 `PGGraphStorage` 迁移到 `PGTableGraphStorage` 而无需重新索引 —— 参见下文*从 Apache AGE 迁移图数据到 PostgreSQL 表*。
 - 修改 `LIGHTRAG_PARSER` 只影响新上传文件。如需让已有文档使用新的解析路由，请删除后重新上传。
 
 ### Nginx 反向代理配置
@@ -498,6 +515,8 @@ server {
 
      把 `MAX_REQUEST_BODY_BYTES` 设为任意正值时，该值将统一作用于除上传外的所有路由（含摄取路由）——即使该值恰好等于 1 MiB 默认值也是如此，这正是分档出现之前该配置项的行为。设为 `0` 则关闭全部上限（含派生的上传上限），启动时会给出告警。
    - **输入字段上限**作用于 `/query*`、`/api/chat`、`/api/generate` 的模型侧字段：单个 query/prompt 64 KiB、单条消息 32 KiB、每请求模型侧文本合计 128 KiB、最多 128 条消息，以及 `top_k` / `chunk_top_k`（1000）与 `max_*_tokens`（1,000,000）的上界。这些上限刻意不做成配置项——一个用来阻止未认证调用者决定服务端 CPU 开销的限制，如果可以被配错，就等于没有。`/query*` 超限返回 **422**（FastAPI 原生校验响应），`/api/*` 返回 **413**。
+   - **查询不得为空**：去除首尾空白后为空的查询在所有路径上都会被拒绝，包括 `bypass`、Open WebUI 元数据任务和 `/api/generate`。豁免下面的最小长度并不等于可以不带提示词。
+   - **RAG 查询最小长度**：去除首尾空白后，检索模式要求查询的英文等效长度至少为 3。每个中日韩字符按 2 计算，其他 Unicode 字符按 1 计算。该规则适用于核心查询 API、`/query*` 和 `/api/chat` 的 RAG 分支；`bypass`、直接转发给 LLM 的 Open WebUI 元数据任务以及 `/api/generate` 仅豁免最小长度这一条。`/query` 与 `/query/stream` 返回 **422**，`/query/data` 返回 **400**，`/api/*` 返回 **400**。
    - `MAX_TEXTS_PER_REQUEST` 限制单个 `/documents/texts` 请求可携带的文本数量，在任何逐条存储查询之前就返回 **413**。它限制的是单个请求的扇出，因此与下面的容量上限不同，**不是**"稍后重试"类条件：超限的批次无论等多久都不会被接受，必须拆分。
    - `MAX_PENDING_DOCUMENTS` 限制可同时处于活跃状态（`PENDING`/`PARSING`/`ANALYZING`/`PROCESSING`）或被在飞请求预留的文档数。超容量时返回 **429**,带 `Retry-After` 头,detail 里给出当前数量、本次请求数量与容量——且**在 body 传输之前**就拒绝。`/documents/scan` 与人工重试按设计突破该上限;它们产生的文档会让普通上传排队等待。
 
@@ -530,13 +549,13 @@ lightrag-server --port 9622 --workspace space2
 命令行的 workspace 参数和`.env`文件中的环境变量`WORKSPACE` 都可以用于指定当前实例的工作空间名字，命令行参数的优先级别更高。下面是不同类型的存储实现工作空间的方式：
 
 - **对于本地基于文件的数据库，数据隔离通过工作空间子目录实现：** JsonKVStorage, JsonDocStatusStorage, NetworkXStorage, NanoVectorDBStorage, FaissVectorDBStorage。
-- **对于将数据存储在集合（collection）中的数据库，通过在集合名称前添加工作空间前缀来实现：** RedisKVStorage, RedisDocStatusStorage, MilvusVectorDBStorage, QdrantVectorDBStorage, MongoKVStorage, MongoDocStatusStorage, MongoVectorDBStorage, MongoGraphStorage, PGGraphStorage。
+- **对于将数据存储在集合（collection）中的数据库，通过在集合名称前添加工作空间前缀来实现：** RedisKVStorage, RedisDocStatusStorage, MilvusVectorDBStorage, MongoKVStorage, MongoDocStatusStorage, MongoVectorDBStorage, MongoGraphStorage, PGGraphStorage。
+- **对于 Qdrant 向量数据库，通过基于 payload 的分区实现数据隔离（Qdrant 推荐的多租户方式）：** `QdrantVectorDBStorage` 使用共享 collection 和 payload 过滤，从而支持不限数量的 workspace。
 - **对于关系型数据库，数据隔离通过向表中添加 `workspace` 字段进行数据的逻辑隔离：** PGKVStorage, PGVectorStorage, PGDocStatusStorage。
+- **对于图数据库，通过 label 实现数据的逻辑隔离：** `Neo4JStorage`、`MemgraphStorage`
+- **对于 OpenSearch，通过索引名称前缀实现数据隔离：** `OpenSearchKVStorage`、`OpenSearchDocStatusStorage`、`OpenSearchGraphStorage`、`OpenSearchVectorDBStorage`
 
-* **对于Neo4j图数据库，通过label来实现数据的逻辑隔离**：Neo4JStorage
-* **对于OpenSearch，通过索引名称前缀实现数据隔离**：OpenSearchKVStorage、OpenSearchDocStatusStorage、OpenSearchGraphStorage、OpenSearchVectorDBStorage
-
-为了保持对遗留数据的兼容，在未配置工作空间时PostgreSQL的默认工作空间为`default`，Neo4j的默认工作空间为`base`。对于所有的外部存储，系统都提供了专用的工作空间环境变量，用于覆盖公共的 `WORKSPACE`环境变量配置。这些适用于指定存储类型的工作空间环境变量为：`REDIS_WORKSPACE`, `MILVUS_WORKSPACE`, `QDRANT_WORKSPACE`, `MONGODB_WORKSPACE`, `POSTGRES_WORKSPACE`, `NEO4J_WORKSPACE`, `OPENSEARCH_WORKSPACE`。
+为了保持对遗留数据的兼容，在未配置工作空间时PostgreSQL的默认工作空间为`default`，Neo4j的默认工作空间为`base`。对于所有的外部存储，系统都提供了专用的工作空间环境变量，用于覆盖公共的 `WORKSPACE`环境变量配置。这些适用于指定存储类型的工作空间环境变量为：`REDIS_WORKSPACE`, `MILVUS_WORKSPACE`, `QDRANT_WORKSPACE`, `MONGODB_WORKSPACE`, `POSTGRES_WORKSPACE`, `NEO4J_WORKSPACE`, `MEMGRAPH_WORKSPACE`, `OPENSEARCH_WORKSPACE`。
 
 ### Gunicorn + Uvicorn 的多工作进程
 
@@ -549,7 +568,8 @@ LightRAG 服务器可以在 `Gunicorn + Uvicorn` 预加载模式下运行。Guni
 WORKERS=2
 ### 一批中并行处理的文件数
 MAX_PARALLEL_INSERT=3
-# LLM 的最大并发请求数(MAX_ASYNC 作为兼容旧名仍可用)
+### 基础 LLM 并发与单文档 chunk 抽取 task 上限
+### （MAX_ASYNC 作为兼容旧名仍可用）
 MAX_ASYNC_LLM=4
 ```
 
@@ -601,6 +621,8 @@ Open WebUI 使用 LLM 来执行会话标题和会话关键词生成任务。因�
 如果您从 LightRAG 的 Ollama 接口发送消息（查询），默认查询模式是 `hybrid`。您可以通过发送带有查询前缀的消息来选择查询模式。
 
 查询字符串中的查询前缀可以决定使用哪种 LightRAG 查询模式来生成响应。支持的前缀包括：
+
+去除模式前缀后，RAG 查询的英文等效长度必须至少为 3；每个中日韩字符按 2 计算。直接调用 LLM 的 `/bypass` 请求不受此最小长度限制，但任何请求都不得携带空查询——若模式前缀吞掉了整条消息（如 `/local[hint]`），将返回 **400**。
 
 ```
 /local
@@ -725,7 +747,7 @@ API 服务器可以通过两种方式配置（优先级从高到低）：
 * 命令行参数
 * 环境变量或 .env 文件
 
-大多数配置都有默认设置，详细信息请查看示例文件：`.env.example`。存储配置也应通过环境变量或 `.env` 文件设置。
+大多数配置都有默认设置，详细信息请查看示例文件：`env.example`。存储配置也应通过环境变量或 `.env` 文件设置。
 
 ### 支持的 LLM 和嵌入后端
 
@@ -774,9 +796,11 @@ lightrag-server --embedding-binding ollama --help
 lightrag-server --embedding-binding gemini --help
 ```
 
-> 请使用openai兼容方式访问OpenRouter、vLLM或SLang部署的LLM。可以通过 `OPENAI_LLM_EXTRA_BODY` 环境变量给OpenRouter、vLLM或SGLang推理框架传递额外的参数，实现推理模式的关闭或者其它个性化控制。
+> **全部 provider 参数速查：** `--help` 只显示当前所选 binding 的参数组，既不显示默认值也不显示对应的环境变量名。[LLM and Embedding Provider Options Reference](./LLMProviderOptions.md)（英文技术参考）完整列出 `OPENAI_LLM_*`、`OLLAMA_LLM_*`、`GEMINI_LLM_*`、`BEDROCK_LLM_*`、`OLLAMA_EMBEDDING_*`、`GEMINI_EMBEDDING_*` 的每一个变量及其类型与含义，并说明取值规则（未设置即“不下发”、取值语法、各驱动实际转发哪些参数、以及为什么修改 provider 参数不会让 LLM 缓存失效）。
+>
+> 请使用openai兼容方式访问OpenRouter、[OrcaRouter](https://www.orcarouter.ai)、vLLM或SGLang部署的LLM。可以通过 `OPENAI_LLM_EXTRA_BODY` 环境变量给这些提供商传递额外的参数，实现推理模式的关闭或者其它个性化控制。
 
-设置 `max_tokens` 参数旨在**防止在实体关系提取阶段出现LLM 响应输出过长或无休止的循环输出的问题**。设置 `max_tokens` 参数的目的是在超时发生之前截断 LLM 输出，从而防止文档提取失败。这解决了某些包含大量实体和关系的文本块（例如表格或引文）可能导致 LLM 产生过长甚至无限循环输出的问题。此设置对于本地部署的小参数模型尤为重要。`max_tokens` 值可以通过以下公式计算：
+设置 `max_tokens` 参数旨在**防止在实体关系提取阶段出现LLM 响应输出过长或无休止的循环输出的问题**。设置 `max_tokens` 参数的目的是在超时发生之前截断 LLM 输出，从而防止文档提取失败。这解决了某些包含大量实体和关系的文本块（例如表格或引文）可能导致 LLM 产生过长甚至无限循环输出的问题。此设置对于本地部署的小参数模型尤为重要。`max_tokens` 值可以通过以下公式计算：`LLM_TIMEOUT * llm_output_tokens/second`（例如 `240s * 50 tokens/s = 12000`，此时 max_tokens 应小于 12000）。
 
 ```
 # For vLLM/SGLang doployed models, or most of OpenAI compatible API provider
@@ -879,24 +903,71 @@ LightRAG 使用 4 种类型的存储用于不同目的：
 * GRAPH_STORAGE：实体关系图
 * DOC_STATUS_STORAGE：文档索引状态
 
-每种存储类型都有多种存储实现方式。LightRAG Server 默认的存储实现为内存数据库，数据通过文件持久化保存到 WORKING_DIR 目录。LightRAG 还支持 PostgreSQL、MongoDB、FAISS、Milvus、Qdrant、Neo4j、Memgraph、Redis 和 OpenSearch 等存储实现方式。详细的存储支持方式请参考根目录下的 `README.md` 文件中关于存储的相关内容。
+每种存储类型都有多种存储实现方式。LightRAG Server 默认的存储实现为内存数据库，数据通过文件持久化保存到 WORKING_DIR 目录：全部数据常驻服务进程的内存中，文件仅用于持久化，因此容量受可用内存限制。默认存储**仅适合小数据量的测试、效果评估与开发调试，不建议用于生产环境** —— 生产环境推荐使用 PostgreSQL。各存储类型当前可选的实现如下：
 
-**Milvus 索引配置:** LightRAG 现在可通过环境变量支持对 Milvus 向量存储的可配置索引类型（AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT 等）。HNSW_SQ 需要 Milvus 2.6.8 或更高版本，并能显著节省内存。有关完整的配置选项，请参阅主 README.md 文件中的“使用 Milvus 进行向量存储”部分。
+| 存储类型 | 可选实现（首个为默认实现） |
+|---|---|
+| KV_STORAGE | `JsonKVStorage`、`RedisKVStorage`、`PGKVStorage`、`MongoKVStorage`、`OpenSearchKVStorage` |
+| VECTOR_STORAGE | `NanoVectorDBStorage`、`MilvusVectorDBStorage`、`PGVectorStorage`、`FaissVectorDBStorage`、`QdrantVectorDBStorage`、`MongoVectorDBStorage`、`OpenSearchVectorDBStorage` |
+| GRAPH_STORAGE | `NetworkXStorage`、`Neo4JStorage`、`PGTableGraphStorage`、`PGGraphStorage`、`MongoGraphStorage`、`MemgraphStorage`、`OpenSearchGraphStorage` |
+| DOC_STATUS_STORAGE | `JsonDocStatusStorage`、`RedisDocStatusStorage`、`PGDocStatusStorage`、`MongoDocStatusStorage`、`OpenSearchDocStatusStorage` |
+
+在生产环境中，如果希望用单一后端同时承担全部四种存储，可以选择 PostgreSQL（推荐）、MongoDB 或 OpenSearch；也可以为不同存储类型分别选择专用数据库，例如用 Milvus 或 Qdrant 承担向量存储，用 Neo4j 或 Memgraph 承担图存储。
+
+**PostgreSQL 图存储推荐使用 `PGTableGraphStorage`：** 对于新建的 PostgreSQL 部署，`PGTableGraphStorage` 是推荐的 `GRAPH_STORAGE` 实现，用于替代 `PGGraphStorage`。它不经由 Apache AGE，而是把实体关系图直接存放在普通表中（JSONB 属性配合 B-tree 索引），由此带来两点实际优势：
+
+* **无需安装扩展。** `PGGraphStorage` 依赖 Apache AGE 扩展，而多数托管 PostgreSQL 服务（Amazon RDS、Cloud SQL、Supabase、Neon）并不提供该扩展，导致图存储往往无法与其余三类存储共用同一个数据库。`PGTableGraphStorage` 可运行在任意原生 PostgreSQL 14 及以上版本，所需的表在 `initialize()` 阶段自动创建。在 Docker 部署中，这也意味着使用官方镜像 `pgvector/pgvector:pg18` 即可；内置 AGE 的 `gzdaniel/postgres-for-rag:pg18-age-pgvector` 镜像仅 `PGGraphStorage` 需要。
+* **性能大幅提升。** 查询是带索引的普通 SQL，而非基于 `agtype` 的 Cypher；`get_knowledge_graph` 采用受 `max_nodes` 约束的前沿限幅 BFS。根据 [PR #3103](https://github.com/HKUDS/LightRAG/pull/3103) 随附的实测数据（PostgreSQL 18，8k 节点 / 约 40k 边的图，两个后端在测量前均已执行 `VACUUM ANALYZE`）：`get_knowledge_graph` p50 为 **39 ms 对 1,099 ms（约 28 倍）**，图数据批量装载 **3.0 s 对 434 s**，混合负载吞吐 **1,431 对 73 RPS**。
+
+两种实现读取相同的 `POSTGRES_*` 环境变量，但图数据的存放位置不同 —— `PGTableGraphStorage` 使用自己的 `lightrag_graph_nodes` / `lightrag_graph_edges` 表，`PGGraphStorage` 则存放在 AGE 图内部。因此对已有部署而言，切换实现并不是原地变更：切换之后，此前抽取的图对新后端不可见。此时可以选择重新索引文档，或使用下文*从 Apache AGE 迁移图数据到 PostgreSQL 表*所述的离线迁移工具把已有的图搬过去（LLM 缓存可以单独沿用，参见*在不同存储类型之间迁移LLM缓存*）。对于已经运行在 AGE 上的部署，`PGGraphStorage` 仍继续支持。
+
+各存储实现启动时必须配置的环境变量如下（未列出的实现无需额外配置，仅依赖 WORKING_DIR 下的文件持久化）：
+
+| 存储实现 | 必需的环境变量 |
+|---|---|
+| `PGKVStorage` / `PGVectorStorage` / `PGGraphStorage` / `PGTableGraphStorage` / `PGDocStatusStorage` | `POSTGRES_USER`、`POSTGRES_PASSWORD`、`POSTGRES_DATABASE`（另需 `POSTGRES_HOST`、`POSTGRES_PORT`） |
+| `Neo4JStorage` | `NEO4J_URI`、`NEO4J_USERNAME`、`NEO4J_PASSWORD` |
+| `MongoKVStorage` / `MongoVectorDBStorage` / `MongoGraphStorage` / `MongoDocStatusStorage` | `MONGO_URI`、`MONGO_DATABASE`（`MongoVectorDBStorage` 要求该 Mongo 实例支持 Atlas Search / Vector Search） |
+| `RedisKVStorage` / `RedisDocStatusStorage` | `REDIS_URI` |
+| `MilvusVectorDBStorage` | `MILVUS_URI`、`MILVUS_DB_NAME` |
+| `QdrantVectorDBStorage` | `QDRANT_URL`（`QDRANT_API_KEY` 可选） |
+| `MemgraphStorage` | `MEMGRAPH_URI` |
+| `OpenSearchKVStorage` / `OpenSearchVectorDBStorage` / `OpenSearchGraphStorage` / `OpenSearchDocStatusStorage` | `OPENSEARCH_HOSTS` |
+
+此外，`WORKSPACE` 环境变量用于在同一后端上隔离多个 LightRAG 实例的数据（合法字符为 `a-z`、`A-Z`、`0-9` 和 `_`）；各存储后端也提供形如 `POSTGRES_WORKSPACE`、`NEO4J_WORKSPACE` 的专属覆盖变量，仅为兼容旧配置保留，正常情况下应统一使用 `WORKSPACE`。
+
+上表仅列出启动必需的连接参数，每种存储实现还提供大量可选的调优环境变量（连接池大小、SSL、批量写入/删除的分片阈值、向量索引参数等）。完整清单及默认值请参考仓库根目录的 `env.example` 文件，其中按存储后端分组并附有详细注释。
+
+**Milvus 索引配置:** LightRAG 现在可通过环境变量支持对 Milvus 向量存储的可配置索引类型（AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT 等）。HNSW_SQ 需要 Milvus 2.6.8 或更高版本，并能显著节省内存。有关完整的配置选项，请参阅 [MilvusConfigurationGuide.md](./MilvusConfigurationGuide.md) 文件。
 
 您可以通过环境变量选择存储实现。例如，在首次启动 API 服务器之前，您可以将以下环境变量设置为特定的存储实现名称：
 
 ```
 LIGHTRAG_KV_STORAGE=PGKVStorage
 LIGHTRAG_VECTOR_STORAGE=PGVectorStorage
-LIGHTRAG_GRAPH_STORAGE=PGGraphStorage
+LIGHTRAG_GRAPH_STORAGE=PGTableGraphStorage
 LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage
 ```
 
-在向 LightRAG 添加文档后，您不能更改存储实现选择。目前尚不支持从一个存储实现迁移到另一个存储实现。更多配置信息请阅读示例 `.env.example` 文件。
+在向 LightRAG 添加文档后，您不能更改存储实现选择。目前尚不支持从一个存储实现迁移到另一个存储实现，但图数据从 `PGGraphStorage` 迁移到 `PGTableGraphStorage`（参见下文*从 Apache AGE 迁移图数据到 PostgreSQL 表*）以及 LLM 缓存迁移（参见下文*在不同存储类型之间迁移LLM缓存*）除外。更多配置信息请阅读示例 `env.example` 文件。
+
+> 开发分支 [dev-lancedb](https://github.com/HKUDS/LightRAG/tree/dev-lancedb) 提供了由社区贡献的 LanceDB 存储实现，支持键值（KV）、向量、图及文档状态四类存储。开发分支 [dev-nebula-graph](https://github.com/HKUDS/LightRAG/tree/dev-nebula-graph) 则提供了社区贡献的 Nebula 图存储实现。欢迎有需求的开发者试用并持续完善上述两项存储方案。
 
 ### 在不同存储类型之间迁移LLM缓存
 
 当LightRAG更换存储实现方式的时候，可以LLM缓存从就的存储迁移到新的存储。先以后在新的存储上重新上传文件时，将利用利用原有存储的LLM缓存大幅度加快文件处理的速度。LLM缓存迁移工具的使用方法请参考 [README_MIGRATE_LLM_CACHE.md](../lightrag/tools/README_MIGRATE_LLM_CACHE.md)
+
+### 从 Apache AGE 迁移图数据到 PostgreSQL 表
+
+已经运行 `PGGraphStorage` 的部署，可以把已抽取的图迁移到 `PGTableGraphStorage`，无需重新处理源文档。该离线工具通过公共存储 API 复制图数据：
+
+```bash
+# 请先停止所有 LightRAG 写入进程。默认为 dry run —— 不迁移任何图数据。
+python -m lightrag.tools.migrate_graph_storage
+python -m lightrag.tools.migrate_graph_storage --apply
+```
+
+只有图数据被迁移；向量与 KV 数据不受影响且继续有效，因为迁移后的图保持相同的实体与关系标识。该工具要求目标图分片为空，并且在写入任何数据之前，会拒绝所有它能观察到、且无法完整迁移的结构——缺少可用标识的节点、重复的节点 ID、互为反向的边对，以及 PostgreSQL `jsonb` 无法存储的取值。若写入过程中失败，它只移除本次运行实际写入的内容。有一点限制需要知悉：Apache AGE 使用 `SELECT DISTINCT` 枚举边，因此同一对节点之间两条完全相同的关系只会返回一行，工具无法察觉图的度数将会改变。更换存储后端的通用建议仍然是重新索引 —— 本工具是针对这一特定组合的进阶路径。前置条件、报告格式与失败处理请参考 [README_MIGRATE_GRAPH_STORAGE.md](../lightrag/tools/README_MIGRATE_GRAPH_STORAGE.md)
 
 ### LightRAG API 服务器命令行选项
 
@@ -907,7 +978,7 @@ LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage
 | `--working-dir` | `./rag_storage` | RAG 存储工作目录 |
 | `--input-dir` | `./inputs` | 上传/输入文档目录 |
 | `--timeout` | `150` | Gunicorn worker timeout 以及 fallback 请求超时 |
-| `--max-async` | `4` | 最大并发 LLM 操作数 |
+| `--max-async` | `4` | 基础 LLM 最大并发；也是单文档 chunk 抽取的 task 上限（每个实体/关系合并阶段使用其两倍的 task 上限） |
 | `--log-level` | `INFO` | 日志级别（`DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`） |
 | `--verbose` | `False` | 详细调试输出，配合 debug 日志生效 |
 | `--key` | `None` | 用于认证的 API key |
@@ -1175,13 +1246,15 @@ notes.[-R].md
 
 每个文件最多选择 `F`、`R`、`V`、`P` 中的一种。分块参数通过 `CHUNK_SIZE`、`CHUNK_OVERLAP_SIZE` 以及策略专属变量配置，例如 `CHUNK_R_SEPARATORS`、`CHUNK_V_BREAKPOINT_THRESHOLD_TYPE`、`CHUNK_P_SIZE`、`CHUNK_P_OVERLAP_SIZE`。这些值在服务器启动时读取，并在文档入队时作为该文档的 `chunk_options` 快照保存。
 
+`V` 策略的句子切分正则是唯一不能按请求设置的 chunker 参数：只能通过 `CHUNK_V_SENTENCE_SPLIT_REGEX`（或 SDK 的 `addon_params`）修改。`/documents/text` 和 `/documents/texts` 会拒绝 `chunking.params` 中的 `sentence_split_regex` 键并返回 HTTP 422。调用方提供的正则会应用于同一请求的文本，而 CPython 正则引擎在回溯时会持有 GIL，因此 `(a+)+$` 之类的模式可能冻结整个 worker 进程——参见 [GHSA-32jh-39m7-8x84](https://github.com/HKUDS/LightRAG/security/advisories/GHSA-32jh-39m7-8x84)。文档 `chunk_options` 快照中已经保存的该值也会在处理时被丢弃（并以 `WARNING` 级别记录日志），因此旧版本持久化的模式不会在升级后冻结 worker。
+
 `R` 策略的分隔符级联无论来自何处都限制为最多 64 条、单条最长 256 字符；内置级联为 9 条。请求体超限返回 HTTP 422；非 HTTP 配置值会在缓存时收敛并只记一次 WARNING：`CHUNK_R_SEPARATORS` 在配置装载时，显式提供或整体替换的 `addon_params['chunker']` 会立即处理（为兼容而保留的嵌套原地修改在第一次入队时处理）。规范化后的值会**原地**写回供后续文档复用，因此调用方持有的那个嵌套 `recursive_character` 字典引用仍然生效。直接 SDK 调用和旧版本持久化的按文档快照会保留原值并在执行时静默收敛，避免一个旧值对每篇文档重复告警。若 `separators` 既不是 list/tuple 也不是 `None`，则不做收敛而是**移除该键**并单独告警——因为对裸字符串做边界收敛会把它悄悄变成 64 个单字符分隔符。收敛不等于截短：单条超过 256 字符的分隔符会被**整条丢弃**，列表超过 64 条才**截断**到 64 条（若末尾有字符级 `""` 哨兵则予以保留）。因此一条 300 字符的分隔符是消失，而不是退化成匹配它的前 256 字符，切分点将来自回退级联——各路径分别回退到什么，见[流水线规格](./FileProcessingPipeline-zh.md#r--递归字符)。
 
 完整路由语法、支持扩展名、解析缓存行为、chunker 配置、并发规则以及 Python SDK 差异，请参阅 [文件处理流水线规格](./FileProcessingPipeline-zh.md)。`P` 策略细节请参阅 [段落语义分块](./ParagraphSemanticChunking-zh.md)。如需在索引前调试解析输出，请参阅 [解析器调试 CLI](./ParserDebugCLI-zh.md)。
 
 ### 流水线并发
 
-`MAX_PARALLEL_INSERT` 控制并行处理的文件数量。`MAX_ASYNC_LLM`(兼容旧名:`MAX_ASYNC`)控制并发 LLM 调用，包括抽取、合并、查询关键词生成和最终回答生成。解析压力较大的部署可以使用可选的分阶段流水线变量，例如 `MAX_PARALLEL_PARSE_NATIVE`、`MAX_PARALLEL_PARSE_MINERU`、`MAX_PARALLEL_PARSE_DOCLING` 和 `MAX_PARALLEL_ANALYZE`。
+`MAX_PARALLEL_INSERT` 控制并行处理的文件数量，不控制单个文档内的 chunk 或图合并 task 上限。`MAX_ASYNC_LLM`（兼容旧名：`MAX_ASYNC`）是基础 LLM 并发；对每个文档，它将 chunk 的实体/关系抽取 task 限制为 `MAX_ASYNC_LLM` 个，并将每个实体合并或关系合并阶段限制为 `2 × MAX_ASYNC_LLM` 个 task。实际 Extract 角色 LLM 请求在设置了 `EXTRACT_MAX_ASYNC_LLM` 时使用该值，否则使用 `MAX_ASYNC_LLM`；该角色覆盖不会改变流水线 task 上限。解析压力较大的部署可以使用可选的分阶段流水线变量，例如 `MAX_PARALLEL_PARSE_NATIVE`、`MAX_PARALLEL_PARSE_MINERU`、`MAX_PARALLEL_PARSE_DOCLING` 和 `MAX_PARALLEL_ANALYZE`。完整拓扑见[文件处理流水线规格](./FileProcessingPipeline-zh.md#86-流水线并发参数)。
 
 当处理循环 busy 时，上传和文本插入仍可被接受；运行中的循环会被通知并拾取新 pending 文档。`/documents/clear`、单文档删除等破坏性任务，以及 `/documents/scan` 的分类阶段仍会拒绝并发入队，以保护存储一致性。失败文件可通过 WebUI 重新处理，也可以触发 `/documents/scan`。
 
@@ -1191,6 +1264,8 @@ notes.[-R].md
 
 - Swagger UI：http://localhost:9621/docs
 - ReDoc：http://localhost:9621/redoc
+
+设置 `ENABLE_API_DOCS=false` 可完全关闭交互式接口文档——`/docs`、`/redoc`、`/openapi.json` 及内置 Swagger UI 静态资源全部返回 404（建议加固的生产部署使用）。`/health` 以 `api_docs_available` 字段报告该状态，WebUI 会据此隐藏 API 文档入口。
 
 您可以使用提供的 curl 命令或通过 Swagger UI 界面测试 API 端点。确保：
 

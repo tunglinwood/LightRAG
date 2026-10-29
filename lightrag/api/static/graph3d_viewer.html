@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GK Brain Knowledge Graph · 3D Galaxy</title>
+<title data-i18n="app.title.full">GK Brain Knowledge Graph · 3D Galaxy</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <style>
   :root {
@@ -14,8 +14,20 @@
     --color-text-muted: #8888aa;
     --color-accent: #4a9eff;
     --color-accent-glow: rgba(74, 158, 255, 0.4);
+    --color-topbar-fade: rgba(5, 5, 16, 0.8);
     --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     --font-mono: 'SF Mono', Monaco, Consolas, monospace;
+  }
+
+  [data-theme="light"] {
+    --color-bg: #e9edf5;
+    --color-surface: rgba(255, 255, 255, 0.78);
+    --color-border: rgba(40, 60, 120, 0.2);
+    --color-text: #1c2436;
+    --color-text-muted: #5b657a;
+    --color-accent: #2f6fd0;
+    --color-accent-glow: rgba(47, 111, 208, 0.25);
+    --color-topbar-fade: rgba(233, 237, 245, 0.85);
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -27,6 +39,7 @@
     overflow: hidden;
     height: 100vh;
     width: 100vw;
+    transition: background 0.3s ease, color 0.3s ease;
   }
 
   #canvas-container {
@@ -48,30 +61,30 @@
 
   .top-bar {
     top: 0; left: 0; right: 0;
-    padding: 16px 24px;
+    padding: 24px 32px;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    background: linear-gradient(to bottom, rgba(5, 5, 16, 0.8), transparent);
+    background: linear-gradient(to bottom, var(--color-topbar-fade), transparent);
   }
 
   .logo {
     display: flex;
     align-items: center;
-    gap: 12px;
-    font-size: 18px;
+    gap: 16px;
+    font-size: 36px;
     font-weight: 600;
     letter-spacing: 0.5px;
   }
 
   .logo-icon {
-    width: 32px; height: 32px;
+    width: 64px; height: 64px;
     background: linear-gradient(135deg, var(--color-accent), #a855f7);
-    border-radius: 8px;
+    border-radius: 12px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 18px;
+    font-size: 36px;
   }
 
   .stats {
@@ -156,14 +169,145 @@
     font-family: var(--font-mono);
   }
 
-  .bottom-bar {
-    bottom: 0; left: 0; right: 0;
-    padding: 16px 24px;
+  .settings-gear {
+    position: fixed;
+    bottom: 24px; right: 24px;
+    z-index: 30;
+    width: 48px; height: 48px;
+    border-radius: 50%;
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
+    font-size: 22px;
+    cursor: pointer;
+    transition: all 0.2s ease;
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 16px;
-    background: linear-gradient(to top, rgba(5, 5, 16, 0.8), transparent);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  }
+
+  .settings-gear:hover {
+    background: rgba(74, 158, 255, 0.15);
+    border-color: var(--color-accent);
+    transform: scale(1.1);
+  }
+
+  .settings-panel {
+    bottom: 80px; right: 24px;
+    width: 280px;
+    max-height: calc(100vh - 100px);
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 16px;
+    padding: 20px;
+    overflow-y: auto;
+    transition: transform 0.3s ease, opacity 0.3s ease;
+    z-index: 25;
+  }
+
+  .settings-panel.hidden {
+    transform: translateX(320px);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .settings-section-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin: 16px 0 8px;
+  }
+
+  .settings-section-title:first-of-type {
+    margin-top: 4px;
+  }
+
+  .lang-toggle {
+    display: flex;
+    gap: 0;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 4px;
+  }
+
+  .lang-btn, .theme-btn {
+    flex: 1;
+    padding: 6px 12px;
+    background: transparent;
+    border: none;
+    color: var(--color-text-muted);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+
+  .lang-btn.active, .theme-btn.active {
+    background: var(--color-accent);
+    color: #fff;
+  }
+
+  .settings-panel .control-btn {
+    width: 100%;
+    justify-content: flex-start;
+    margin-bottom: 6px;
+  }
+
+  /* Free-floating, draggable QR chip. Leaves the top-bar flow; position is
+     set inline by JS once dragged (static position = original spot until then). */
+  .title-qr {
+    position: fixed;
+    width: 144px; height: 144px;
+    border-radius: 12px;
+    border: 2px solid var(--color-border);
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-drag: none;
+    z-index: 30;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  .title-qr:hover {
+    border-color: var(--color-accent);
+    box-shadow: 0 8px 28px var(--color-accent-glow);
+  }
+
+  .title-qr.dragging {
+    cursor: grabbing;
+    border-color: var(--color-accent);
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+    transition: none;
+  }
+
+  /* Corner resize handle for the QR chip. Positioned by JS at the img's
+     bottom-right corner; sits at root level so it stays clickable above
+     the overlay stacking context. */
+  .qr-resize-handle {
+    position: fixed;
+    width: 18px;
+    height: 18px;
+    background: var(--color-accent);
+    border: 2px solid rgba(255, 255, 255, 0.85);
+    border-radius: 50%;
+    cursor: nwse-resize;
+    touch-action: none;
+    z-index: 31;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    opacity: 0.7;
+    transition: opacity 0.2s ease, transform 0.15s ease;
+  }
+
+  .qr-resize-handle:hover,
+  .qr-resize-handle.resizing {
+    opacity: 1;
+    transform: scale(1.2);
   }
 
   .control-btn {
@@ -332,176 +476,158 @@
     background: rgba(100, 120, 200, 0.5);
   }
 
-  .query-panel {
-    top: 80px;
-    left: 24px;
-    display: flex;
-    gap: 8px;
-    z-index: 10;
-  }
-
-  .query-panel input {
-    background: var(--color-surface);
-    backdrop-filter: blur(20px);
-    border: 1px solid var(--color-border);
-    border-radius: 12px;
-    padding: 10px 16px;
-    color: var(--color-text);
-    font-size: 14px;
-    width: 350px;
-    outline: none;
-    transition: all 0.2s ease;
-  }
-
-  .query-panel input:focus {
-    border-color: var(--color-accent);
-    box-shadow: 0 0 0 3px var(--color-accent-glow);
-  }
-
   .query-panel input::placeholder {
     color: var(--color-text-muted);
-  }
-
-  .query-panel button {
-    background: linear-gradient(135deg, var(--color-accent), #a855f7);
-    border: none;
-    border-radius: 12px;
-    padding: 10px 20px;
-    color: white;
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s ease;
-  }
-
-  .query-panel button:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 12px var(--color-accent-glow);
   }
 
   .query-panel button:active {
     transform: translateY(0);
   }
 
+  /* Bottom-anchored news-stack ticker (replaces the old floating panel).
+     Fixed label on the left, vertical-rotating events on the right. */
   .activation-log {
-    top: 136px;
-    left: 24px;
-    width: calc(350px + 8px + 80px); /* match query-panel width: input + gap + button */
-    max-height: calc(100vh - 220px);
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: calc(30px * var(--ticker-scale, 1));
+    display: flex;
+    align-items: stretch;
     background: var(--color-surface);
     backdrop-filter: blur(20px);
-    border: 1px solid var(--color-border);
-    border-radius: 12px;
-    display: flex;
-    flex-direction: column;
+    border-top: 1px solid var(--color-border);
     overflow: hidden;
     z-index: 10;
   }
 
-  .log-header {
+  .activation-log.hidden {
+    display: none;
+  }
+
+  /* Top-edge drag handle: pull up/down to change how many log lines show.
+     Anchored inside the bar; a slim 6px strip so it steals minimal line space. */
+  .ticker-resize-handle {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 6px;
+    cursor: ns-resize;
+    touch-action: none;
+    z-index: 2;
+  }
+
+  .ticker-resize-handle::after {
+    content: '';
+    position: absolute;
+    top: 1.5px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 56px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--color-text-muted);
+    opacity: 0.45;
+    transition: opacity 0.2s ease, background 0.2s ease;
+  }
+
+  .ticker-resize-handle:hover::after,
+  .ticker-resize-handle.resizing::after {
+    opacity: 1;
+    background: var(--color-accent);
+  }
+
+  .log-label {
+    flex: 0 0 auto;
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--color-border);
+    padding: 0 18px;
+    background: var(--color-accent);
+    color: #fff;
+    font-size: calc(13px * var(--ticker-scale, 1));
     font-weight: 600;
-    font-size: 14px;
-    color: var(--color-text);
-  }
-
-  .log-close {
-    background: none;
-    border: none;
-    color: var(--color-text-muted);
-    font-size: 20px;
-    cursor: pointer;
-    padding: 0;
-    width: 24px;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 4px;
-    transition: all 0.2s ease;
-  }
-
-  .log-close:hover {
-    background: rgba(255, 255, 255, 0.1);
-    color: var(--color-text);
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+    user-select: none;
   }
 
   .log-content {
     flex: 1;
-    overflow-y: auto;
-    padding: 12px;
-    font-size: 12px;
+    position: relative;
+    overflow: hidden;
+    padding: 0 16px;
+    font-size: calc(12px * var(--ticker-scale, 1));
     font-family: var(--font-mono);
+    /* Column stack anchored to the bottom: newest sits on the baseline,
+       older items rotate up and off the top. */
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+  }
+
+  /* New item slides up into place; existing items rotate up and fade. */
+  @keyframes ticker-in {
+    from { transform: translateY(100%); opacity: 0; }
+    to   { transform: translateY(0);    opacity: 1; }
+  }
+  @keyframes ticker-up {
+    from { transform: translateY(0); }
+    to   { transform: translateY(-100%); }
+  }
+  @keyframes ticker-out {
+    from { transform: translateY(-100%); opacity: 1; }
+    to   { transform: translateY(-200%); opacity: 0; }
   }
 
   .log-entry {
-    padding: 8px;
-    margin-bottom: 8px;
-    border-radius: 6px;
-    border-left: 3px solid;
-    line-height: 1.5;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: calc(30px * var(--ticker-scale, 1));
+    white-space: nowrap;
+    overflow: hidden;
+    flex: 0 0 auto;
+    animation: ticker-in 0.3s ease;
   }
+  .log-entry.ticker-move { animation: ticker-up 0.3s ease forwards; }
+  .log-entry.ticker-exit { animation: ticker-out 0.3s ease forwards; }
 
-  .log-entry:last-child {
-    margin-bottom: 0;
-  }
-
-  .log-info {
-    background: rgba(74, 158, 255, 0.1);
-    border-left-color: var(--color-accent);
-    color: var(--color-text);
-  }
-
-  .log-success {
-    background: rgba(16, 185, 129, 0.1);
-    border-left-color: #10b981;
-    color: var(--color-text);
-  }
-
-  .log-warning {
-    background: rgba(245, 158, 11, 0.1);
-    border-left-color: #f59e0b;
-    color: var(--color-text);
-  }
-
-  .log-error {
-    background: rgba(239, 68, 68, 0.1);
-    border-left-color: #ef4444;
-    color: var(--color-text);
-  }
+  /* Severity colors (text accents — no per-entry backgrounds in the ticker). */
+  .log-info    { color: var(--color-text); }
+  .log-success { color: #34d399; }
+  .log-warning { color: #fbbf24; }
+  .log-error   { color: #f87171; }
+  .log-edge-info { color: #c084fc; font-style: italic; font-size: calc(11px * var(--ticker-scale, 1)); }
 
   .log-timestamp {
     color: var(--color-text-muted);
-    font-size: 10px;
-    display: block;
-    margin-bottom: 4px;
+    font-size: calc(10px * var(--ticker-scale, 1));
+    flex: 0 0 auto;
   }
+
+  .log-msg { overflow: hidden; text-overflow: ellipsis; }
+  .log-msg strong { font-weight: 600; }
 
   .log-entities {
-    margin-top: 6px;
-    padding-left: 8px;
     color: var(--color-text-muted);
-    font-size: 11px;
+    font-size: calc(10px * var(--ticker-scale, 1));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-
   .log-entities span {
-    display: inline-block;
-    background: rgba(255, 255, 255, 0.05);
-    padding: 2px 6px;
-    margin: 2px 2px;
-    border-radius: 3px;
+    display: inline;
+    background: none;
+    padding: 0;
+    margin: 0;
+    border-radius: 0;
     font-size: 10px;
   }
+  .log-entities span + span::before { content: ', '; color: var(--color-text-muted); }
+
   .log-edge-info {
-    background: rgba(168, 85, 247, 0.1);
-    border-left-color: #a855f7;
-    color: var(--color-text);
-    font-size: 10px;
-    font-style: italic;
+    background: none;
+    border-left-color: transparent;
   }
 
   /* Insights Panel */
@@ -719,6 +845,156 @@
     color: var(--color-text-muted);
     line-height: 1.3;
   }
+  .brightness-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 10px 16px;
+    color: var(--color-text);
+    font-size: 14px;
+    backdrop-filter: blur(10px);
+    cursor: default;
+    transition: border-color 0.3s ease;
+  }
+
+  .brightness-control:hover {
+    border-color: var(--color-accent);
+  }
+
+  .brightness-control input[type="range"] {
+    width: 110px;
+    accent-color: var(--color-accent);
+    cursor: pointer;
+  }
+
+  .log-scale-value {
+    min-width: 42px;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-text-muted);
+    user-select: none;
+  }
+
+  .conn-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 6px;
+  }
+
+  .conn-chip {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 10px;
+    padding: 3px 9px;
+    font-size: 11px;
+    color: var(--color-text);
+    cursor: pointer;
+    transition: border-color 0.2s ease, color 0.2s ease;
+  }
+
+  .conn-chip:hover {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+  }
+
+  .conn-chip.disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  .conn-chip.disabled:hover {
+    border-color: var(--color-border);
+    color: var(--color-text);
+  }
+
+  .relationship-view {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--color-border);
+  }
+
+  .relationship-view.hidden {
+    display: none;
+  }
+
+  .relationship-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+  }
+
+  .rel-entity-link {
+    color: var(--color-accent);
+    cursor: pointer;
+    font-weight: 600;
+  }
+
+  .rel-entity-link:hover {
+    text-decoration: underline;
+  }
+
+  .rel-desc {
+    font-size: 11px;
+    color: var(--color-text-muted);
+    line-height: 1.4;
+    margin-top: 6px;
+  }
+
+  .rel-keywords {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 6px;
+  }
+
+  .rel-keyword {
+    background: rgba(74, 158, 255, 0.1);
+    border-radius: 8px;
+    padding: 2px 7px;
+    font-size: 10px;
+    color: var(--color-accent);
+  }
+
+  .rel-weight {
+    font-size: 10px;
+    color: var(--color-text-muted);
+    margin-top: 6px;
+  }
+
+  .panel-back {
+    background: none;
+    border: none;
+    color: var(--color-accent);
+    font-size: 12px;
+    cursor: pointer;
+    padding: 0;
+    margin-bottom: 8px;
+    display: none;
+  }
+
+  .panel-back:hover {
+    text-decoration: underline;
+  }
+
+  #entity-cluster {
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 0 3px;
+    transition: background 0.2s ease, color 0.2s ease;
+  }
+
+  #entity-cluster:hover {
+    background: rgba(74, 158, 255, 0.15);
+    color: var(--color-accent);
+  }
 </style>
 </head>
 <body>
@@ -728,99 +1004,133 @@
 <div class="ui-overlay top-bar">
   <div class="logo">
     <div class="logo-icon">⚡</div>
-    <span>GK Brain Knowledge Graph</span>
+    <span data-i18n="app.title">GK Brain Knowledge Graph</span>
+    <img class="title-qr" src="__API_BASE__/graph3d/gkcharger_qrcode.jpg" data-i18n-alt="gk.qrAlt" alt="GK Charger mobile WeChat QR code" draggable="false" />
   </div>
   <div class="stats">
-    <div>Entities: <span class="stat-value" id="stat-entities">—</span></div>
-    <div>Edges: <span class="stat-value" id="stat-edges">—</span></div>
-    <div>Clusters: <span class="stat-value" id="stat-clusters">—</span></div>
+    <div><span data-i18n="stats.entities">Entities</span>: <span class="stat-value" id="stat-entities">—</span></div>
+    <div><span data-i18n="stats.edges">Edges</span>: <span class="stat-value" id="stat-edges">—</span></div>
+    <div><span data-i18n="stats.clusters">Clusters</span>: <span class="stat-value" id="stat-clusters">—</span></div>
   </div>
 </div>
 
 <div class="ui-overlay side-panel hidden" id="side-panel">
-  <div class="panel-title">Entity Details</div>
+  <div class="panel-title" data-i18n="panel.title">Entity Details</div>
+  <button class="panel-back" id="panel-back" data-i18n="panel.back">← Back</button>
   <div class="entity-name" id="entity-name">—</div>
   <div class="entity-description" id="entity-description">—</div>
   <div class="entity-meta">
-    <div>Cluster: <span id="entity-cluster">—</span></div>
-    <div>Position: <span id="entity-position">—</span></div>
-    <div>Connections: <span id="entity-connections">—</span></div>
+    <div><span data-i18n="panel.cluster">Cluster</span>: <span id="entity-cluster" data-i18n-title="panel.clusterHoverHint" title="Hover to highlight this cluster in the graph">—</span></div>
+    <div><span data-i18n="panel.position">Position</span>: <span id="entity-position">—</span></div>
+    <div><span data-i18n="panel.connections">Connections</span>: <span id="entity-connections">—</span></div>
   </div>
+  <div class="conn-chips" id="entity-conn-chips"></div>
+
+  <!-- Relationship drill-down view (populated on connection-chip click) -->
+  <div class="relationship-view hidden" id="relationship-view"></div>
 
   <!-- Cluster Information Legend -->
   <div class="cluster-legend" id="cluster-legend">
-    <div class="cluster-legend-title">📊 Cluster Information</div>
-    <div class="cluster-label" id="cluster-label">Select an entity to view cluster info</div>
+    <div class="cluster-legend-title" data-i18n="panel.clusterInfo">📊 Cluster Information</div>
+    <div class="cluster-label" id="cluster-label" data-i18n="panel.selectEntity">Select an entity to view cluster info</div>
     <div class="cluster-stats" id="cluster-stats"></div>
-    <div class="top-entities-title">Key Entities</div>
+    <div class="top-entities-title" data-i18n="panel.keyEntities">Key Entities</div>
     <div id="cluster-entities"></div>
   </div>
 </div>
 
-<div class="ui-overlay bottom-bar">
-  <button class="control-btn" id="btn-insights">
-    <span>💡</span> Insights
-  </button>
+<button class="settings-gear" id="btn-settings" data-i18n-title="settings.title" title="Settings">⚙️</button>
+
+<div class="ui-overlay settings-panel hidden" id="settings-panel">
+  <div class="panel-title" data-i18n="settings.title">Settings</div>
+
+  <div class="settings-section-title" data-i18n="settings.language">Language</div>
+  <div class="lang-toggle">
+    <button class="lang-btn active" data-lang="zh" data-i18n="lang.zh">中文</button>
+    <button class="lang-btn" data-lang="en" data-i18n="lang.en">English</button>
+  </div>
+
+  <div class="settings-section-title" data-i18n="settings.theme">Theme</div>
+  <div class="lang-toggle">
+    <button class="theme-btn active" data-theme="dark" data-i18n="theme.dark">🌙 Dark</button>
+    <button class="theme-btn" data-theme="light" data-i18n="theme.light">☀️ Light</button>
+  </div>
+
+  <div class="settings-section-title" data-i18n="settings.brightness">Node Brightness</div>
+  <div class="brightness-control" data-i18n-title="brightness.title" title="Node brightness">
+    <span>🔆</span>
+    <input type="range" id="brightness-slider" min="0.2" max="4.0" step="0.05" value="1.0">
+  </div>
+
+  <div class="settings-section-title" data-i18n="settings.logScale">Query Log Scale</div>
+  <div class="brightness-control" data-i18n-title="logScale.title" title="Query log size">
+    <span>🔍</span>
+    <input type="range" id="log-scale-slider" min="0.7" max="1.5" step="0.05" value="1.0">
+    <span id="log-scale-value" class="log-scale-value">100%</span>
+  </div>
+
+  <div class="settings-section-title" data-i18n="settings.view">View</div>
   <button class="control-btn" id="btn-reset-camera">
-    <span>⟲</span> Reset View
+    <span>⟲</span> <span data-i18n="btn.resetView">Reset View</span>
   </button>
   <button class="control-btn" id="btn-toggle-edges">
-    <span>⋯</span> Toggle Edges
+    <span></span> <span data-i18n="btn.toggleEdges">Toggle Edges</span>
   </button>
   <button class="control-btn" id="btn-toggle-labels">
-    <span>Aa</span> Toggle Labels
+    <span>Aa</span> <span data-i18n="btn.toggleLabels">Toggle Labels</span>
+  </button>
+  <button class="control-btn" id="btn-toggle-title">
+    <span>🏷️</span> <span data-i18n="btn.toggleTitle">Show Title & QR</span>
   </button>
   <button class="control-btn" id="btn-auto-rotate">
-    <span>🔄</span> Auto Rotate
+    <span>🔄</span> <span data-i18n="btn.autoRotate">Auto Rotate</span>
+  </button>
+
+  <div class="settings-section-title" data-i18n="settings.panels">Panels</div>
+  <button class="control-btn" id="btn-insights">
+    <span>💡</span> <span data-i18n="btn.insights">Insights</span>
   </button>
   <button class="control-btn" id="btn-entity-details">
-    <span>ℹ️</span> Entity Details
+    <span>ℹ️</span> <span data-i18n="btn.entityDetails">Entity Details</span>
   </button>
   <button class="control-btn" id="btn-query-log">
-    <span>🔍</span> Query Log
+    <span>🔍</span> <span data-i18n="btn.queryLog">Query Log</span>
   </button>
   <button class="control-btn" id="btn-gk-mobile">
-    <span>📱</span> GK充电宝移动端
+    <span>📱</span> <span data-i18n="btn.gkMobile">GK充电宝移动端</span>
   </button>
 </div>
 
 <div class="gk-modal-overlay hidden" id="gk-modal-overlay">
   <div class="gk-modal">
     <button class="gk-modal-close" id="gk-modal-close">×</button>
-    <div class="gk-modal-title">使用GK充电宝移动端提问</div>
+    <div class="gk-modal-title" data-i18n="gk.title">使用GK充电宝移动端提问</div>
     <img class="gk-modal-qr" src="__API_BASE__/graph3d/gkcharger_qrcode.jpg" alt="GK Charger mobile WeChat QR code" />
-    <div class="gk-modal-hint">微信扫一扫，打开小程序提问</div>
+    <div class="gk-modal-hint" data-i18n="gk.hint">微信扫一扫，打开小程序提问</div>
   </div>
-</div>
-
-<div class="ui-overlay query-panel" id="query-panel">
-  <input type="text" id="query-input" placeholder="Enter query to activate neurons..." />
-  <button id="query-submit">Query</button>
 </div>
 
 <div class="ui-overlay activation-log" id="activation-log">
-  <div class="log-header">
-    <span>🔍 Query Log</span>
-    <button class="log-close" id="log-close">×</button>
-  </div>
+  <span class="log-label" data-i18n="btn.queryLog">查询日志</span>
   <div class="log-content" id="log-content">
-    <div class="log-entry log-info">Ready to query. Enter a search term above.</div>
+    <div class="log-entry log-info" data-i18n="query.ready">Ready to query. Enter a search term above.</div>
   </div>
+  <div class="ticker-resize-handle" id="ticker-resize-handle"></div>
 </div>
 
 <div class="tooltip" id="tooltip"></div>
 
 <div class="ui-overlay insights-panel hidden" id="insights-panel">
-  <div class="insights-title">🔬 Research Insights</div>
+  <div class="insights-title" data-i18n="insights.title">🔬 Research Insights</div>
   <div class="stats-grid" id="insights-stats"></div>
   <div id="insights-content"></div>
-  <div class="insights-title" style="margin-top: 20px; font-size: 16px;">📚 Research Use Cases</div>
+  <div class="insights-title" style="margin-top: 20px; font-size: 16px;" data-i18n="insights.useCases">📚 Research Use Cases</div>
   <div id="use-cases-content"></div>
 </div>
 
 <div class="loading-overlay" id="loading">
   <div class="loading-spinner"></div>
-  <div class="loading-text">Loading knowledge graph...</div>
+  <div class="loading-text" data-i18n="loading.text">Loading knowledge graph...</div>
 </div>
 
 <script type="importmap">
@@ -840,6 +1150,9 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
 const API_BASE = '__API_BASE__';
+// Per-instance viewer config injected by the /graph3d/viewer route from
+// <working_dir>/graph3d_config.json (title overrides, ...). Defaults to {}.
+const VIEWER_CONFIG = __VIEWER_CONFIG__;
 const BINARY_URL = `${API_BASE}/graph3d/layout.bin`;
 const META_URL = `${API_BASE}/graph3d/layout_meta.json`;
 const ACTIVATIONS_URL = `${API_BASE}/query/activations`;
@@ -848,13 +1161,36 @@ const POINT_SIZE = 0.012;
 const SPHERE_SEGMENTS_W = 48;
 const SPHERE_SEGMENTS_H = 32;
 
-// Cluster color palette (10 distinct colors)
-const CLUSTER_COLORS = [
-  0x2a5a9f, 0x6835a7, 0x0a7951, 0x956e0b, 0x8f2424,
-  0x047684, 0x5b3c96, 0x547c0e, 0x99550e, 0x942c5f
-];
+// Cluster color palette. The first 10 entries are the original hand-picked
+// palette; beyond that, golden-angle hue spacing (with alternating lightness
+// bands) generates perceptually distinct colors, so up to 60 clusters each
+// get a UNIQUE color. Previously 25-cluster layouts aliased 2-3 unrelated
+// clusters onto each of 10 colors, making same-colored nodes appear scattered.
+function hslToHex(h, s, l) {
+  const a = s * Math.min(l, 1 - l);
+  const f = n => {
+    const k = (n + h / 30) % 12;
+    const v = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    return Math.round(v * 255);
+  };
+  return (f(0) << 16) | (f(8) << 8) | f(4);
+}
+const CLUSTER_COLORS = (() => {
+  const colors = [
+    0x2a5a9f, 0x6835a7, 0x0a7951, 0x956e0b, 0x8f2424,
+    0x047684, 0x5b3c96, 0x547c0e, 0x99550e, 0x942c5f
+  ];
+  const GOLDEN_ANGLE = 137.508; // maximizes hue separation between neighbors
+  for (let i = colors.length; i < 256; i++) {
+    const hue = (i * GOLDEN_ANGLE) % 360;
+    const lightness = 0.40 + 0.15 * ((i >> 3) % 3); // cycle dark/mid/bright bands
+    colors.push(hslToHex(hue, 0.7, lightness));
+  }
+  return colors;
+})();
 
 let scene, camera, renderer, composer, controls;
+let bloomPass = null;
 let pointsMesh, edgesMesh;
 let entityData = null;
 let edgeData = null;
@@ -863,12 +1199,248 @@ let selectedEntity = -1;
 let showEdges = false;
 let showLabels = false;
 
+// Node brightness (slider-controlled, persisted in localStorage)
+const BLOOM_STRENGTH_BASE = 0.6; // UnrealBloomPass strength at brightness 1.0
+let brightnessFactor = parseFloat(localStorage.getItem('graph3d_brightness')) || 1.0;
+
+// Light/dark theme (persisted in localStorage)
+const THEME_SCENE_BG = { dark: 0x050510, light: 0xe9edf5 };
+let currentTheme = localStorage.getItem('graph3d_theme') === 'light' ? 'light' : 'dark';
+// Stamp before first paint so CSS tokens apply immediately.
+document.documentElement.dataset.theme = currentTheme;
+
+function isLightTheme() { return currentTheme === 'light'; }
+
+// Additive blending glows on a dark background but washes out to white on a
+// light one — the light theme uses normal blending with higher opacity instead.
+function getBlendMode() { return isLightTheme() ? THREE.NormalBlending : THREE.AdditiveBlending; }
+
+// Pulse/highlight target: brighten toward white in dark mode, deepen toward
+// dark navy in light mode so activations stay visible on a light background.
+function getGlowColor() {
+  return new THREE.Color(isLightTheme() ? 0x222244 : 0xffffff);
+}
+
+// Re-skin the 3D scene for the current theme. Safe to call any time after
+// init — every check tolerates not-yet-created objects.
+function applyTheme(theme) {
+  currentTheme = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = currentTheme;
+  document.querySelectorAll('.theme-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.theme === currentTheme);
+  });
+  const light = isLightTheme();
+  const blending = getBlendMode();
+  if (scene) scene.background.set(THEME_SCENE_BG[currentTheme]);
+  // Bloom reads as fog on a light background — dark theme only.
+  if (bloomPass) bloomPass.enabled = !light;
+  if (pointsMesh) {
+    pointsMesh.material.blending = blending;
+    pointsMesh.material.opacity = light ? 0.85 : 0.4;
+    pointsMesh.material.needsUpdate = true;
+  }
+  if (edgesMesh) {
+    edgesMesh.material.blending = blending;
+    edgesMesh.material.opacity = light ? 0.35 : 0.15;
+    edgesMesh.material.needsUpdate = true;
+  }
+  for (const group of activationGroups) {
+    for (const sphere of group.spheres) {
+      sphere.material.blending = blending;
+      sphere.material.needsUpdate = true;
+    }
+    for (const mesh of [group.edgesMesh, group.particles]) {
+      if (mesh) {
+        mesh.material.blending = blending;
+        mesh.material.needsUpdate = true;
+      }
+    }
+  }
+}
+
+function setTheme(theme) {
+  localStorage.setItem('graph3d_theme', theme === 'light' ? 'light' : 'dark');
+  applyTheme(theme);
+}
+
+// ===== i18n (English/Chinese translation) =====
+const I18N_FALLBACK = {"en":{"app.title":"GK Brain Knowledge Graph","app.title.full":"GK Brain Knowledge Graph · 3D Galaxy","stats.entities":"Entities","stats.edges":"Edges","stats.clusters":"Clusters","panel.title":"Entity Details","panel.back":"← Back","panel.cluster":"Cluster","panel.clusterHoverHint":"Hover to highlight this cluster in the graph","panel.position":"Position","panel.connections":"Connections","panel.clusterInfo":"📊 Cluster Information","panel.selectEntity":"Select an entity to view cluster info","panel.keyEntities":"Key Entities","panel.noClusterAnalysis":"Detailed analysis not available for this cluster.","btn.insights":"Insights","btn.resetView":"Reset View","btn.toggleEdges":"Toggle Edges","btn.toggleLabels":"Toggle Labels","btn.toggleTitle":"Show Title & QR","btn.autoRotate":"Auto Rotate","btn.entityDetails":"Entity Details","btn.queryLog":"Query Log","btn.gkMobile":"GK充电宝移动端","btn.settings":"Settings","settings.title":"Settings","settings.language":"Language","settings.theme":"Theme","settings.brightness":"Node Brightness","settings.logScale":"Query Log Scale","logScale.title":"Query log size","settings.panels":"Panels","settings.view":"View","brightness.title":"Node brightness","query.title":"Query","query.placeholder":"Enter query to activate neurons…","query.ready":"Ready to query. Enter a search term above.","log.title":"🔍 Query Log","log.querying":"🔍 Querying","log.queryFailed":"❌ Query failed","log.noResults":"⚠️ Query returned no results","log.queryError":"❌ Query error","log.noEntities":"⚠️ No entities found in point cloud. Try a different query.","log.edgesCreated":"🔗 Created <strong>{count}</strong> activated edges with traffic flow","log.pulse":"✨ Neural Pulse activated for <strong>{count}</strong> entities ({color})","log.found":"✅ Found <strong>{entities}</strong> entities, <strong>{rels}</strong> relationships","log.monitoringOn":"🔄 Real-time activation monitoring enabled","log.replay":"🔁 Replay","log.dimmed":"(dimmed)","log.manualQuery":"🔍 Manual query","log.externalQuery":"🌐 External query","log.foundEntities":"✅ Found <strong>{count}</strong> entities","log.activated":"⚡ Activated <strong>{count}</strong> neurons","log.queued":"⏳ {count} more que{plural} queued…","log.monitoringOff":"⏸️ Real-time activation monitoring paused","log.rotateOn":"🔄 Auto-rotate enabled","log.rotateOff":"️ Auto-rotate disabled","log.insightsLoading":"📊 Loading research insights…","log.insightsLoaded":"✅ Research insights loaded","log.insightsFailed":"⚠️ Failed to load insights","log.more":"+{count} more","relationship.title":"Relationship","relationship.loading":"Loading…","relationship.weight":"Weight","insights.title":"🔬 Research Insights","insights.entities":"Entities","insights.relationships":"Relationships","insights.clusters":"Clusters","insights.avgConnections":"Avg Connections","insights.useCases":"📚 Research Use Cases","cluster.label":"Cluster {id}","cluster.internalEdges":"Internal Edges","loading.text":"Loading knowledge graph…","loading.failed":"Failed to load knowledge graph","loading.hint":"${t('loading.hint')}","gk.title":"使用GK充电宝移动端提问","gk.hint":"微信扫一扫,打开小程序提问","gk.qrAlt":"GK Charger mobile WeChat QR code","rel.notInLayout":"Not in 3D layout","rel.chipTitle":"Weight {weight} — click to view relationship","rel.weight":"Weight","entity.noDesc":"No description available.","lang.zh":"中文","lang.en":"English","theme.dark":"🌙 Dark","theme.light":"☀️ Light"},"zh":{"app.title":"GK大脑类神经元3D视图","app.title.full":"GK大脑类神经元3D视图","stats.entities":"实体","stats.edges":"关系","stats.clusters":"聚类","panel.title":"实体详情","panel.back":"← 返回","panel.cluster":"聚类","panel.clusterHoverHint":"悬停以在图中高亮该聚类","panel.position":"位置","panel.connections":"连接数","panel.clusterInfo":"📊 聚类信息","panel.selectEntity":"选择一个实体以查看聚类信息","panel.keyEntities":"关键实体","panel.noClusterAnalysis":"该聚类暂无详细分析。","btn.insights":"研究洞察","btn.resetView":"重置视图","btn.toggleEdges":"切换边线","btn.toggleLabels":"切换标签","btn.toggleTitle":"显示标题与二维码","btn.autoRotate":"自动旋转","btn.entityDetails":"实体详情","btn.queryLog":"查询日志","btn.gkMobile":"GK充电宝移动端","btn.settings":"设置","settings.title":"设置","settings.language":"语言","settings.theme":"主题","settings.brightness":"节点亮度","settings.logScale":"查询日志缩放","logScale.title":"查询日志大小","settings.panels":"面板","settings.view":"视图","brightness.title":"节点亮度","query.title":"查询","query.placeholder":"输入查询以激活神经元…","query.ready":"等待外部查询激活…","log.title":"🔍 查询日志","log.querying":"🔍 查询中","log.queryFailed":"❌ 查询失败","log.noResults":"⚠️ 查询无结果","log.queryError":"❌ 查询出错","log.noEntities":"⚠️ 点云中未找到实体,请尝试其他查询。","log.edgesCreated":"🔗 已创建 <strong>{count}</strong> 条带信息流的激活边","log.pulse":"✨ 神经脉冲已激活 <strong>{count}</strong> 个实体({color})","log.found":"✅ 找到 <strong>{entities}</strong> 个实体、<strong>{rels}</strong> 条关系","log.monitoringOn":"🔄 实时激活监控已开启","log.replay":" 回放","log.dimmed":"(暗色)","log.manualQuery":"🔍 手动查询","log.externalQuery":"🌐 外部查询","log.foundEntities":"✅ 找到 <strong>{count}</strong> 个实体","log.activated":"⚡ 已激活 <strong>{count}</strong> 个神经元","log.queued":"⏳ 还有 {count} 条查询排队中…","log.monitoringOff":"⏸️ 实时激活监控已暂停","log.rotateOn":" 自动旋转已开启","log.rotateOff":"️ 自动旋转已关闭","log.insightsLoading":"📊 正在加载研究洞察…","log.insightsLoaded":"✅ 研究洞察已加载","log.insightsFailed":"️ 洞察加载失败","log.more":"+{count} 更多","relationship.title":"关系","relationship.loading":"加载中…","relationship.weight":"权重","insights.title":"🔬 研究洞察","insights.entities":"实体","insights.relationships":"关系","insights.clusters":"聚类","insights.avgConnections":"平均连接数","insights.useCases":" 研究用例","cluster.label":"聚类 {id}","cluster.internalEdges":"内部边","loading.text":"正在加载知识图谱…","loading.failed":"知识图谱加载失败","loading.hint":"请确认已计算3D布局。","gk.title":"使用GK充电宝移动端提问","gk.hint":"微信扫一扫,打开小程序提问","gk.qrAlt":"GK充电宝移动端微信二维码","rel.notInLayout":"不在3D布局中","rel.chipTitle":"权重 {weight} — 点击查看关系","rel.weight":"权重","entity.noDesc":"暂无描述。","lang.zh":"中文","lang.en":"English","theme.dark":"🌙 深色","theme.light":"☀️ 浅色"}};
+
+let I18N = JSON.parse(JSON.stringify(I18N_FALLBACK));
+let currentLang = localStorage.getItem('graph3d_lang') || 'zh';
+
+function t(key, params) {
+  let s = (I18N[currentLang] && I18N[currentLang][key]) || (I18N.en && I18N.en[key]) || key;
+  if (params) {
+    for (const [k, v] of Object.entries(params)) {
+      s = s.replace(new RegExp('\\{' + k + '\\}', 'g'), String(v));
+    }
+  }
+  return s;
+}
+
+function applyI18n() {
+  document.documentElement.lang = currentLang;
+  // Walk data-i18n attributes
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    if (key) el.textContent = t(key);
+  });
+  // Walk data-i18n-title attributes
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    const key = el.getAttribute('data-i18n-title');
+    if (key) el.title = t(key);
+  });
+  // Walk data-i18n-alt attributes
+  document.querySelectorAll('[data-i18n-alt]').forEach(el => {
+    const key = el.getAttribute('data-i18n-alt');
+    if (key) el.alt = t(key);
+  });
+  // Walk data-i18n-placeholder attributes
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    const key = el.getAttribute('data-i18n-placeholder');
+    if (key) el.placeholder = t(key);
+  });
+  // Update HTML title
+  const titleEl = document.querySelector('title[data-i18n]');
+  if (titleEl) titleEl.textContent = t(titleEl.getAttribute('data-i18n'));
+  // Update language toggle buttons
+  document.querySelectorAll('.lang-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.lang === currentLang);
+  });
+}
+
+function setLanguage(lang) {
+  if (!I18N[lang]) return;
+  currentLang = lang;
+  localStorage.setItem('graph3d_lang', lang);
+  applyI18n();
+}
+
+// Per-instance title overrides from graph3d_config.json, applied on top of
+// whichever i18n table is active (fetched or inline fallback).
+function applyViewerConfigOverrides() {
+  for (const lang of ['en', 'zh']) {
+    if (!I18N[lang]) continue;
+    if (VIEWER_CONFIG[`title_${lang}`]) I18N[lang]['app.title'] = VIEWER_CONFIG[`title_${lang}`];
+    if (VIEWER_CONFIG[`title_full_${lang}`]) I18N[lang]['app.title.full'] = VIEWER_CONFIG[`title_full_${lang}`];
+  }
+}
+
+async function loadI18n() {
+  try {
+    const resp = await fetch(`${API_BASE}/graph3d/i18n.json`);
+    if (resp.ok) {
+      I18N = await resp.json();
+    }
+  } catch (e) { /* keep fallback */ }
+  applyViewerConfigOverrides();
+  applyI18n();
+}
+
+
+
 // Neuron activation state
 let entityNameToIndex = new Map();
 let activationAnimation = null;
 
 // Multi-activation system: track multiple coexisting activation groups
 const MAX_CONCURRENT_ACTIVATIONS = 6;
+
+// Cluster lookup (built in createPoints): clusterId -> array of entity indices
+const clusterToIndices = new Map();
+
+// Persistent highlight layer: survives pulse()'s per-frame base-color reset.
+// Entries are re-applied every frame while activations run (pulse() calls
+// applyHighlightsToArrays), and applied directly when no loop is active.
+// idx -> { color: THREE.Color, sizeBoost: number, source: string, startTime: number }
+const persistentHighlights = new Map();
+const HIGHLIGHT_SETTLE_MS = 1500; // clicked-node pulse-then-settle duration
+const HIGHLIGHT_SETTLED_BOOST = 1.4; // settled size multiplier for clicked node
+let highlightAnimFrame = null;
+
+function setHighlight(indices, color, sizeBoost = 2.0, source = 'click') {
+  for (const idx of indices) {
+    persistentHighlights.set(idx, { color, sizeBoost, source, startTime: Date.now() });
+  }
+  applyPersistentHighlights();
+}
+
+function clearHighlights(source = null) {
+  if (source === null) {
+    persistentHighlights.clear();
+  } else {
+    for (const [idx, h] of persistentHighlights) {
+      if (h.source === source) persistentHighlights.delete(idx);
+    }
+  }
+  applyPersistentHighlights();
+}
+
+// Write highlight colors/sizes into attribute arrays. Caller handles needsUpdate.
+// Returns true while any clicked-node highlight is still settling (needs another frame).
+function applyHighlightsToArrays(colors, sizes) {
+  const now = Date.now();
+  let settling = false;
+  for (const [idx, h] of persistentHighlights) {
+    let boost = h.sizeBoost;
+    if (h.source === 'click') {
+      const t = Math.min((now - h.startTime) / HIGHLIGHT_SETTLE_MS, 1);
+      boost = HIGHLIGHT_SETTLED_BOOST + (h.sizeBoost - HIGHLIGHT_SETTLED_BOOST) * (1 - t);
+      if (t < 1) settling = true;
+    }
+    colors[idx * 3] = h.color.r;
+    colors[idx * 3 + 1] = h.color.g;
+    colors[idx * 3 + 2] = h.color.b;
+    sizes[idx] = POINT_SIZE * boost;
+  }
+  return settling;
+}
+
+function applyPersistentHighlights() {
+  if (!pointsMesh || !entityData) return;
+  const colors = pointsMesh.geometry.attributes.color.array;
+  const sizes = pointsMesh.geometry.attributes.size.array;
+  if (activationGroups.length === 0) {
+    // No pulse loop rewriting colors each frame — restore base state first so
+    // cleared highlights revert immediately.
+    for (let idx = 0; idx < entityData.length; idx++) {
+      const baseColor = getBaseColor(idx);
+      colors[idx * 3] = baseColor.r;
+      colors[idx * 3 + 1] = baseColor.g;
+      colors[idx * 3 + 2] = baseColor.b;
+      sizes[idx] = POINT_SIZE;
+    }
+  }
+  const settling = applyHighlightsToArrays(colors, sizes);
+  pointsMesh.geometry.attributes.color.needsUpdate = true;
+  pointsMesh.geometry.attributes.size.needsUpdate = true;
+  // Keep animating the settle while no activation loop is running
+  if (settling && !highlightAnimFrame && !activationAnimation) {
+    highlightAnimFrame = requestAnimationFrame(() => {
+      highlightAnimFrame = null;
+      applyPersistentHighlights();
+    });
+  }
+}
+
+// Base point color for an entity (cluster color scaled by brightness)
+function getBaseColor(idx) {
+  return new THREE.Color(CLUSTER_COLORS[entityData[idx].cluster % CLUSTER_COLORS.length])
+    .multiplyScalar(brightnessFactor);
+}
+
+// Apply the current brightness to the scene. While activations run, pulse()'s
+// per-frame reset picks up brightnessFactor automatically — this handles the
+// idle case via applyPersistentHighlights(), which rewrites base colors.
+function applyBrightness() {
+  if (bloomPass) {
+    bloomPass.strength = BLOOM_STRENGTH_BASE * brightnessFactor;
+  }
+  if (!pointsMesh || !entityData) return;
+  if (activationGroups.length > 0) return; // next pulse() frame applies it
+  applyPersistentHighlights();
+}
 
 // Format a description that may contain <SEP> tokens into styled HTML.
 // Splits on <SEP>, trims, deduplicates, and wraps each segment as a bullet.
@@ -923,7 +1495,48 @@ let isProcessingQueue = false;
 const ACTIVATION_DISPLAY_DURATION = 4000; // How long each activation stays visible
 const QUEUE_PROCESSING_DELAY = 500; // Delay between processing queued activations
 
-// Logging functions
+// Idle replay: when no real query activity for IDLE_REPLAY_DELAY_MS, replay a
+// random activation from today's server-side cache in a dimmed style.
+let lastQueryActivityAt = Date.now();
+const IDLE_REPLAY_DELAY_MS = 30000;
+const REPLAY_CHECK_INTERVAL_MS = 5000;
+const REPLAY_DIM_FACTOR = 0.45;
+
+// Logging — bottom news-stack ticker. New items slide in at the bottom,
+// older ones rotate up and fade. Visible slots follow the bar height (the
+// top edge is draggable), so a taller bar shows more history. Keep a small
+// buffer so rapid bursts read.
+const TICKER_LINE_PX = 30; // row height at scale 1.0 — keep in sync with .log-entry
+const TICKER_BUFFER_MAX = 30;
+const TICKER_SCALE_KEY = 'graph3d_log_scale';
+const TICKER_SCALE_MIN = 0.7;
+const TICKER_SCALE_MAX = 1.5;
+let tickerScale = 1;
+
+const tickerLinePx = () => TICKER_LINE_PX * tickerScale;
+
+function tickerVisibleSlots() {
+  const panel = document.getElementById('activation-log');
+  const height = panel ? panel.clientHeight : tickerLinePx();
+  return Math.max(1, Math.floor(height / tickerLinePx()));
+}
+
+// Push the scale into the panel's CSS variable and keep the bar height
+// coherent. Pass the current visible line count to keep that many lines
+// on screen (height follows the new line height); pass 0 to keep the
+// current pixel height and only re-clamp it.
+function applyTickerScale(preserveSlots) {
+  const panel = document.getElementById('activation-log');
+  if (!panel) return;
+  panel.style.setProperty('--ticker-scale', String(tickerScale));
+  const clamp = (v) => Math.min(
+    Math.max(v, tickerLinePx()),
+    Math.max(tickerLinePx(), Math.round(window.innerHeight * 0.5))
+  );
+  const target = preserveSlots ? preserveSlots * tickerLinePx() : panel.clientHeight;
+  panel.style.height = `${clamp(Math.round(target))}px`;
+}
+
 function addLog(message, type = 'info', details = null) {
   const logContent = document.getElementById('log-content');
   const timestamp = new Date().toLocaleTimeString();
@@ -931,20 +1544,40 @@ function addLog(message, type = 'info', details = null) {
   const entry = document.createElement('div');
   entry.className = `log-entry log-${type}`;
 
-  let html = `<span class="log-timestamp">${timestamp}</span>${message}`;
+  let html = `<span class="log-timestamp">${timestamp}</span><span class="log-msg">${message}</span>`;
 
   if (details) {
-    html += `<div class="log-entities">${details}</div>`;
+    html += `<span class="log-entities">${details}</span>`;
   }
 
   entry.innerHTML = html;
+
+  // Remove any placeholder before the first real event lands
+  const placeholder = logContent.querySelector('[data-i18n="query.ready"]');
+  if (placeholder) placeholder.remove();
+
   logContent.appendChild(entry);
 
-  // Auto-scroll to bottom
-  logContent.scrollTop = logContent.scrollHeight;
+  // Animate: newest slides in at the bottom, existing items rotate up,
+  // the one that falls off the top fades out.
+  const visibleSlots = tickerVisibleSlots();
+  const items = Array.from(logContent.querySelectorAll('.log-entry'));
+  items.forEach((el, idx) => {
+    const fromBottom = items.length - 1 - idx; // 0 = newest
+    el.classList.remove('ticker-move', 'ticker-exit');
+    if (fromBottom >= visibleSlots) {
+      void el.offsetWidth; // restart animation
+      el.classList.add('ticker-exit');
+      el.addEventListener('animationend', () => el.remove(), { once: true });
+    } else if (fromBottom > 0) {
+      void el.offsetWidth;
+      el.classList.add('ticker-move');
+      el.addEventListener('animationend', () => el.classList.remove('ticker-move'), { once: true });
+    }
+  });
 
-  // Keep only last 50 entries
-  while (logContent.children.length > 50) {
+  // Hard cap so a flooded buffer can't grow unbounded
+  while (logContent.children.length > TICKER_BUFFER_MAX) {
     logContent.removeChild(logContent.firstChild);
   }
 }
@@ -953,7 +1586,7 @@ function formatEntityList(entities, maxShow = 10) {
   const shown = entities.slice(0, maxShow);
   let html = shown.map(e => `<span>${e}</span>`).join('');
   if (entities.length > maxShow) {
-    html += `<span>+${entities.length - maxShow} more</span>`;
+    html += `<span>${t('log.more', {count: entities.length - maxShow})}</span>`;
   }
   return html;
 }
@@ -1003,7 +1636,7 @@ function initScene() {
 
   // Scene
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x050510);
+  scene.background = new THREE.Color(THEME_SCENE_BG[currentTheme]);
 
   // Camera
   camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 2000);
@@ -1022,12 +1655,14 @@ function initScene() {
   composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
 
-  const bloomPass = new UnrealBloomPass(
+  bloomPass = new UnrealBloomPass(
     new THREE.Vector2(width, height),
-    0.6,  // strength (reduced for better activation visibility)
+    BLOOM_STRENGTH_BASE * brightnessFactor,  // strength (reduced for better activation visibility)
     0.4,  // radius
     0.3   // threshold (increased so only activated entities glow brightly)
   );
+  // Bloom reads as fog on a light background — dark theme only.
+  bloomPass.enabled = !isLightTheme();
   composer.addPass(bloomPass);
 
   // Controls
@@ -1064,7 +1699,7 @@ function createPoints() {
     positions[i * 3 + 1] = entity.y;
     positions[i * 3 + 2] = entity.z;
 
-    const color = new THREE.Color(CLUSTER_COLORS[entity.cluster % CLUSTER_COLORS.length]);
+    const color = getBaseColor(i);
     colors[i * 3] = color.r;
     colors[i * 3 + 1] = color.g;
     colors[i * 3 + 2] = color.b;
@@ -1073,6 +1708,12 @@ function createPoints() {
 
     // Build name-to-index map
     entityNameToIndex.set(entity.name, i);
+
+    // Build cluster-to-indices map
+    if (!clusterToIndices.has(entity.cluster)) {
+      clusterToIndices.set(entity.cluster, []);
+    }
+    clusterToIndices.get(entity.cluster).push(i);
   }
 
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
@@ -1083,9 +1724,9 @@ function createPoints() {
     size: POINT_SIZE,
     vertexColors: true,
     transparent: true,
-    opacity: 0.4,
+    opacity: isLightTheme() ? 0.85 : 0.4,
     sizeAttenuation: true,
-    blending: THREE.AdditiveBlending,
+    blending: getBlendMode(),
     depthWrite: false
   });
 
@@ -1107,13 +1748,9 @@ const ACTIVATION_COLORS = [
   new THREE.Color(0x0088ff), // Blue
   new THREE.Color(0x00ff88), // Mint
 ];
-const ACTIVATION_COLOR_NAMES = [
-  'Cyan', 'Magenta', 'Yellow', 'Lime', 'Orange',
-  'Pink', 'Purple', 'Red', 'Blue', 'Mint'
-];
 let activationColorIndex = 0;
 
-function activateEntities(entityNames, duration = 3000) {
+function activateEntities(entityNames, duration = 3000, dimFactor = 1.0) {
   if (!pointsMesh || !entityData) return;
 
   // Keep original edges hidden during activation
@@ -1134,7 +1771,7 @@ function activateEntities(entityNames, duration = 3000) {
   }
 
   if (indices.size === 0) {
-    addLog(`⚠️ No entities found in point cloud. Try a different query.`, 'warning');
+    addLog(t('log.noEntities'), 'warning');
     return;
   }
 
@@ -1145,7 +1782,6 @@ function activateEntities(entityNames, duration = 3000) {
   // Get the current activation color and increment for next time
   const colorIdx = activationColorIndex % ACTIVATION_COLORS.length;
   const ACTIVATION_COLOR = ACTIVATION_COLORS[colorIdx];
-  const ACTIVATION_COLOR_NAME = ACTIVATION_COLOR_NAMES[colorIdx];
   activationColorIndex++;
 
   // Create new activation group
@@ -1158,7 +1794,8 @@ function activateEntities(entityNames, duration = 3000) {
     edgesMesh: null,
     particles: null,
     trafficData: null,
-    startTime: Date.now()
+    startTime: Date.now(),
+    dimFactor: dimFactor // 1.0 = live query, < 1.0 = dimmed idle replay
   };
 
   // Create small glowing spheres for each activated entity (node-sized glow)
@@ -1171,7 +1808,7 @@ function activateEntities(entityNames, duration = 3000) {
       color: ACTIVATION_COLOR,
       transparent: true,
       opacity: 0.9,
-      blending: THREE.AdditiveBlending,
+      blending: getBlendMode(),
       depthWrite: false
     });
 
@@ -1204,7 +1841,7 @@ function activateEntities(entityNames, duration = 3000) {
         activatedPositions.push(tgt.x, tgt.y, tgt.z);
 
         // Use activation color with white blend for edges
-        const edgeColor = ACTIVATION_COLOR.clone().lerp(new THREE.Color(0xffffff), 0.3);
+        const edgeColor = ACTIVATION_COLOR.clone().lerp(getGlowColor(), 0.3);
         activatedColors.push(edgeColor.r, edgeColor.g, edgeColor.b);
         activatedColors.push(edgeColor.r, edgeColor.g, edgeColor.b);
 
@@ -1221,16 +1858,13 @@ function activateEntities(entityNames, duration = 3000) {
         vertexColors: true,
         transparent: true,
         opacity: 0.6,
-        blending: THREE.AdditiveBlending,
+        blending: getBlendMode(),
         depthWrite: false,
         linewidth: 2
       });
 
       activationGroup.edgesMesh = new THREE.LineSegments(edgeGeometry, edgeMaterial);
       scene.add(activationGroup.edgesMesh);
-
-      const edgeCount = activatedPositions.length / 6;
-      addLog(`🔗 Created <strong>${edgeCount}</strong> activated edges with traffic flow`, 'info');
 
       // Create traffic lines along edges using the activation color
       activationGroup.trafficData = createTrafficLines(edgeSegments, ACTIVATION_COLOR);
@@ -1253,8 +1887,6 @@ function activateEntities(entityNames, duration = 3000) {
   if (!activationAnimation) {
     startActivationAnimation();
   }
-
-  addLog(`✨ Neural Pulse activated for <strong>${indices.size}</strong> entities (${ACTIVATION_COLOR_NAME})`, 'success');
 }
 
 // Global animation loop for all activation groups
@@ -1269,12 +1901,17 @@ function startActivationAnimation() {
     // Reset all points to original colors first
     // (We'll re-apply activation colors for each group)
     for (let idx = 0; idx < entityData.length; idx++) {
-      const baseColor = new THREE.Color(CLUSTER_COLORS[entityData[idx].cluster % CLUSTER_COLORS.length]);
+      const baseColor = getBaseColor(idx);
       colors[idx * 3] = baseColor.r;
       colors[idx * 3 + 1] = baseColor.g;
       colors[idx * 3 + 2] = baseColor.b;
       sizes[idx] = POINT_SIZE;
     }
+
+    // Re-apply persistent highlights (clicked node, hovered cluster, selected
+    // edge endpoints) so they survive the per-frame reset. Activation groups
+    // below may still brighten a highlighted node further.
+    applyHighlightsToArrays(colors, sizes);
 
     // Process each activation group
     for (const group of activationGroups) {
@@ -1300,17 +1937,20 @@ function startActivationAnimation() {
         ? Math.sin((groupElapsed / 2000) * Math.PI * 4) * 0.5 + 0.5
         : 1.0;
 
+      // Replays render dimmer: scale every fade-driven term by the group's dimFactor
+      const effectiveFade = fadeFactor * (group.dimFactor ?? 1);
+
       // Apply activation color to entities
       for (const idx of group.indices) {
-        const baseColor = new THREE.Color(CLUSTER_COLORS[entityData[idx].cluster % CLUSTER_COLORS.length]);
+        const baseColor = getBaseColor(idx);
         // Blend toward activation color-white with fade
         const brightColor = baseColor.clone()
-          .lerp(group.color, 0.3 * fadeFactor)
-          .lerp(new THREE.Color(0xffffff), pulseIntensity * 0.5 * fadeFactor);
+          .lerp(group.color, 0.3 * effectiveFade)
+          .lerp(getGlowColor(), pulseIntensity * 0.5 * effectiveFade);
         colors[idx * 3] = brightColor.r;
         colors[idx * 3 + 1] = brightColor.g;
         colors[idx * 3 + 2] = brightColor.b;
-        sizes[idx] = POINT_SIZE * (1 + pulseIntensity * 1.5 * fadeFactor);
+        sizes[idx] = POINT_SIZE * (1 + pulseIntensity * 1.5 * effectiveFade);
       }
 
       // Propagate to neighbor entities with dimmer effect
@@ -1322,11 +1962,11 @@ function startActivationAnimation() {
           if (srcActivated || tgtActivated) {
             const neighborIdx = srcActivated ? tgtIdx : srcIdx;
             if (!group.indices.has(neighborIdx)) {
-              const neighborColor = new THREE.Color(CLUSTER_COLORS[entityData[neighborIdx].cluster % CLUSTER_COLORS.length]);
-              const dimPulse = pulseIntensity * 0.3 * fadeFactor;
+              const neighborColor = getBaseColor(neighborIdx);
+              const dimPulse = pulseIntensity * 0.3 * effectiveFade;
               const dimColor = neighborColor.clone()
-                .lerp(group.color, 0.2 * fadeFactor)
-                .lerp(new THREE.Color(0xffffff), dimPulse);
+                .lerp(group.color, 0.2 * effectiveFade)
+                .lerp(getGlowColor(), dimPulse);
               colors[neighborIdx * 3] = dimColor.r;
               colors[neighborIdx * 3 + 1] = dimColor.g;
               colors[neighborIdx * 3 + 2] = dimColor.b;
@@ -1338,7 +1978,7 @@ function startActivationAnimation() {
 
       // Pulse the edges mesh
       if (group.edgesMesh) {
-        group.edgesMesh.material.opacity = (0.3 + pulseIntensity * 0.3) * fadeFactor;
+        group.edgesMesh.material.opacity = (0.3 + pulseIntensity * 0.3) * effectiveFade;
       }
 
       // Animate pulse spheres
@@ -1346,8 +1986,8 @@ function startActivationAnimation() {
         group.spheres.forEach(sphere => {
           const sphereElapsed = now - sphere.userData.startTime;
           const pulse = Math.sin((sphereElapsed / 1000) * Math.PI * 2) * 0.3 + 0.7;
-          sphere.material.opacity = sphere.userData.baseOpacity * pulse * fadeFactor;
-          const scale = 1 + (pulse - 0.7) * 0.5 * fadeFactor;
+          sphere.material.opacity = sphere.userData.baseOpacity * pulse * effectiveFade;
+          const scale = 1 + (pulse - 0.7) * 0.5 * effectiveFade;
           sphere.scale.set(scale, scale, scale);
         });
       }
@@ -1384,7 +2024,7 @@ function startActivationAnimation() {
         }
 
         group.particles.geometry.attributes.position.needsUpdate = true;
-        group.particles.material.opacity = 0.9 * fadeFactor;
+        group.particles.material.opacity = 0.9 * effectiveFade;
       }
     }
 
@@ -1427,8 +2067,8 @@ function createTrafficLines(edgeSegments, activationColor) {
   const colors = new Float32Array(totalLines * 2 * 3);
 
   // Create lighter and darker variants of the activation color
-  const TRAFFIC_BRIGHT = activationColor.clone().lerp(new THREE.Color(0xffffff), 0.4);
-  const TRAFFIC_DIM = activationColor.clone().lerp(new THREE.Color(0xffffff), 0.1);
+  const TRAFFIC_BRIGHT = activationColor.clone().lerp(getGlowColor(), 0.4);
+  const TRAFFIC_DIM = activationColor.clone().lerp(getGlowColor(), 0.1);
 
   // Initialize traffic lines at random positions along edges
   for (let i = 0; i < totalLines; i++) {
@@ -1476,7 +2116,7 @@ function createTrafficLines(edgeSegments, activationColor) {
     vertexColors: true,
     transparent: true,
     opacity: 0.9,
-    blending: THREE.AdditiveBlending,
+    blending: getBlendMode(),
     depthWrite: false,
     linewidth: 2
   });
@@ -1524,83 +2164,6 @@ function removeActivationGroup(group) {
   console.log(`Removed activation group ${group.id} (age: ${((Date.now() - group.timestamp) / 1000).toFixed(1)}s)`);
 }
 
-async function queryAndActivate(queryText) {
-  addLog(`🔍 Querying: <strong>${queryText}</strong>`, 'info');
-
-  try {
-    const response = await fetch(`${API_BASE}/query/data`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        query: queryText,
-        mode: 'hybrid',
-        top_k: 20,
-        chunk_top_k: 10
-      })
-    });
-
-    if (!response.ok) {
-      addLog(`❌ Query failed: ${response.statusText}`, 'error');
-      console.error('Query failed:', response.statusText);
-      return;
-    }
-
-    const result = await response.json();
-    if (result.status === 'success' && result.data) {
-      const entityNames = [];
-
-      // Collect entity names from results
-      if (result.data.entities) {
-        entityNames.push(...result.data.entities.map(e => e.entity_name));
-      }
-
-      // Collect entity names from relationships
-      if (result.data.relationships) {
-        for (const rel of result.data.relationships) {
-          entityNames.push(rel.src_id, rel.tgt_id);
-        }
-      }
-
-      // Remove duplicates
-      const uniqueEntities = [...new Set(entityNames)];
-
-      // Log the results
-      const entityCount = result.data.entities ? result.data.entities.length : 0;
-      const relCount = result.data.relationships ? result.data.relationships.length : 0;
-      addLog(
-        `✅ Found <strong>${entityCount}</strong> entities, <strong>${relCount}</strong> relationships`,
-        'success',
-        formatEntityList(uniqueEntities, 15)
-      );
-
-      // Add to queue instead of activating directly
-      activationQueue.push({
-        query: queryText,
-        entities: uniqueEntities,
-        entityCount: entityCount,
-        timestamp: Date.now() / 1000,
-        isManual: true
-      });
-
-      // Advance the polling watermark so the same activation isn't
-      // re-fetched by pollForActivations() and processed a second time.
-      lastActivationTimestamp = Date.now() / 1000 + 1;
-
-      // Start processing queue if not already processing
-      if (!isProcessingQueue) {
-        processActivationQueue();
-      }
-    } else {
-      addLog(`⚠️ Query returned no results`, 'warning');
-    }
-  } catch (error) {
-    addLog(`❌ Query error: ${error.message}`, 'error');
-    console.error('Query error:', error);
-  }
-}
-
 function createEdges() {
   if (!edgeData || !entityData) return;
 
@@ -1628,8 +2191,8 @@ function createEdges() {
   const material = new THREE.LineBasicMaterial({
     vertexColors: true,
     transparent: true,
-    opacity: 0.15,
-    blending: THREE.AdditiveBlending,
+    opacity: isLightTheme() ? 0.35 : 0.15,
+    blending: getBlendMode(),
     depthWrite: false
   });
 
@@ -1722,9 +2285,146 @@ function setupInteraction() {
   renderer.domElement.addEventListener('click', () => {
     if (hoveredEntity >= 0) {
       selectedEntity = hoveredEntity;
+      // Fresh graph click starts a new navigation path
+      panelHistory.length = 0;
+      updatePanelBack();
+      // Light up the clicked node (pulse-then-settle, source-tagged 'click')
+      clearHighlights('click');
+      setHighlight([selectedEntity], getGlowColor(), 2.5, 'click');
       showEntityDetails(selectedEntity);
     }
   });
+}
+
+// Panel navigation history for relationship drill-down
+const panelHistory = [];
+let panelClusterId = null;
+let highlightEdgeMesh = null;
+
+function updatePanelBack() {
+  document.getElementById('panel-back').style.display =
+    panelHistory.length > 0 ? 'block' : 'none';
+}
+
+// Navigate to an entity from inside the panel (keeps back-history)
+function navigateToEntity(idx) {
+  if (idx == null || idx < 0) return;
+  if (selectedEntity >= 0 && selectedEntity !== idx) {
+    panelHistory.push(selectedEntity);
+  }
+  selectedEntity = idx;
+  clearHighlights('click');
+  setHighlight([idx], getGlowColor(), 2.5, 'click');
+  showEntityDetails(idx);
+  updatePanelBack();
+}
+
+// Bright single edge between two entities (relationship selection)
+function setHighlightEdge(srcIdx, tgtIdx) {
+  clearHighlightEdge();
+  const src = entityData[srcIdx];
+  const tgt = entityData[tgtIdx];
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(
+    [src.x, src.y, src.z, tgt.x, tgt.y, tgt.z], 3));
+  const material = new THREE.LineBasicMaterial({
+    color: isLightTheme() ? 0x222244 : 0xffffff,
+    transparent: true,
+    opacity: 0.9,
+    blending: getBlendMode(),
+    depthWrite: false
+  });
+  highlightEdgeMesh = new THREE.LineSegments(geometry, material);
+  scene.add(highlightEdgeMesh);
+}
+
+function clearHighlightEdge() {
+  if (highlightEdgeMesh) {
+    scene.remove(highlightEdgeMesh);
+    highlightEdgeMesh.geometry.dispose();
+    highlightEdgeMesh.material.dispose();
+    highlightEdgeMesh = null;
+  }
+}
+
+// Show relationship details between two entities in the side panel and
+// light both nodes plus the connecting edge in the 3D graph.
+async function showRelationship(fromName, toName) {
+  const relView = document.getElementById('relationship-view');
+  relView.classList.remove('hidden');
+  relView.innerHTML = '<div class="relationship-title">' + t('relationship.title') + '</div>' +
+    '<div class="rel-desc">' + t('relationship.loading') + '</div>';
+
+  let edge;
+  try {
+    const r = await fetch(
+      `${API_BASE}/graph3d/edge_info?src=${encodeURIComponent(fromName)}&tgt=${encodeURIComponent(toName)}`
+    );
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.detail || r.statusText);
+    }
+    edge = await r.json();
+  } catch (err) {
+    relView.innerHTML = '<div class="relationship-title">' + t('relationship.title') + '</div>' +
+      `<div class="rel-desc">⚠️ ${err.message}</div>`;
+    return;
+  }
+
+  relView.innerHTML = '<div class="relationship-title">' + t('relationship.title') + '</div>';
+
+  // Entity pair as clickable links (built via DOM to avoid attribute injection)
+  const pairDiv = document.createElement('div');
+  const makeLink = (name) => {
+    const link = document.createElement('span');
+    link.className = 'rel-entity-link';
+    link.textContent = name;
+    link.addEventListener('click', () => {
+      const idx = entityNameToIndex.get(name);
+      if (idx !== undefined) navigateToEntity(idx);
+    });
+    return link;
+  };
+  pairDiv.appendChild(makeLink(fromName));
+  pairDiv.appendChild(document.createTextNode(' ↔ '));
+  pairDiv.appendChild(makeLink(toName));
+  relView.appendChild(pairDiv);
+
+  const descDiv = document.createElement('div');
+  descDiv.className = 'rel-desc';
+  descDiv.innerHTML = formatDescription(edge.description) || t('entity.noDesc');
+  relView.appendChild(descDiv);
+
+  const keywords = (edge.keywords || '').split(',').map(k => k.trim()).filter(Boolean);
+  if (keywords.length) {
+    const kwDiv = document.createElement('div');
+    kwDiv.className = 'rel-keywords';
+    for (const kw of keywords) {
+      const tag = document.createElement('span');
+      tag.className = 'rel-keyword';
+      tag.textContent = kw;
+      kwDiv.appendChild(tag);
+    }
+    relView.appendChild(kwDiv);
+  }
+
+  const weightDiv = document.createElement('div');
+  weightDiv.className = 'rel-weight';
+  weightDiv.textContent = `${t('relationship.weight')}: ${Number(edge.weight || 0).toFixed(2)}`;
+  relView.appendChild(weightDiv);
+
+  // Light both nodes and the edge in the 3D graph
+  const srcIdx = entityNameToIndex.get(fromName);
+  const tgtIdx = entityNameToIndex.get(toName);
+  clearHighlights('edge');
+  clearHighlightEdge();
+  const lit = [];
+  if (srcIdx !== undefined) lit.push(srcIdx);
+  if (tgtIdx !== undefined) lit.push(tgtIdx);
+  if (lit.length) setHighlight(lit, getGlowColor(), 2.2, 'edge');
+  if (srcIdx !== undefined && tgtIdx !== undefined) {
+    setHighlightEdge(srcIdx, tgtIdx);
+  }
 }
 
 function showEntityDetails(idx) {
@@ -1737,15 +2437,52 @@ function showEntityDetails(idx) {
   if (descHtml) {
     descEl.innerHTML = descHtml;
   } else {
-    descEl.textContent = 'No description available.';
+    descEl.textContent = t('entity.noDesc');
   }
   document.getElementById('entity-cluster').textContent = entity.cluster;
   document.getElementById('entity-position').textContent =
     `(${entity.x.toFixed(2)}, ${entity.y.toFixed(2)}, ${entity.z.toFixed(2)})`;
 
+  // Track cluster for hover-highlight (feature: hover cluster text lights cluster N)
+  panelClusterId = entity.cluster;
+
+  // Reset relationship drill-down state
+  const relView = document.getElementById('relationship-view');
+  relView.classList.add('hidden');
+  relView.innerHTML = '';
+  clearHighlights('edge');
+  clearHighlightEdge();
+
   // Count connections
   const connections = edgeData.filter(([s, t]) => s === idx || t === idx).length;
   document.getElementById('entity-connections').textContent = connections;
+
+  // Clickable connection chips (sorted by relationship weight, capped by backend)
+  const chipsDiv = document.getElementById('entity-conn-chips');
+  chipsDiv.innerHTML = '';
+  fetch(`${API_BASE}/graph3d/entity_edges?name=${encodeURIComponent(entity.name)}`)
+    .then(r => (r.ok ? r.json() : null))
+    .then(data => {
+      // Ignore stale responses if the user already clicked another entity
+      if (selectedEntity !== idx) return;
+      chipsDiv.innerHTML = '';
+      const neighbors = data?.neighbors || [];
+      for (const neighbor of neighbors) {
+        const chip = document.createElement('span');
+        const neighborIdx = entityNameToIndex.get(neighbor.name);
+        const inLayout = neighborIdx !== undefined;
+        chip.className = inLayout ? 'conn-chip' : 'conn-chip disabled';
+        chip.textContent = neighbor.name;
+        chip.title = inLayout
+          ? `${t('rel.chipTitle', {weight: Number(neighbor.weight || 0).toFixed(2)})}`
+          : t('rel.notInLayout');
+        if (inLayout) {
+          chip.addEventListener('click', () => showRelationship(entity.name, neighbor.name));
+        }
+        chipsDiv.appendChild(chip);
+      }
+    })
+    .catch(err => console.error('Error loading entity edges:', err));
 
   panel.classList.remove('hidden');
 
@@ -1772,7 +2509,6 @@ document.getElementById('btn-reset-camera').addEventListener('click', () => {
 document.getElementById('btn-toggle-edges').addEventListener('click', () => {
   showEdges = !showEdges;
   if (edgesMesh) edgesMesh.visible = showEdges;
-  if (activatedEdgesMesh) activatedEdgesMesh.visible = showEdges;
 });
 
 document.getElementById('btn-toggle-labels').addEventListener('click', () => {
@@ -1780,34 +2516,191 @@ document.getElementById('btn-toggle-labels').addEventListener('click', () => {
   // TODO: Implement label rendering with CSS2DRenderer
 });
 
-// Query panel - submit button
-document.getElementById('query-submit').addEventListener('click', () => {
-  const queryInput = document.getElementById('query-input');
-  const queryText = queryInput.value.trim();
-  if (queryText) {
-    queryAndActivate(queryText);
-  }
+// Title + QR visibility toggle (persisted in localStorage)
+let showTitle = localStorage.getItem('graph3d_show_title') !== 'false';
+const btnToggleTitle = document.getElementById('btn-toggle-title');
+function applyTitleVisibility() {
+  document.querySelector('.top-bar .logo').style.display = showTitle ? '' : 'none';
+  btnToggleTitle.style.opacity = showTitle ? '1' : '0.5';
+  // The resize handle lives at root level; keep it in sync with the QR chip
+  const handle = document.getElementById('qr-resize-handle');
+  if (handle) handle.style.display = showTitle ? '' : 'none';
+}
+btnToggleTitle.addEventListener('click', () => {
+  showTitle = !showTitle;
+  localStorage.setItem('graph3d_show_title', String(showTitle));
+  applyTitleVisibility();
 });
+applyTitleVisibility();
 
-// Query panel - enter key
-document.getElementById('query-input').addEventListener('keypress', (e) => {
-  if (e.key === 'Enter') {
-    const queryText = e.target.value.trim();
-    if (queryText) {
-      queryAndActivate(queryText);
-    }
+// Draggable title-bar QR chip. Pointer-based (mouse + touch), clamped to the
+// viewport, position persisted in localStorage. Until the first drag it keeps
+// its natural static spot; afterwards inline left/top take over. A corner
+// handle resizes it — always square, so the QR stays scannable.
+(function initDraggableTitleQr() {
+  const qr = document.querySelector('.title-qr');
+  if (!qr) return;
+
+  const QR_POS_KEY = 'graph3d_qr_pos';
+  const QR_SIZE_KEY = 'graph3d_qr_size';
+  const QR_MIN_SIZE = 72;
+  const QR_MAX_SIZE = 360;
+  const HANDLE_HALF = 9; // half of the 18px handle, to center it on the corner
+  const clamp = (v, min, max) => Math.min(Math.max(v, min), Math.max(min, max));
+
+  function place(x, y) {
+    const rect = qr.getBoundingClientRect();
+    const w = rect.width || 144;
+    const h = rect.height || 144;
+    qr.style.left = clamp(x, 8, window.innerWidth - w - 8) + 'px';
+    qr.style.top = clamp(y, 8, window.innerHeight - h - 8) + 'px';
+    syncHandle();
   }
-});
+
+  function setSize(size, persist) {
+    size = clamp(Math.round(size), QR_MIN_SIZE, QR_MAX_SIZE);
+    qr.style.width = size + 'px';
+    qr.style.height = size + 'px';
+    // Anchor top-left: growing near the right/bottom edge pushes the chip
+    // back inside the viewport via place()'s clamp.
+    const rect = qr.getBoundingClientRect();
+    place(rect.left, rect.top);
+    if (persist) localStorage.setItem(QR_SIZE_KEY, String(size));
+  }
+
+  // --- Corner resize handle (created at root so it isn't clipped by overlays) ---
+  const handle = document.createElement('div');
+  handle.id = 'qr-resize-handle';
+  handle.className = 'qr-resize-handle';
+  document.body.appendChild(handle);
+
+  function syncHandle() {
+    const rect = qr.getBoundingClientRect();
+    handle.style.left = (rect.right - HANDLE_HALF) + 'px';
+    handle.style.top = (rect.bottom - HANDLE_HALF) + 'px';
+  }
+
+  let resizing = false;
+  handle.addEventListener('pointerdown', (e) => {
+    resizing = true;
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add('resizing');
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  handle.addEventListener('pointermove', (e) => {
+    if (!resizing) return;
+    const rect = qr.getBoundingClientRect();
+    // Square by construction: take the larger axis so the pointer stays
+    // inside the chip while dragging outward.
+    setSize(Math.max(e.clientX - rect.left, e.clientY - rect.top), false);
+  });
+  function endResize() {
+    if (!resizing) return;
+    resizing = false;
+    handle.classList.remove('resizing');
+    localStorage.setItem(QR_SIZE_KEY, String(Math.round(qr.getBoundingClientRect().width)));
+  }
+  handle.addEventListener('pointerup', endResize);
+  handle.addEventListener('pointercancel', endResize);
+
+  // Restore saved size before position so the clamp uses the real dimensions
+  try {
+    const savedSize = parseInt(localStorage.getItem(QR_SIZE_KEY) || '', 10);
+    if (Number.isFinite(savedSize)) setSize(savedSize, false);
+  } catch (_) { /* ignore corrupt saved state */ }
+
+  // Restore saved position from a previous session
+  try {
+    const saved = JSON.parse(localStorage.getItem(QR_POS_KEY) || 'null');
+    if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+      place(saved.x, saved.y);
+    }
+  } catch (_) { /* ignore corrupt saved state */ }
+
+  // If the title toggle starts hidden, the handle must follow
+  if (typeof showTitle !== 'undefined' && !showTitle) handle.style.display = 'none';
+
+  let dragging = false;
+  let startX = 0, startY = 0, baseX = 0, baseY = 0;
+
+  qr.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    qr.setPointerCapture(e.pointerId);
+    const rect = qr.getBoundingClientRect();
+    startX = e.clientX;
+    startY = e.clientY;
+    baseX = rect.left;
+    baseY = rect.top;
+    qr.classList.add('dragging');
+    e.preventDefault(); // no native image-drag ghost / text selection
+  });
+
+  qr.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    place(baseX + e.clientX - startX, baseY + e.clientY - startY);
+  });
+
+  function endDrag() {
+    if (!dragging) return;
+    dragging = false;
+    qr.classList.remove('dragging');
+    const rect = qr.getBoundingClientRect();
+    localStorage.setItem(QR_POS_KEY, JSON.stringify({
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+    }));
+  }
+
+  qr.addEventListener('pointerup', endDrag);
+  qr.addEventListener('pointercancel', endDrag);
+
+  // Keep the chip on screen if the window shrinks
+  window.addEventListener('resize', () => {
+    const rect = qr.getBoundingClientRect();
+    if (rect.width > 0) place(rect.left, rect.top);
+  });
+
+  syncHandle();
+})();
+
+
 
 // Auto-rotate toggle button
 document.getElementById('btn-auto-rotate').addEventListener('click', () => {
   controls.autoRotate = !controls.autoRotate;
   const btn = document.getElementById('btn-auto-rotate');
   btn.style.opacity = controls.autoRotate ? '1' : '0.5';
-  addLog(
-    controls.autoRotate ? '🔄 Auto-rotate enabled' : '⏸️ Auto-rotate disabled',
-    'info'
-  );
+});
+
+// Brightness slider (persisted in localStorage)
+const brightnessSlider = document.getElementById('brightness-slider');
+brightnessSlider.value = brightnessFactor;
+brightnessSlider.addEventListener('input', () => {
+  brightnessFactor = parseFloat(brightnessSlider.value) || 1.0;
+  localStorage.setItem('graph3d_brightness', String(brightnessFactor));
+  applyBrightness();
+});
+
+// Query Log scale slider (persisted in localStorage) — scales the ticker's
+// row height, bar height and fonts together via the --ticker-scale CSS
+// variable. Restore the saved scale here (this block runs before
+// initTickerResize) so the slider shows the persisted position.
+const savedTickerScale = parseFloat(localStorage.getItem(TICKER_SCALE_KEY) || '');
+if (Number.isFinite(savedTickerScale)) {
+  tickerScale = Math.min(TICKER_SCALE_MAX, Math.max(TICKER_SCALE_MIN, savedTickerScale));
+}
+const logScaleSlider = document.getElementById('log-scale-slider');
+const logScaleValue = document.getElementById('log-scale-value');
+logScaleSlider.value = String(tickerScale);
+logScaleValue.textContent = `${Math.round(tickerScale * 100)}%`;
+logScaleSlider.addEventListener('input', () => {
+  // Capture the visible line count at the outgoing scale before switching
+  const slots = tickerVisibleSlots();
+  tickerScale = parseFloat(logScaleSlider.value) || 1;
+  localStorage.setItem(TICKER_SCALE_KEY, String(tickerScale));
+  logScaleValue.textContent = `${Math.round(tickerScale * 100)}%`;
+  applyTickerScale(slots);
 });
 
 // Entity Details toggle button
@@ -1816,16 +2709,106 @@ document.getElementById('btn-entity-details').addEventListener('click', () => {
   panel.classList.toggle('hidden');
   const btn = document.getElementById('btn-entity-details');
   btn.style.opacity = panel.classList.contains('hidden') ? '0.5' : '1';
+  if (panel.classList.contains('hidden')) {
+    // Closing the panel clears all interactive highlights
+    clearHighlights('click');
+    clearHighlights('edge');
+    clearHighlights('cluster-hover');
+    clearHighlightEdge();
+  }
+});
+
+// Back button for relationship drill-down navigation
+document.getElementById('panel-back').addEventListener('click', () => {
+  const prev = panelHistory.pop();
+  if (prev != null) {
+    selectedEntity = prev;
+    clearHighlights('click');
+    setHighlight([prev], getGlowColor(), 2.5, 'click');
+    showEntityDetails(prev);
+  }
+  updatePanelBack();
+});
+
+// Hover the cluster label in the entity panel -> light up the whole cluster
+const clusterSpan = document.getElementById('entity-cluster');
+clusterSpan.addEventListener('mouseenter', () => {
+  if (panelClusterId == null) return;
+  const idxs = clusterToIndices.get(panelClusterId) || [];
+  const color = new THREE.Color(CLUSTER_COLORS[panelClusterId % CLUSTER_COLORS.length])
+    .lerp(getGlowColor(), 0.55);
+  setHighlight(idxs, color, 1.8, 'cluster-hover');
+});
+clusterSpan.addEventListener('mouseleave', () => {
+  clearHighlights('cluster-hover');
 });
 
 // Query Log toggle button
 document.getElementById('btn-query-log').addEventListener('click', () => {
   const panel = document.getElementById('activation-log');
-  const isHidden = panel.style.display === 'none';
-  panel.style.display = isHidden ? 'flex' : 'none';
+  panel.classList.toggle('hidden');
   const btn = document.getElementById('btn-query-log');
-  btn.style.opacity = isHidden ? '1' : '0.5';
+  btn.style.opacity = panel.classList.contains('hidden') ? '0.5' : '1';
 });
+
+// Query Log ticker height: drag the top-edge handle up/down to show more or
+// fewer rotating lines. Same pointer-event pattern as the title QR drag/resize.
+// Height is persisted as scale-1.0 "base" pixels so the scale slider doesn't
+// change how many lines a saved height means.
+(function initTickerResize() {
+  const panel = document.getElementById('activation-log');
+  const handle = document.getElementById('ticker-resize-handle');
+  if (!panel || !handle) return;
+
+  const HEIGHT_KEY = 'graph3d_log_height';
+  const clampHeight = (h) => Math.min(
+    Math.max(h, tickerLinePx()),
+    Math.max(tickerLinePx(), Math.round(window.innerHeight * 0.5))
+  );
+
+  function setHeight(h, persist) {
+    const clamped = clampHeight(Math.round(h));
+    panel.style.height = `${clamped}px`;
+    if (persist) localStorage.setItem(HEIGHT_KEY, String(Math.round(clamped / tickerScale)));
+  }
+
+  // Restore saved scale first so the height restore lands at the right size
+  const savedScale = parseFloat(localStorage.getItem(TICKER_SCALE_KEY) || '');
+  if (Number.isFinite(savedScale)) {
+    tickerScale = Math.min(TICKER_SCALE_MAX, Math.max(TICKER_SCALE_MIN, savedScale));
+  }
+  panel.style.setProperty('--ticker-scale', String(tickerScale));
+
+  // Restore saved height (stored in scale-1.0 base pixels) before the first
+  // events land
+  const saved = parseInt(localStorage.getItem(HEIGHT_KEY) || '', 10);
+  if (Number.isFinite(saved)) setHeight(saved * tickerScale, false);
+
+  let resizing = false;
+  handle.addEventListener('pointerdown', (e) => {
+    resizing = true;
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add('resizing');
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  handle.addEventListener('pointermove', (e) => {
+    if (!resizing) return;
+    // Bar is anchored to bottom:0 — its top edge follows the pointer's Y.
+    setHeight(window.innerHeight - e.clientY, false);
+  });
+  function endResize() {
+    if (!resizing) return;
+    resizing = false;
+    handle.classList.remove('resizing');
+    localStorage.setItem(HEIGHT_KEY, String(Math.round(panel.clientHeight / tickerScale)));
+  }
+  handle.addEventListener('pointerup', endResize);
+  handle.addEventListener('pointercancel', endResize);
+
+  // Keep the saved height within bounds if the window shrinks
+  window.addEventListener('resize', () => setHeight(panel.clientHeight, false));
+})();
 
 // GK Charger mobile QR modal
 const gkModalOverlay = document.getElementById('gk-modal-overlay');
@@ -1839,15 +2822,35 @@ gkModalOverlay.addEventListener('click', (e) => {
   if (e.target === gkModalOverlay) gkModalOverlay.classList.add('hidden');
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') gkModalOverlay.classList.add('hidden');
+  if (e.key === 'Escape') {
+    gkModalOverlay.classList.add('hidden');
+    document.getElementById('settings-panel').classList.add('hidden');
+  }
 });
 
-// Log panel close button (now toggles visibility)
-document.getElementById('log-close').addEventListener('click', () => {
-  const panel = document.getElementById('activation-log');
-  panel.style.display = 'none';
-  const btn = document.getElementById('btn-query-log');
-  btn.style.opacity = '0.5';
+// Settings sidebar
+const settingsPanel = document.getElementById('settings-panel');
+document.getElementById('btn-settings').addEventListener('click', () => {
+  settingsPanel.classList.toggle('hidden');
+});
+// Close settings panel on outside click
+document.addEventListener('click', (e) => {
+  if (!settingsPanel.contains(e.target) && e.target.id !== 'btn-settings' && !e.target.closest('#btn-settings')) {
+    settingsPanel.classList.add('hidden');
+  }
+});
+// Language toggle buttons
+document.querySelectorAll('.lang-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    setLanguage(btn.dataset.lang);
+  });
+});
+// Theme toggle buttons (initial active state comes from stored theme)
+document.querySelectorAll('.theme-btn').forEach(btn => {
+  btn.classList.toggle('active', btn.dataset.theme === currentTheme);
+  btn.addEventListener('click', () => {
+    setTheme(btn.dataset.theme);
+  });
 });
 
 // Poll for new query activations from other sources
@@ -1895,6 +2898,9 @@ async function pollForActivations() {
       // Update timestamp
       lastActivationTimestamp = data.latest_timestamp;
 
+      // Stamp activity so idle replay pauses
+      lastQueryActivityAt = Date.now();
+
       // Start processing queue if not already processing
       if (!isProcessingQueue) {
         processActivationQueue();
@@ -1910,7 +2916,67 @@ function startPolling() {
   if (pollingInterval) return; // Already polling
 
   pollingInterval = setInterval(pollForActivations, POLL_INTERVAL_MS);
-  addLog('🔄 Real-time activation monitoring enabled', 'info');
+  setInterval(checkIdleReplay, REPLAY_CHECK_INTERVAL_MS);
+}
+
+// After 30s without real query activity, replay a random activation from
+// today's server-side cache in a dimmed style. A real query arriving at any
+// point (including mid-fetch) prevents the replay from being queued.
+async function checkIdleReplay() {
+  if (isProcessingQueue || activationQueue.length > 0) return;
+  if (Date.now() - lastQueryActivityAt < IDLE_REPLAY_DELAY_MS) return;
+
+  try {
+    const response = await fetch(`${ACTIVATIONS_URL}/daily_replay`);
+    if (!response.ok) return;
+    const { activation } = await response.json();
+    if (!activation) return;
+
+    // Re-check idle after the await — a real query may have arrived mid-fetch
+    if (Date.now() - lastQueryActivityAt < IDLE_REPLAY_DELAY_MS) return;
+    if (isProcessingQueue || activationQueue.length > 0) return;
+
+    const entityNames = [...(activation.entities || [])];
+    for (const rel of (activation.relationships || [])) {
+      entityNames.push(rel.src, rel.tgt);
+    }
+    const uniqueEntities = [...new Set(entityNames)];
+    if (uniqueEntities.length === 0) return;
+
+    activationQueue.push({
+      query: activation.query,
+      entities: uniqueEntities,
+      entityCount: activation.entities?.length || 0,
+      timestamp: Date.now() / 1000,
+      isReplay: true
+    });
+
+    if (!isProcessingQueue) {
+      processActivationQueue();
+    }
+  } catch (error) {
+    console.error('Idle replay error:', error);
+  }
+}
+
+// Bottom ticker now shows one headline item at a time (vertical rotation), so
+// coalesce each activation's sub-events into a single readable line.
+function logActivationSummary(activation) {
+  const srcLabel = activation.isReplay ? t('log.replay') : t('log.externalQuery');
+  const parts = [];
+
+  parts.push(`<strong>"${activation.query}"</strong>`);
+
+  if (activation.entityCount) {
+    parts.push(t('log.foundEntities', { count: activation.entityCount }));
+  }
+
+  const uniqueCount = activation.entities ? activation.entities.length : 0;
+  if (uniqueCount) {
+    parts.push(t('log.activated', { count: uniqueCount }));
+  }
+
+  addLog(`${srcLabel}: ${parts.join(' · ')}`, 'info');
 }
 
 // Process activation queue sequentially
@@ -1924,33 +2990,20 @@ async function processActivationQueue() {
   while (activationQueue.length > 0) {
     const activation = activationQueue.shift();
 
-    // Log the activation (different message for manual vs external queries)
-    if (activation.isManual) {
-      addLog(
-        `🔍 Manual query: <strong>"${activation.query}"</strong>`,
-        'info'
-      );
-    } else {
-      addLog(
-        `🌐 External query: <strong>"${activation.query}"</strong>`,
-        'info'
-      );
-    }
+    // Log the activation (replay vs external) as one coalesced headline
+    logActivationSummary(activation);
 
-    addLog(
-      `✅ Found <strong>${activation.entityCount}</strong> entities`,
-      'success',
-      formatEntityList(activation.entities, 15)
+    // Activate the entities (dimmed for replays)
+    activateEntities(
+      activation.entities,
+      ACTIVATION_DISPLAY_DURATION,
+      activation.isReplay ? REPLAY_DIM_FACTOR : 1.0
     );
-
-    // Activate the entities
-    activateEntities(activation.entities, ACTIVATION_DISPLAY_DURATION);
-    addLog(`⚡ Activated <strong>${activation.entities.length}</strong> neurons`, 'success');
 
     // If there are more items in queue, show queue status
     if (activationQueue.length > 0) {
       addLog(
-        `⏳ ${activationQueue.length} more query${activationQueue.length > 1 ? 'ies' : 'y'} queued...`,
+        t('log.queued', {count: activationQueue.length}),
         'info'
       );
     }
@@ -1966,18 +3019,18 @@ function stopPolling() {
   if (pollingInterval) {
     clearInterval(pollingInterval);
     pollingInterval = null;
-    addLog('⏸️ Real-time activation monitoring paused', 'info');
   }
 }
 
 async function init() {
+  await loadI18n();
   const loaded = await loadData();
   if (!loaded) {
     document.getElementById('loading').innerHTML = `
       <div style="text-align: center; color: var(--color-text-muted);">
         <div style="font-size: 48px; margin-bottom: 16px;">⚠</div>
-        <div style="font-size: 18px; margin-bottom: 8px;">Failed to load knowledge graph</div>
-        <div style="font-size: 14px;">Make sure the layout has been computed.</div>
+        <div style="font-size: 18px; margin-bottom: 8px;">${t('loading.failed')}</div>
+        <div style="font-size: 14px;">${t('loading.hint')}</div>
       </div>
     `;
     return;
@@ -2026,8 +3079,6 @@ document.getElementById('btn-insights').addEventListener('click', async () => {
 // Load insights from backend
 async function loadInsights() {
   try {
-    addLog('📊 Loading research insights...', 'info');
-
     // Fetch insights
     const insightsResponse = await fetch(`${API_BASE}/graph3d/insights`);
     insightsData = await insightsResponse.json();
@@ -2038,11 +3089,8 @@ async function loadInsights() {
 
     // Display insights
     displayInsights();
-
-    addLog('✅ Research insights loaded', 'success');
   } catch (error) {
     console.error('Error loading insights:', error);
-    addLog('⚠️ Failed to load insights', 'warning');
   }
 }
 
@@ -2055,19 +3103,19 @@ function displayInsights() {
   statsGrid.innerHTML = `
     <div class="stat-card">
       <div class="stat-card-value">${insightsData.total_entities.toLocaleString()}</div>
-      <div class="stat-card-label">Entities</div>
+      <div class="stat-card-label">${t('insights.entities')}</div>
     </div>
     <div class="stat-card">
       <div class="stat-card-value">${insightsData.total_edges.toLocaleString()}</div>
-      <div class="stat-card-label">Relationships</div>
+      <div class="stat-card-label">${t('insights.relationships')}</div>
     </div>
     <div class="stat-card">
       <div class="stat-card-value">${insightsData.total_clusters}</div>
-      <div class="stat-card-label">Clusters</div>
+      <div class="stat-card-label">${t('insights.clusters')}</div>
     </div>
     <div class="stat-card">
       <div class="stat-card-value">${insightsData.avg_connections_per_entity}</div>
-      <div class="stat-card-label">Avg Connections</div>
+      <div class="stat-card-label">${t('insights.avgConnections')}</div>
     </div>
   `;
 
@@ -2110,18 +3158,18 @@ function showClusterInfo(clusterId) {
   }
 
   // Display cluster label
-  document.getElementById('cluster-label').textContent = `Cluster ${clusterId}: ${cluster.label}`;
+  document.getElementById('cluster-label').textContent = `${t('cluster.label', {id: clusterId})}: ${cluster.label}`;
 
   // Display stats
   const statsDiv = document.getElementById('cluster-stats');
   statsDiv.innerHTML = `
     <div class="cluster-stat">
       <div class="cluster-stat-value">${cluster.entity_count}</div>
-      <div class="cluster-stat-label">Entities</div>
+      <div class="cluster-stat-label">${t('insights.entities')}</div>
     </div>
     <div class="cluster-stat">
       <div class="cluster-stat-value">${cluster.internal_edges}</div>
-      <div class="cluster-stat-label">Internal Edges</div>
+      <div class="cluster-stat-label">${t('cluster.internalEdges')}</div>
     </div>
   `;
 

@@ -1,6 +1,8 @@
 import os
 import re
+import sys
 import json
+import math
 import time
 import hashlib
 from dataclasses import dataclass, field
@@ -36,8 +38,10 @@ from ..utils import (
     compute_mdhash_id,
     _cooperative_yield,
     merge_source_ids,
+    validate_interpreted_attribute_names,
     validate_workspace,
 )
+from ..utils_graph import relation_evidence_count
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from ..constants import (
     CUSTOM_CHUNK_PATCH_METADATA_KEY,
@@ -48,9 +52,15 @@ from ..exceptions import (
     SourceConflictRepairCASError,
     StorageControlPlaneError,
     StorageRecordNotFoundError,
+    VectorSpaceMismatchError,
 )
 from .._version import __version__
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
+from ..kg.vector_space import (
+    assert_vector_space_matches,
+    read_vector_space_marker,
+    vector_space_marker,
+)
 
 import pipmaster as pm
 
@@ -88,6 +98,28 @@ DEFAULT_MONGO_UPSERT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024  # 16MB
 DEFAULT_MONGO_UPSERT_MAX_RECORDS_PER_BATCH = 128
 DEFAULT_MONGO_DELETE_MAX_RECORDS_PER_BATCH = 1000
 
+# get_edges_batch's own $or chunk size, matching postgres_impl.get_edges_batch's
+# batch_size default -- a fixed safety cap for query size, not an operator-tuned
+# knob like the env-var-driven limits above, so it isn't one.
+_GET_EDGES_BATCH_CHUNK_SIZE = 500
+
+# node_degrees_batch's own $in chunk size -- kept as its own constant rather
+# than sharing _GET_EDGES_BATCH_CHUNK_SIZE since the two methods' per-entry
+# BSON size differs enough to matter: a bare id string costs far less than
+# get_edges_batch's two-field edge_lo/edge_hi dict, so the same query-size
+# budget affords a much larger chunk here. Matched to
+# _GRAPH_DEGREE_RANK_MAX_CANDIDATES (this module's already-accepted safe
+# candidate-set size for a BFS level) rather than picked independently, so
+# that already-bounded caller stays at 2 round trips (one chunk) instead of
+# being re-split by an unrelated, smaller cap.
+_NODE_DEGREES_BATCH_CHUNK_SIZE = 8192
+
+# Shared query payload budget for node-degree ``$in`` and edge ``$or`` lookups.
+# Count-only caps cannot bound BSON size because entity IDs are caller-controlled.
+# Reserve 1 MiB for query wrappers and BSON metadata; count caps remain secondary
+# guards on round-trip volume.
+_GRAPH_BATCH_QUERY_MAX_PAYLOAD_BYTES = 15 * 1024 * 1024  # 15 MiB + 1 MiB headroom
+
 # MongoDB duplicate-key error code, raised when an upsert insert races the
 # unique edge-endpoint index (another writer inserted the same edge first).
 _DUPLICATE_KEY_CODE = 11000
@@ -96,6 +128,20 @@ _DUPLICATE_KEY_CODE = 11000
 # watching a large migration see liveness (mirrors the OpenSearch canonical-id
 # migration's progress cadence).
 _EDGE_MIGRATION_PROGRESS_INTERVAL = 50_000
+
+# Ceiling on how many same-depth candidates get a degree lookup before the
+# max_nodes cap in the bidirectional BFS. node_degrees_batch itself chunks
+# its $in queries at this same size (see _NODE_DEGREES_BATCH_CHUNK_SIZE), so
+# this call site fits in exactly one chunk -- 2 round trips, same as before
+# chunking existed -- when ids are short enough to stay under
+# _GRAPH_BATCH_QUERY_MAX_PAYLOAD_BYTES; long ids can still re-split it (see
+# that constant's comment), the count cap alone is not a hard guarantee. The
+# ceiling itself still earns its keep: one hub can put 100k+ neighbours in a
+# single level, and without it every one of them would get degree-ranked (in
+# several chunks) for an outcome max_nodes will mostly discard anyway.
+# (Deliberately not shared with the OpenSearch constant of the same value:
+# that one is derived from index.max_terms_count / search.max_buckets.)
+_GRAPH_DEGREE_RANK_MAX_CANDIDATES = 8192
 
 
 def _canonical_edge_endpoints(
@@ -124,13 +170,23 @@ def _edge_source_id_list(doc: dict[str, Any]) -> list[str]:
 
 
 def _coerce_weight(weight: Any) -> float | None:
-    """Coerce a (possibly string) edge weight to float, or None if non-numeric."""
+    """Coerce a (possibly string) edge weight to float, or None if the value
+    is missing, non-numeric, or not finite.
+
+    NaN/+-inf pass ``float()`` (including via strings like "nan"), but none of
+    them is a storable graph attribute (see ``graph_attribute_value_rejection``
+    -- the rule is the portability intersection across the backends, not a
+    per-backend impossibility) and a NaN poisons every ``sum``/``max`` it later
+    reaches. A non-finite legacy weight is therefore unusable in exactly the
+    way a non-numeric one is, and is skipped the same way.
+    """
     if weight is None:
         return None
     try:
-        return float(weight)
+        coerced = float(weight)
     except (TypeError, ValueError):
         return None
+    return coerced if math.isfinite(coerced) else None
 
 
 def _estimate_doc_bytes(doc: Any) -> int:
@@ -624,12 +680,13 @@ class MongoDocStatusStorage(DocStatusStorage):
         Single source of the raw -> status construction shared by
         ``get_docs_by_statuses`` and the ``get_full_docs_by_ids`` hydration
         path. Raises ``KeyError``/``TypeError`` on a malformed document
-        (``TypeError`` is what ``DocProcessingStatus(**data)`` raises on
-        missing required fields); the caller decides strict (raise) vs relaxed
-        (skip).
+        (``TypeError`` is what construction raises on missing required
+        fields); the caller decides strict (raise) vs relaxed (skip).
+        Fields the dataclass does not declare are tolerated — see
+        ``DocProcessingStatus.from_stored``.
         """
         data = self._prepare_doc_status_data(doc)
-        return DocProcessingStatus(**data)
+        return DocProcessingStatus.from_stored(data)
 
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
         super().__init__(
@@ -753,12 +810,6 @@ class MongoDocStatusStorage(DocStatusStorage):
             counts[doc["_id"]] = doc["count"]
         return counts
 
-    async def get_docs_by_status(
-        self, status: DocStatus
-    ) -> dict[str, DocProcessingStatus]:
-        """Get all documents with a specific status"""
-        return await self.get_docs_by_statuses([status])
-
     async def get_docs_by_statuses(
         self, statuses: list[DocStatus], strict: bool = False
     ) -> dict[str, DocProcessingStatus]:
@@ -799,12 +850,19 @@ class MongoDocStatusStorage(DocStatusStorage):
         result = await cursor.to_list()
         processed_result = {}
         for doc in result:
+            doc_id_hint = doc.get("_id", "<unknown>") if doc else "<unknown>"
             try:
-                data = self._prepare_doc_status_data(doc)
-                processed_result[doc["_id"]] = DocProcessingStatus(**data)
-            except KeyError as e:
+                processed_result[doc["_id"]] = (
+                    self._mongo_doc_processing_status_from_doc(doc)
+                )
+            except (KeyError, TypeError) as e:
+                # TypeError, not just KeyError: DocProcessingStatus is a
+                # dataclass, so a row missing a required field (or carrying an
+                # unknown one) raises TypeError. Catching KeyError alone left
+                # the real failure uncaught and crashed the whole listing.
                 logger.error(
-                    f"[{self.workspace}] Missing required field for document {doc['_id']}: {e}"
+                    f"[{self.workspace}] Missing required field for document "
+                    f"{doc_id_hint}: {e}"
                 )
                 continue
         return processed_result
@@ -995,7 +1053,8 @@ class MongoDocStatusStorage(DocStatusStorage):
             status_filter: Filter by document status, None for all statuses
             page: Page number (1-based)
             page_size: Number of documents per page (10-200)
-            sort_field: Field to sort by ('created_at', 'updated_at', '_id')
+            sort_field: Field to sort by ('created_at', 'updated_at', 'id', 'file_path').
+                The legacy '_id' alias is also accepted.
             sort_direction: Sort direction ('asc' or 'desc')
 
         Returns:
@@ -1013,6 +1072,9 @@ class MongoDocStatusStorage(DocStatusStorage):
             page_size = 10
         elif page_size > 200:
             page_size = 200
+
+        if sort_field == "id":
+            sort_field = "_id"
 
         if sort_field not in ["created_at", "updated_at", "_id", "file_path"]:
             sort_field = "updated_at"
@@ -1063,7 +1125,7 @@ class MongoDocStatusStorage(DocStatusStorage):
 
                 data = self._prepare_doc_status_data(doc)
 
-                doc_status = DocProcessingStatus(**data)
+                doc_status = DocProcessingStatus.from_stored(data)
                 documents.append((doc_id, doc_status))
             except KeyError as e:
                 logger.error(
@@ -1792,6 +1854,13 @@ class MongoGraphStorage(BaseGraphStorage):
     async def create_edge_indexes_and_migrate_if_not_exists(self) -> None:
         """Create the compound unique edge-endpoint index, migrating legacy edges first.
 
+        Also ensures the ``source_node_id``/``target_node_id`` single-field
+        indexes that back ``node_degree``/``node_degrees_batch``/
+        ``get_node_edges``/``get_nodes_edges_batch`` exist, independently of
+        the migration below and on every call (idempotent) — so an
+        already-migrated deployment still picks them up. Best-effort: unlike
+        the migration, a failure there is logged and does not abort startup.
+
         Fail-fast one-time migration (mirrors the OpenSearch canonical-id work):
 
           1. dedupe legacy reciprocal duplicate docs, **merging the full relation
@@ -1823,7 +1892,69 @@ class MongoGraphStorage(BaseGraphStorage):
 
         indexes_cursor = await self.edge_collection.list_indexes()
         existing_indexes = await indexes_cursor.to_list(length=None)
-        if any(idx.get("name") == index_name for idx in existing_indexes):
+        existing_index_names = {idx.get("name", "") for idx in existing_indexes}
+        # Fields already covered by a single-field index. Index options are not
+        # inspected: a hand-added collation or partial index the planner can't
+        # use for these lookups would still skip creation below.
+        single_field_indexed = {
+            next(iter(idx["key"]))
+            for idx in existing_indexes
+            if isinstance(idx.get("key"), dict) and len(idx["key"]) == 1
+        }
+
+        # Best-effort only -- these two indexes are a performance optimization,
+        # not required for correctness (unlike the compound migration below).
+        # Check by field, not by our own name: an index on the same field can
+        # already exist under a different name (e.g. Mongo's own default
+        # "source_node_id_1", from a DBA-added index), and creating a
+        # same-field index under a new name raises IndexKeySpecsConflict.
+        # Catch PyMongoError too (e.g. a restricted service account without
+        # createIndex privilege) so a failure here logs and moves on instead
+        # of aborting initialize()/startup, mirroring the doc-status index
+        # creation above.
+        source_index_name = f"{workspace_prefix}source_node_id"
+        target_index_name = f"{workspace_prefix}target_node_id"
+        if (
+            "source_node_id" not in single_field_indexed
+            or "target_node_id" not in single_field_indexed
+        ):
+            # create_index() awaits the build's commit, and this runs inside
+            # get_data_init_lock, so the first startup after upgrading onto
+            # this code blocks here until the build finishes -- on a
+            # collection with tens of millions of edges that can look like a
+            # hang rather than a one-time index build. Logged unconditionally
+            # (not just on a slow-build heuristic) since there's no cheap way
+            # to know the collection size in advance.
+            logger.info(
+                f"[{self.workspace}] Creating source_node_id/target_node_id "
+                f"indexes on {self._edge_collection_name}; this may take a "
+                "while on large collections and blocks startup until it "
+                "completes"
+            )
+        if "source_node_id" not in single_field_indexed:
+            try:
+                await self.edge_collection.create_index(
+                    [("source_node_id", 1)], name=source_index_name
+                )
+            except PyMongoError as e:
+                logger.warning(
+                    f"[{self.workspace}] Could not create source_node_id index on "
+                    f"{self._edge_collection_name}: {e}. Queries filtering by "
+                    "source_node_id will fall back to a collection scan."
+                )
+        if "target_node_id" not in single_field_indexed:
+            try:
+                await self.edge_collection.create_index(
+                    [("target_node_id", 1)], name=target_index_name
+                )
+            except PyMongoError as e:
+                logger.warning(
+                    f"[{self.workspace}] Could not create target_node_id index on "
+                    f"{self._edge_collection_name}: {e}. Queries filtering by "
+                    "target_node_id will fall back to a collection scan."
+                )
+
+        if index_name in existing_index_names:
             logger.info(
                 f"[{self.workspace}] Edge collection {self._edge_collection_name} "
                 f"already on canonical edge endpoints; skipping migration"
@@ -1873,7 +2004,9 @@ class MongoGraphStorage(BaseGraphStorage):
         ``description`` are unioned over their ``GRAPH_FIELD_SEP`` components,
         ``keywords`` are comma-set-unioned, and ``weight`` is **summed** (like
         ``_merge_edges_then_upsert`` — duplicate docs carry separate accumulated
-        weight).
+        weight) then floored to the merged evidence count, so a duplicate with
+        new source_ids but a missing/non-numeric legacy weight cannot leave the
+        result under its own evidence count.
 
         The merge is **idempotent across retries**: if a transient error aborts
         startup after the survivor update but before the delete, the next run
@@ -1985,8 +2118,32 @@ class MongoGraphStorage(BaseGraphStorage):
                 set_fields["description"] = GRAPH_FIELD_SEP.join(all_descriptions)
             if all_keywords:
                 set_fields["keywords"] = ",".join(sorted(all_keywords))
-            if weights:
-                set_fields["weight"] = sum(weights)
+            # A duplicate can contribute new source_ids while carrying a
+            # missing/non-numeric weight (skipped above), which would otherwise
+            # let the summed weight fall below the merged evidence count -- or,
+            # if every doc lacked a coercible weight, leave "weight" unset even
+            # though source_ids just grew. Floor the sum to the evidence count,
+            # per the relation weight contract, whichever a plain sum misses.
+            #
+            # The floor is computed from `relation_evidence_count` rather than
+            # through `apply_relation_weight_floor`, which validates the whole
+            # relation the way a caller ingress does: a legacy `source_id` no
+            # backend can store (an XML-incompatible character, say) would abort
+            # this one-time migration over a row it is supposed to carry
+            # through. Counting evidence needs no such validation.
+            evidence_count = relation_evidence_count(set_fields.get("source_id", ""))
+            if weights or evidence_count:
+                summed_weight = sum(weights) if weights else 0.0
+                if summed_weight == math.inf:
+                    # Each weight was individually finite (_coerce_weight
+                    # rejects nan/inf inputs), but their sum can still overflow
+                    # past what a graph attribute may hold. Keep the largest
+                    # representable weight instead of collapsing an absurd but
+                    # real magnitude down to the evidence count. Only +inf is
+                    # clamped: a sum of finite floats is never NaN, and -inf is
+                    # absorbed by the evidence floor below.
+                    summed_weight = sys.float_info.max
+                set_fields["weight"] = max(summed_weight, float(evidence_count))
             if set_fields:
                 await self.edge_collection.update_one(
                     {"_id": survivor["_id"]}, {"$set": set_fields}
@@ -2103,6 +2260,12 @@ class MongoGraphStorage(BaseGraphStorage):
     async def node_degree(self, node_id: str) -> int:
         """
         Returns the total number of edges connected to node_id (both inbound and outbound).
+
+        One count, not two. A self-loop would be counted once here and twice
+        by ``node_degrees_batch`` below, but the graph is not allowed to hold
+        one (``BaseGraphStorage.node_degree``), so no caller can observe the
+        difference on data the contract admits. Excluding it at the query was
+        measured and rejected -- see the contract for what it cost.
         """
         return await self.edge_collection.count_documents(
             {"$or": [{"source_node_id": node_id}, {"target_node_id": node_id}]}
@@ -2169,8 +2332,27 @@ class MongoGraphStorage(BaseGraphStorage):
 
         Returns:
             list[tuple[str, str]]: List of (source_label, target_label) tuples representing edges
-            None: If no edges found
+            None: If the node does not exist
+
+        An existing node with no relations returns ``[]``, NOT ``None`` — the
+        BaseGraphStorage contract, as implemented by NetworkXStorage. No in-tree
+        caller reads the distinction today (they all guard with ``if edges:``),
+        so this restores the declared contract rather than fixing a live caller;
+        collapsing the two here is what makes the information unrecoverable for
+        a caller that needs it. A backend error is neither value: it propagates.
         """
+        # Existence is decided by the node collection, before the edge scan —
+        # never inferred from the edges. upsert_edge / upsert_edges_batch now
+        # materialize both endpoints, so a dangling target should not arise from
+        # new writes, but rows written before that change still can carry one,
+        # and a read contract must not rest on a write-path invariant anyway.
+        # Inferring existence from the edge scan would make this method
+        # contradict has_node() on the same id, and delete_entity 404s on
+        # has_node(). Checking first also means an absent node costs one indexed
+        # point lookup instead of a full edge scan.
+        if not await self.has_node(source_node_id):
+            return None
+
         cursor = self.edge_collection.find(
             {
                 "$or": [
@@ -2195,35 +2377,194 @@ class MongoGraphStorage(BaseGraphStorage):
 
     async def node_degrees_batch(self, node_ids: list[str]) -> dict[str, int]:
         # merge the outbound and inbound results with the same "_id" and sum the "degree"
-        merged_results = {}
+        # Seeded with zeros so every requested id gets an answer: a node with no
+        # edges contributes no row to either aggregation, and the batch must
+        # still report the 0 node_degree reports rather than omitting the key.
+        merged_results = {nid: 0 for nid in node_ids}
 
-        # Outbound degrees
-        outbound_pipeline = [
-            {"$match": {"source_node_id": {"$in": node_ids}}},
-            {"$group": {"_id": "$source_node_id", "degree": {"$sum": 1}}},
-        ]
-
-        cursor = await self.edge_collection.aggregate(
-            outbound_pipeline, allowDiskUse=True
+        # Chunk the $in list so one hub with a huge neighbor set (an unbounded
+        # caller, e.g. edge_degrees_batch below) can't inflate a single command
+        # document past MongoDB's 16MB limit or force the planner through a
+        # huge index-bounds list -- the same hazard
+        # _GRAPH_DEGREE_RANK_MAX_CANDIDATES caps at the BFS call site, fixed
+        # here at the shared primitive so every caller is covered. Byte budget
+        # (_GRAPH_BATCH_QUERY_MAX_PAYLOAD_BYTES) is the primary limiter,
+        # _NODE_DEGREES_BATCH_CHUNK_SIZE stays as a secondary record-count cap
+        # so the already-bounded BFS call site still fits in one chunk. Each
+        # chunk merges into merged_results as a whole, via a fresh local dict,
+        # so it's correct regardless of dedupe or how ids are split across chunks.
+        unique_node_ids = list(dict.fromkeys(node_ids))
+        id_batches = _chunk_by_budget(
+            unique_node_ids,
+            _estimate_doc_bytes,
+            _GRAPH_BATCH_QUERY_MAX_PAYLOAD_BYTES,
+            _NODE_DEGREES_BATCH_CHUNK_SIZE,
         )
-        async for doc in cursor:
-            merged_results[doc.get("_id")] = doc.get("degree")
+        if len(id_batches) > 1:
+            logger.info(
+                f"[{self.workspace}] node_degrees_batch: $in split into "
+                f"{len(id_batches)} batches for {len(unique_node_ids)} ids"
+            )
 
-        # Inbound degrees
-        inbound_pipeline = [
-            {"$match": {"target_node_id": {"$in": node_ids}}},
-            {"$group": {"_id": "$target_node_id", "degree": {"$sum": 1}}},
-        ]
+        async def _outbound_degrees(chunk: list[str]) -> dict[str, int]:
+            outbound_pipeline = [
+                {"$match": {"source_node_id": {"$in": chunk}}},
+                {"$group": {"_id": "$source_node_id", "degree": {"$sum": 1}}},
+            ]
+            cursor = await self.edge_collection.aggregate(
+                outbound_pipeline, allowDiskUse=True
+            )
+            return {doc.get("_id"): doc.get("degree") async for doc in cursor}
 
-        cursor = await self.edge_collection.aggregate(
-            inbound_pipeline, allowDiskUse=True
-        )
-        async for doc in cursor:
-            merged_results[doc.get("_id")] = merged_results.get(
-                doc.get("_id"), 0
-            ) + doc.get("degree")
+        async def _inbound_degrees(chunk: list[str]) -> dict[str, int]:
+            inbound_pipeline = [
+                {"$match": {"target_node_id": {"$in": chunk}}},
+                {"$group": {"_id": "$target_node_id", "degree": {"$sum": 1}}},
+            ]
+            cursor = await self.edge_collection.aggregate(
+                inbound_pipeline, allowDiskUse=True
+            )
+            inbound: dict[str, int] = {}
+            async for doc in cursor:
+                inbound[doc.get("_id")] = inbound.get(doc.get("_id"), 0) + doc.get(
+                    "degree"
+                )
+            return inbound
+
+        async def _chunk_degrees(
+            chunk: list[str], estimated_bytes: int
+        ) -> dict[str, int]:
+            if (
+                len(chunk) == 1
+                and estimated_bytes > _GRAPH_BATCH_QUERY_MAX_PAYLOAD_BYTES
+            ):
+                logger.warning(
+                    f"[{self.workspace}] node_degrees_batch: single id "
+                    f"{chunk[0]!r} estimated {estimated_bytes} bytes exceeds "
+                    f"{_GRAPH_BATCH_QUERY_MAX_PAYLOAD_BYTES}"
+                )
+
+            outbound = await _outbound_degrees(chunk)
+            inbound = await _inbound_degrees(chunk)
+            chunk_degrees = dict(outbound)
+            for node_id, degree in inbound.items():
+                chunk_degrees[node_id] = chunk_degrees.get(node_id, 0) + degree
+            return chunk_degrees
+
+        for chunk, estimated_bytes in id_batches:
+            chunk_degrees = await _chunk_degrees(chunk, estimated_bytes)
+            merged_results.update(chunk_degrees)
 
         return merged_results
+
+    async def edge_degrees_batch(
+        self, edge_pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], int]:
+        """
+        Calculate the combined degree for each edge (sum of the source and target node degrees)
+        in batch using the already implemented node_degrees_batch.
+
+        Args:
+            edge_pairs: List of (source_node_id, target_node_id) tuples
+
+        Returns:
+            Dictionary mapping edge tuples to their combined degrees
+        """
+        if not edge_pairs:
+            return {}
+
+        # Node degrees are already batched; sum them locally instead of
+        # issuing one edge_degree() round-trip per pair.
+        node_ids = {node_id for pair in edge_pairs for node_id in pair}
+        degrees = await self.node_degrees_batch(list(node_ids))
+
+        result = {}
+        for src_id, tgt_id in edge_pairs:
+            result[(src_id, tgt_id)] = degrees.get(src_id, 0) + degrees.get(tgt_id, 0)
+        return result
+
+    async def get_edges_batch(
+        self, pairs: list[dict[str, str]]
+    ) -> dict[tuple[str, str], dict]:
+        """
+        Retrieve edge properties for multiple (src, tgt) pairs in one query.
+
+        Args:
+            pairs: List of dictionaries, e.g. [{"src": "node1", "tgt": "node2"}, ...]
+
+        Returns:
+            A dictionary mapping existing (src, tgt) tuples to their edge
+            properties. Missing pairs are omitted.
+        """
+        if not pairs:
+            return {}
+
+        # Map canonical (edge_lo, edge_hi) back to the requested (src, tgt)
+        # direction, since multiple requested pairs can share one canonical edge.
+        canonical_to_requested: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for pair in pairs:
+            src_id = pair["src"]
+            tgt_id = pair["tgt"]
+            canonical = _canonical_edge_endpoints(src_id, tgt_id)
+            canonical_to_requested.setdefault(canonical, []).append((src_id, tgt_id))
+
+        # Chunk the $or so a large batch (e.g. purging a document with many
+        # relations) stays under the 16MB query limit instead of building one
+        # unbounded $or. Byte budget (_GRAPH_BATCH_QUERY_MAX_PAYLOAD_BYTES) is
+        # the primary limiter -- endpoint strings are not length-bounded (see
+        # that constant's comment), so a pure item-count cap alone can't
+        # bound BSON size. _GET_EDGES_BATCH_CHUNK_SIZE (matching
+        # postgres_impl.get_edges_batch's own batch_size default) stays as a
+        # secondary record-count cap.
+        canonical_pairs = list(canonical_to_requested)
+
+        result = {}
+        pair_batches = _chunk_by_budget(
+            canonical_pairs,
+            lambda pair: _estimate_doc_bytes({"edge_lo": pair[0], "edge_hi": pair[1]}),
+            _GRAPH_BATCH_QUERY_MAX_PAYLOAD_BYTES,
+            _GET_EDGES_BATCH_CHUNK_SIZE,
+        )
+        if len(pair_batches) > 1:
+            logger.info(
+                f"[{self.workspace}] get_edges_batch: $or split into "
+                f"{len(pair_batches)} batches for {len(canonical_pairs)} pairs"
+            )
+
+        async def _fetch_batch(
+            batch: list[tuple[str, str]], estimated_bytes: int
+        ) -> list[dict]:
+            if (
+                len(batch) == 1
+                and estimated_bytes > _GRAPH_BATCH_QUERY_MAX_PAYLOAD_BYTES
+            ):
+                logger.warning(
+                    f"[{self.workspace}] get_edges_batch: single pair "
+                    f"edge_lo={batch[0][0]!r} edge_hi={batch[0][1]!r} "
+                    f"estimated {estimated_bytes} bytes exceeds "
+                    f"{_GRAPH_BATCH_QUERY_MAX_PAYLOAD_BYTES}"
+                )
+            cursor = self.edge_collection.find(
+                {
+                    "$or": [
+                        {"edge_lo": edge_lo, "edge_hi": edge_hi}
+                        for edge_lo, edge_hi in batch
+                    ]
+                }
+            )
+            return [doc async for doc in cursor]
+
+        for batch, estimated_bytes in pair_batches:
+            docs = await _fetch_batch(batch, estimated_bytes)
+            for doc in docs:
+                doc.pop("_id", None)
+                canonical = (doc["edge_lo"], doc["edge_hi"])
+                # Independent dict per requested direction: two requested pairs
+                # can share one canonical edge, and callers (e.g. purge) mutate
+                # the per-pair dict in place, so it must not be the same object.
+                for src_id, tgt_id in canonical_to_requested.get(canonical, []):
+                    result[(src_id, tgt_id)] = dict(doc)
+        return result
 
     async def get_nodes_edges_batch(
         self, node_ids: list[str]
@@ -2241,6 +2582,11 @@ class MongoGraphStorage(BaseGraphStorage):
             For each node, the list includes both:
             - Outgoing edges: (queried_node, connected_node)
             - Incoming edges: (connected_node, queried_node)
+
+        A self-loop appears ONCE: it matches both the outbound and the inbound
+        query, and listing it from each would report one edge as two
+        (``BaseGraphStorage.get_node_edges``, and this class's own
+        ``get_node_edges``, which returns it once).
         """
         result = {node_id: [] for node_id in node_ids}
 
@@ -2262,7 +2608,11 @@ class MongoGraphStorage(BaseGraphStorage):
         async for edge in incoming_cursor:
             source = edge["source_node_id"]
             target = edge["target_node_id"]
-            result[target].append((source, target))
+            # A self-loop was already listed by the outbound pass above (its
+            # source is the same requested id), so skip it here -- one edge,
+            # one tuple. Same guard as pgtable_impl.get_nodes_edges_batch.
+            if target != source:
+                result[target].append((source, target))
 
         return result
 
@@ -2272,10 +2622,62 @@ class MongoGraphStorage(BaseGraphStorage):
     # -------------------------------------------------------------------------
     #
 
+    # MongoDB owns ``_id``: it is the node/edge document key and this class uses
+    # it as the update *filter*, so a caller-supplied ``_id`` in the attribute
+    # mapping is never an attribute -- it is an attempt to move the document.
+    # No legacy exposure: ``get_node`` / ``get_edge`` already strip ``_id`` for
+    # exactly this reason, so a rewrite never carries it back in.
+    # (``source_node_id`` / ``target_node_id`` / ``edge_lo`` / ``edge_hi`` need no
+    # entry here: ``upsert_edge`` assigns them *after* spreading the caller's
+    # mapping, so a supplied value is discarded by construction.)
+    _RESERVED_ATTRIBUTE_NAMES = frozenset({"_id"})
+
+    def _validate_attribute_names(self, attributes: dict, *, context: str) -> None:
+        """Reject attribute names MongoDB would interpret rather than store.
+
+        Attribute names reach the server inside a ``$set`` document, where they
+        are *field paths*: a dot addresses a subfield, so ``{"source_ids.0": x}``
+        rewrites the first element of the chunk-attribution array instead of
+        creating a field called ``source_ids.0``, and a leading ``$`` is read as
+        an update operator. Unlike the value rules, this hazard is specific to
+        this backend -- see ``validate_interpreted_attribute_names``.
+
+        Characters are deliberately not checked: MongoDB stores a name holding a
+        control character just fine, so rejecting one here would be a rule wider
+        than this backend's hazard. That character rule belongs to the
+        GraphML-backed store, which genuinely cannot serialize such a name.
+
+        Safe against pre-existing data despite rewrite paths spreading stored
+        attributes back into the payload: the two refused shapes cannot come
+        *out* of this collection. A legacy ``{"a.b": v}`` was interpreted as a
+        path when it was written, so the document holds ``{"a": {"b": v}}`` and
+        ``get_node`` returns the key ``a``; a ``$``-prefixed name was refused by
+        the server outright. That is also why the rule stops at the
+        interpretation hazard -- a merely unusual name such as ``display-name``
+        *is* stored flat and does round-trip, so rejecting it would strand the
+        entity.
+        """
+        validate_interpreted_attribute_names(attributes, context=context)
+        reserved = sorted(self._RESERVED_ATTRIBUTE_NAMES.intersection(attributes))
+        if reserved:
+            raise ValueError(
+                f"{context}: attribute name(s) {', '.join(reserved)} are reserved "
+                "by MongoDB and cannot be set as graph attributes"
+            )
+
+    def _node_context(self, node_id: str) -> str:
+        """Error-message prefix identifying a node write."""
+        return f"[{self.workspace}] node `{node_id}`"
+
+    def _edge_context(self, source_node_id: str, target_node_id: str) -> str:
+        """Error-message prefix identifying an edge write."""
+        return f"[{self.workspace}] edge `{source_node_id}`~`{target_node_id}`"
+
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         """
         Insert or update a node document.
         """
+        self._validate_attribute_names(node_data, context=self._node_context(node_id))
         update_doc = {"$set": {**node_data}}
         if node_data.get("source_id", ""):
             update_doc["$set"]["source_ids"] = node_data["source_id"].split(
@@ -2295,15 +2697,40 @@ class MongoGraphStorage(BaseGraphStorage):
         writers race the first insert, the loser hits a ``DuplicateKeyError``; we
         retry once, which now matches the just-inserted doc and updates it.
         """
-        # Ensure source node exists
-        await self.upsert_node(source_node_id, {})
+        # Materialize BOTH endpoints, not just the source. A target-only
+        # endpoint would otherwise carry edges with no node document, and that
+        # dangling state is externally visible: has_node() says absent while the
+        # edge scan says connected, get_popular_labels ranks an id get_node
+        # returns nothing for, and delete_entity 404s on an entity whose edges
+        # are right there. NetworkXStorage.add_edge and PGOpsGraphStorage both
+        # create both ends; this makes the document backends agree.
+        #
+        # One bulk_write instead of two round trips, and $setOnInsert (the form
+        # upsert_edges_batch already uses) so an endpoint that already carries
+        # real properties is never touched. dict.fromkeys collapses a self-loop.
+        # Snapshot before validating, and build the update from the snapshot
+        # below. The endpoint bulk_write awaits between the check and the use, so
+        # validating the caller's own mapping would leave a window in which a
+        # caller that retains it could add a field path such as ``source_ids.0``
+        # after the check. (This also subsumes the "copy so we never mutate the
+        # caller's dict" reason the copy below already existed for.)
+        edge_attributes = dict(edge_data)
+        self._validate_attribute_names(
+            edge_attributes, context=self._edge_context(source_node_id, target_node_id)
+        )
+        await self.collection.bulk_write(
+            [
+                UpdateOne({"_id": nid}, {"$setOnInsert": {"_id": nid}}, upsert=True)
+                for nid in dict.fromkeys((source_node_id, target_node_id))
+            ],
+            ordered=False,
+        )
 
         edge_lo, edge_hi = _canonical_edge_endpoints(source_node_id, target_node_id)
 
-        # Copy so we never mutate the caller's edge_data dict.
-        set_doc: dict = {**edge_data}
-        if edge_data.get("source_id", ""):
-            set_doc["source_ids"] = edge_data["source_id"].split(GRAPH_FIELD_SEP)
+        set_doc: dict = dict(edge_attributes)
+        if edge_attributes.get("source_id", ""):
+            set_doc["source_ids"] = edge_attributes["source_id"].split(GRAPH_FIELD_SEP)
         set_doc["source_node_id"] = source_node_id
         set_doc["target_node_id"] = target_node_id
         set_doc["edge_lo"] = edge_lo
@@ -2333,6 +2760,9 @@ class MongoGraphStorage(BaseGraphStorage):
             return
         ops: list[tuple[Any, int, str]] = []
         for node_id, node_data in nodes:
+            self._validate_attribute_names(
+                node_data, context=self._node_context(node_id)
+            )
             update_doc: dict = {"$set": {**node_data}}
             if node_data.get("source_id", ""):
                 update_doc["$set"]["source_ids"] = node_data["source_id"].split(
@@ -2374,9 +2804,9 @@ class MongoGraphStorage(BaseGraphStorage):
     ) -> None:
         """Batch insert/update multiple edges using a single bulk_write() call.
 
-        Also ensures source nodes exist (matching upsert_edge() behaviour) via a
-        separate bulk_write on the node collection for any source nodes that need
-        to be created as empty placeholders.
+        Also ensures BOTH endpoints of every edge exist (matching upsert_edge()
+        behaviour) via a separate bulk_write on the node collection for any
+        endpoint that needs to be created as an empty placeholder.
 
         Args:
             edges: List of (source_node_id, target_node_id, edge_data) tuples.
@@ -2384,15 +2814,35 @@ class MongoGraphStorage(BaseGraphStorage):
         if not edges:
             return
 
-        # Ensure all source nodes exist (mirrors upsert_edge's upsert_node call)
-        source_node_ids = list(dict.fromkeys(src for src, _tgt, _data in edges))
+        # Whole batch first: the endpoint-placeholder bulk_write below happens
+        # before any edge document is written, so rejecting mid-loop would leave
+        # placeholder nodes behind for edges that were never created.
+        #
+        # Snapshot each mapping as it is validated and use the snapshots for the
+        # documents built after the placeholder await -- see upsert_edge for the
+        # window that closes.
+        validated_edges: list[tuple[str, str, dict]] = []
+        for src, tgt, edge_data in edges:
+            edge_attributes = dict(edge_data)
+            self._validate_attribute_names(
+                edge_attributes, context=self._edge_context(src, tgt)
+            )
+            validated_edges.append((src, tgt, edge_attributes))
+
+        # Both endpoints, not just the source — see upsert_edge for why a
+        # target-only endpoint is externally visible as an inconsistency.
+        endpoint_ids = list(
+            dict.fromkeys(
+                node_id for src, tgt, _data in edges for node_id in (src, tgt)
+            )
+        )
         node_ops: list[tuple[Any, int, str]] = [
             (
-                UpdateOne({"_id": src}, {"$setOnInsert": {"_id": src}}, upsert=True),
-                _estimate_doc_bytes({"_id": src}),
-                src,
+                UpdateOne({"_id": nid}, {"$setOnInsert": {"_id": nid}}, upsert=True),
+                _estimate_doc_bytes({"_id": nid}),
+                nid,
             )
-            for src in source_node_ids
+            for nid in endpoint_ids
         ]
         await _run_batched_bulk_write(
             self.collection,
@@ -2401,7 +2851,7 @@ class MongoGraphStorage(BaseGraphStorage):
             max_records_per_batch=self._max_upsert_records_per_batch,
             ordered=False,
             log_prefix=f"[{self.workspace}] {self.namespace} edges:",
-            what="source-node placeholder upsert",
+            what="edge endpoint placeholder upsert",
         )
 
         # Key every edge by its canonical (edge_lo, edge_hi) pair and dedupe
@@ -2410,10 +2860,10 @@ class MongoGraphStorage(BaseGraphStorage):
         # and avoids an intra-batch duplicate-key error from two ops inserting
         # the same endpoint pair.
         deduped_ops: dict[tuple[str, str], tuple[Any, int, str]] = {}
-        for source_node_id, target_node_id, edge_data in edges:
-            update_doc: dict = {"$set": {**edge_data}}
-            if edge_data.get("source_id", ""):
-                update_doc["$set"]["source_ids"] = edge_data["source_id"].split(
+        for source_node_id, target_node_id, edge_attributes in validated_edges:
+            update_doc: dict = {"$set": dict(edge_attributes)}
+            if edge_attributes.get("source_id", ""):
+                update_doc["$set"]["source_ids"] = edge_attributes["source_id"].split(
                     GRAPH_FIELD_SEP
                 )
             update_doc["$set"]["source_node_id"] = source_node_id
@@ -2518,6 +2968,20 @@ class MongoGraphStorage(BaseGraphStorage):
             labels.append(doc["_id"])
         return labels
 
+    async def iter_labels(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        pipeline = [{"$project": {"_id": 1}}, {"$sort": {"_id": 1}}]
+        cursor = await self.collection.aggregate(pipeline, allowDiskUse=True)
+        batch: list[str] = []
+        async for doc in cursor:
+            batch.append(doc["_id"])
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
     def _construct_graph_node(
         self, node_id, node_data: dict[str, str]
     ) -> KnowledgeGraphNode:
@@ -2572,6 +3036,83 @@ class MongoGraphStorage(BaseGraphStorage):
             docs_by_id[str(doc["_id"])] = doc
         return [docs_by_id[node_id] for node_id in node_ids if node_id in docs_by_id]
 
+    async def _rank_edge_endpoints_by_degree(
+        self, limit: int, skip: int = 0
+    ) -> list[str]:
+        """Rank edge endpoints by undirected degree, ties on the label ascending.
+
+        Paged rather than fetched whole because the ``$limit`` runs server-side:
+        the caller cannot tell how many of a page really have node documents
+        until it has fetched them, so it needs a way to ask for the next ones.
+        The sort is a TOTAL order -- degree descending, then the unique ``_id``
+        -- which is what makes ``$skip`` paging over it stable across passes.
+        """
+        if limit <= 0:
+            return []
+
+        pipeline: list[dict[str, Any]] = [
+            {"$project": {"source_node_id": 1, "_id": 0}},
+            {"$group": {"_id": "$source_node_id", "degree": {"$sum": 1}}},
+            {
+                "$unionWith": {
+                    "coll": self._edge_collection_name,
+                    "pipeline": [
+                        {"$project": {"target_node_id": 1, "_id": 0}},
+                        {
+                            "$group": {
+                                "_id": "$target_node_id",
+                                "degree": {"$sum": 1},
+                            }
+                        },
+                    ],
+                }
+            },
+            {"$group": {"_id": "$_id", "degree": {"$sum": "$degree"}}},
+            # Degree descending, then label ascending. The tie-break is the
+            # BaseGraphStorage contract: $limit cuts a band of equal-degree
+            # entities, and without a second sort key which ones survive is
+            # whatever order the aggregation happens to emit.
+            {"$sort": {"degree": -1, "_id": 1}},
+        ]
+        if skip:
+            pipeline.append({"$skip": skip})
+        pipeline.append({"$limit": limit})
+
+        cursor = await self.edge_collection.aggregate(pipeline, allowDiskUse=True)
+        return [str(doc["_id"]) async for doc in cursor]
+
+    async def _accept_existing_nodes(
+        self,
+        candidate_ids: list[str],
+        limit: int,
+        result: KnowledgeGraph,
+        accepted: list[str],
+    ) -> None:
+        """Append the candidates that really have node documents, up to `limit`.
+
+        ``_fetch_nodes_by_ids`` preserves the requested order and drops ids with
+        no document, so consuming it in order preserves the ranking and never
+        lets an id that resolves to nothing occupy a slot.
+
+        Asks for the current shortfall first and for the remainder only if that
+        did not fill it, so at most two queries: the caller passes whole ranked
+        pages, and filling the handful of slots a few dangling ids vacated must
+        not pull a page of node documents to place a few nodes.
+        """
+        if not candidate_ids or len(accepted) >= limit:
+            return
+
+        head = candidate_ids[: limit - len(accepted)]
+        for chunk in (head, candidate_ids[len(head) :]):
+            if not chunk or len(accepted) >= limit:
+                break
+            docs = await self._fetch_nodes_by_ids(chunk, {"source_ids": 0})
+            for doc in docs:
+                if len(accepted) >= limit:
+                    break
+                accepted.append(str(doc["_id"]))
+                result.nodes.append(self._construct_graph_node(doc["_id"], doc))
+
     async def get_knowledge_graph_all_by_degree(
         self, max_depth: int, max_nodes: int
     ) -> KnowledgeGraph:
@@ -2586,49 +3127,65 @@ class MongoGraphStorage(BaseGraphStorage):
 
         result.is_truncated = total_node_count > max_nodes
         if result.is_truncated:
-            # Get all node_ids ranked by degree if max_nodes exceeds total node count
-            pipeline = [
-                {"$project": {"source_node_id": 1, "_id": 0}},
-                {"$group": {"_id": "$source_node_id", "degree": {"$sum": 1}}},
-                {
-                    "$unionWith": {
-                        "coll": self._edge_collection_name,
-                        "pipeline": [
-                            {"$project": {"target_node_id": 1, "_id": 0}},
-                            {
-                                "$group": {
-                                    "_id": "$target_node_id",
-                                    "degree": {"$sum": 1},
-                                }
-                            },
-                        ],
-                    }
-                },
-                {"$group": {"_id": "$_id", "degree": {"$sum": "$degree"}}},
-                {"$sort": {"degree": -1}},
-                {"$limit": max_nodes},
-            ]
-            cursor = await self.edge_collection.aggregate(pipeline, allowDiskUse=True)
-
-            node_ids = []
-            async for doc in cursor:
-                node_id = str(doc["_id"])
-                node_ids.append(node_id)
+            # The ranked ids are edge ENDPOINTS, and upsert_edge only guarantees
+            # the source node exists, so one can be a dangling id with no node
+            # document -- a legacy state this backend deliberately tolerates
+            # (see the traversal, which counts only documents it actually read).
+            # Taking the $limit as final let such an id consume a slot and the
+            # answer came back short, reachable as soon as ties break on the
+            # label because a dangling label sorts like any other.
+            # Page the band until the cap fills or the band runs out, so a
+            # vacated slot always goes to the next-ranked entry. The loop is
+            # what keeps the top-up below meaning what it says: it is reachable
+            # only once every edge-backed entity has been offered a slot, so
+            # everything it can still pick really is degree-0. Stopping earlier
+            # would let an isolate outrank an entity further down the band --
+            # only ONE dangling id in this page plus one in the next is enough
+            # to reach that, so it is not a corner.
+            #
+            # Whole pages, not shortfall-sized ones: a page is {_id, degree}
+            # rows, cheap next to the aggregation that produces it, so each
+            # extra pass should make as much progress as it can. The document
+            # fetch inside _accept_existing_nodes stays shortfall-sized.
+            node_ids: list[str] = []
+            skip = 0
+            while len(node_ids) < max_nodes:
+                ranked_page = await self._rank_edge_endpoints_by_degree(
+                    max_nodes, skip=skip
+                )
+                skip += len(ranked_page)
+                await self._accept_existing_nodes(
+                    ranked_page, max_nodes, result, node_ids
+                )
+                if len(ranked_page) < max_nodes:
+                    break  # short page: the band is exhausted
 
             if len(node_ids) < max_nodes:
+                # Top up from the isolated (degree-0) entities, in label order
+                # for the same reason the ranking above breaks ties on the
+                # label: an unordered `find` handed the shortfall to whichever
+                # documents the collection scan reached first. These come from
+                # the node collection, so they exist by construction and are
+                # appended directly. list(node_ids), not node_ids: the cursor is
+                # consumed while appending to the same list, and a live
+                # reference makes the $nin filter depend on when it serializes.
                 remaining = max_nodes - len(node_ids)
-                cursor = self.collection.find(
-                    {"_id": {"$nin": node_ids}},
-                    {"source_ids": 0},
-                ).limit(remaining)
+                cursor = (
+                    self.collection.find(
+                        {"_id": {"$nin": list(node_ids)}},
+                        {"source_ids": 0},
+                    )
+                    .sort("_id", 1)
+                    .limit(remaining)
+                )
                 async for doc in cursor:
                     node_ids.append(str(doc["_id"]))
+                    result.nodes.append(self._construct_graph_node(doc["_id"], doc))
 
-            docs = await self._fetch_nodes_by_ids(node_ids, {"source_ids": 0})
-            for doc in docs:
-                result.nodes.append(self._construct_graph_node(doc["_id"], doc))
-
-            # As node count reaches the limit, only need to fetch the edges that directly connect to these nodes
+            # As node count reaches the limit, only need to fetch the edges that
+            # directly connect to these nodes. Filtered on the RESOLVED ids: a
+            # dangling endpoint left in here would surface an edge pointing at a
+            # node the response does not contain.
             edge_cursor = self.edge_collection.find(
                 {
                     "$and": [
@@ -2642,7 +3199,6 @@ class MongoGraphStorage(BaseGraphStorage):
             cursor = self.collection.find({}, {"source_ids": 0})
 
             async for doc in cursor:
-                node_id = str(doc["_id"])
                 result.nodes.append(self._construct_graph_node(doc["_id"], doc))
 
             edge_cursor = self.edge_collection.find({})
@@ -2664,18 +3220,50 @@ class MongoGraphStorage(BaseGraphStorage):
         max_depth: int,
         max_nodes: int,
     ) -> KnowledgeGraph:
-        if depth > max_depth or len(result.nodes) > max_nodes:
+        if depth > max_depth:
             return result
 
-        cursor = self.collection.find({"_id": {"$in": node_labels}})
+        # Project away source_ids: ranking materialises the WHOLE level before
+        # the cap can discard any of it (the pre-ranking loop could stop at the
+        # first node past max_nodes), and source_ids is the one unbounded field
+        # on the document. The wildcard path feeds _construct_graph_node from a
+        # {"source_ids": 0} cursor already, so it is provably not needed here.
+        cursor = self.collection.find({"_id": {"$in": node_labels}}, {"source_ids": 0})
 
+        # node_labels can name the same node twice (reached by two edges of the
+        # previous level); a duplicate reaching the admission loop would spend a
+        # second slot and trip the cap on a node that is not new.
+        level_nodes = []
+        level_seen = set()
         async for node in cursor:
             node_id = node["_id"]
-            if node_id not in seen_nodes:
-                seen_nodes.add(node_id)
-                result.nodes.append(self._construct_graph_node(node_id, node))
-                if len(result.nodes) > max_nodes:
-                    return result
+            if node_id in seen_nodes or node_id in level_seen:
+                continue
+            level_seen.add(node_id)
+            level_nodes.append(node)
+
+        # find() answers in natural order, not $in order, so an overflowing
+        # level needs the contract's ranking before the cap reads it. Only an
+        # overflowing level pays: a level that fits is admitted whole, and the
+        # contract binds which nodes survive, not their order.
+        if len(level_nodes) > 1 and len(result.nodes) + len(level_nodes) > max_nodes:
+            level_degrees = await self.node_degrees_batch(
+                [
+                    node["_id"]
+                    for node in level_nodes[:_GRAPH_DEGREE_RANK_MAX_CANDIDATES]
+                ]
+            )
+            level_nodes.sort(
+                key=lambda node: (-level_degrees.get(node["_id"], 0), node["_id"])
+            )
+
+        for node in level_nodes:
+            node_id = node["_id"]
+            if len(result.nodes) >= max_nodes:
+                result.is_truncated = True
+                return result
+            seen_nodes.add(node_id)
+            result.nodes.append(self._construct_graph_node(node_id, node))
 
         # Collect neighbors
         # Get both inbound and outbound one hop nodes
@@ -2817,19 +3405,42 @@ class MongoGraphStorage(BaseGraphStorage):
             key=lambda x: (x["depth"], -x["weight"]),
         )
 
-        # As order matters, we need to use another list to store the node_id
-        # And only take the first max_nodes ones
-        node_ids = []
+        # Dedupe edge endpoints (excluding the start node) preserving the
+        # existing depth/weight priority order.
+        ordered_candidates = []
+        seen_candidates = set()
         for edge in node_edges:
-            if len(node_ids) < max_nodes and edge["source_node_id"] not in seen_nodes:
-                node_ids.append(edge["source_node_id"])
-                seen_nodes.add(edge["source_node_id"])
+            for candidate in (edge["source_node_id"], edge["target_node_id"]):
+                if candidate != node_label and candidate not in seen_candidates:
+                    seen_candidates.add(candidate)
+                    ordered_candidates.append(candidate)
 
-            if len(node_ids) < max_nodes and edge["target_node_id"] not in seen_nodes:
-                node_ids.append(edge["target_node_id"])
-                seen_nodes.add(edge["target_node_id"])
+        # Candidates are raw edge endpoints: upsert_edge only guarantees the
+        # source node exists, not the target, so some candidates may be
+        # dangling (no node document). Resolve real existence in priority
+        # order, in bounded batches, stopping once max_nodes real candidates
+        # are confirmed -- the start node already occupies one of the
+        # max_nodes slots, so only the first max_nodes - 1 real ids end up in
+        # the result, and finding a max_nodes-th real candidate proves
+        # truncation without having to probe the entire reachable set.
+        real_ids = []
+        batch_size = max(max_nodes, 1)
+        for i in range(0, len(ordered_candidates), batch_size):
+            if len(real_ids) >= max_nodes:
+                break
+            batch = ordered_candidates[i : i + batch_size]
+            found_cursor = self.collection.find({"_id": {"$in": batch}}, {"_id": 1})
+            found_ids = {doc["_id"] async for doc in found_cursor}
+            for candidate in batch:
+                if candidate in found_ids:
+                    real_ids.append(candidate)
+                    if len(real_ids) >= max_nodes:
+                        break
 
-        # Filter out all the node whose id is same as node_label so that we do not check existence next step
+        result.is_truncated = len(real_ids) >= max_nodes
+        node_ids = real_ids[: max_nodes - 1]
+        seen_nodes.update(node_ids)
+
         cursor = self.collection.find({"_id": {"$in": node_ids}})
 
         async for doc in cursor:
@@ -3039,6 +3650,22 @@ class MongoGraphStorage(BaseGraphStorage):
             edges.append(edge_dict)
         return edges
 
+    async def iter_edges(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        cursor = self.edge_collection.find({})
+        batch: list[dict] = []
+        async for edge in cursor:
+            item = dict(edge)
+            item["source"] = item.get("source_node_id")
+            item["target"] = item.get("target_node_id")
+            batch.append(item)
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
         """Get popular labels(entity names) by node degree (most connected entities)
 
@@ -3047,9 +3674,23 @@ class MongoGraphStorage(BaseGraphStorage):
 
         Returns:
             List of labels(entity names) sorted by degree (highest first)
+
+        Two phases, and the second one usually does not run. Phase 1 ranks the
+        entities that HAVE edges, straight off the edge collection — the cheap
+        aggregation, and on any graph with more than ``limit`` connected
+        entities it fills every slot on its own. Only when it comes up short
+        does phase 2 top the result up from the isolated (degree-0) entities,
+        which is exactly the case the edge-only ranking got wrong by returning
+        nothing at all for a graph whose entities carry no relations.
+
+        Giving every node a degree-0 baseline row inside the aggregation instead
+        would be simpler, but it forces a full pass over the node collection on
+        every call — on a large graph, to produce a result phase 1 already had.
         """
         try:
-            # Use aggregation pipeline to count edges per node and sort by degree
+            # No self-loop guard: the graph is not allowed to hold one
+            # (BaseGraphStorage.node_degree), and filtering for it here was
+            # measured and rejected.
             pipeline = [
                 # Count outbound edges
                 {"$group": {"_id": "$source_node_id", "out_degree": {"$sum": 1}}},
@@ -3095,13 +3736,35 @@ class MongoGraphStorage(BaseGraphStorage):
                 if doc.get("_id"):
                     labels.append(doc["_id"])
 
+            if len(labels) < limit:
+                # Phase 1 returned fewer than `limit`, and its aggregation is
+                # exact, so the connected set is now known in full: every node
+                # outside it has no edge at all. Top up in label order, bounded
+                # by the shortfall — the sort rides the _id index, so this stops
+                # as soon as it has enough rather than scanning the collection.
+                # list(labels), not labels: the cursor is consumed below while
+                # appending to the same list, and handing the driver a live
+                # reference makes the filter depend on when it serializes.
+                isolated_cursor = (
+                    self.collection.find({"_id": {"$nin": list(labels)}}, {"_id": 1})
+                    .sort("_id", 1)
+                    .limit(limit - len(labels))
+                )
+                async for doc in isolated_cursor:
+                    if doc.get("_id"):
+                        labels.append(doc["_id"])
+
             logger.debug(
                 f"[{self.workspace}] Retrieved {len(labels)} popular labels (limit: {limit})"
             )
             return labels
         except Exception as e:
+            # Raise, never return []: an empty list here is indistinguishable
+            # from "the graph has no entities". /graph/label/popular already
+            # turns an exception into a 500, so swallowing it handed the WebUI a
+            # 200 with an empty entity picker while the database was down.
             logger.error(f"[{self.workspace}] Error getting popular labels: {str(e)}")
-            return []
+            raise
 
     async def _try_atlas_text_search(self, query_strip: str, limit: int) -> list[str]:
         """Try Atlas Search using simple text search."""
@@ -3253,11 +3916,15 @@ class MongoGraphStorage(BaseGraphStorage):
             return labels
 
         except Exception as e:
+            # Last resort in the progressive chain: the Atlas methods are allowed
+            # to fail (they may simply be unavailable) and fall through to here,
+            # but if the regex scan itself fails the search produced no answer at
+            # all. Returning [] would report that as "nothing matched".
             logger.error(f"[{self.workspace}] Regex fallback search failed: {e}")
             import traceback
 
             logger.error(f"[{self.workspace}] Traceback: {traceback.format_exc()}")
-            return []
+            raise
 
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
         """
@@ -3280,8 +3947,10 @@ class MongoGraphStorage(BaseGraphStorage):
                 )
                 return []
         except PyMongoError as e:
+            # A failed count is not "the graph is empty" — that shortcut would
+            # report a transport blip as "no labels match".
             logger.error(f"[{self.workspace}] Error counting nodes: {e}")
-            return []
+            raise
 
         # Progressive search strategy
         search_methods = [
@@ -3467,6 +4136,76 @@ class MongoGraphStorage(BaseGraphStorage):
             return {"status": "error", "message": str(e)}
 
 
+# The embedding-space marker lives in the vector collection's JSON Schema
+# validator ``description``, never in a document. A marker document would be a
+# row in the data collection that every future full-collection scan owes an
+# exclusion; the validator is metadata and owes nothing, and no read path --
+# ``$vectorSearch`` or the ``_id`` / ``src_id`` / ``tgt_id`` finds -- can reach
+# it. See ``docs/design/VectorSpaceProvenance.md``.
+#
+# The prefix is what makes a foreign description unambiguously "not ours"
+# rather than something to be parsed and possibly misread, and it makes the
+# marker legible to an operator running ``db.getCollectionInfos()``.
+_VECTOR_SPACE_DESCRIPTION_PREFIX = "LightRAG embedding space: "
+
+
+def _vector_space_validator(embedding_func, existing: Any = None) -> dict:
+    """``existing`` with this instance's embedding space recorded in it.
+
+    MERGED, never replaced. ``collMod`` takes the whole validator, so writing a
+    bare marker schema would drop every rule an operator put on the collection
+    -- their ``required`` list, their ``properties`` -- from all future writes,
+    silently, on an ordinary ``/documents/clear``. That is the same hazard
+    OpenSearch's ``put_mapping`` has with ``_meta``, and it is answered the same
+    way: read what is there and add to it.
+
+    Only ``$jsonSchema.description`` is taken over, because that is the field
+    the marker lives in. An operator who used it for prose loses that prose;
+    that is the documented cost of this marker home, and it is a far smaller
+    one than losing validation rules. A validator with no ``$jsonSchema`` (a
+    plain query expression) keeps its operators: a validator is an implicit
+    AND, so the added ``$jsonSchema`` sits beside them, and ``bsonType:
+    object`` matches every document, so it rejects nothing on its own.
+    """
+    payload = json.dumps(vector_space_marker(embedding_func), sort_keys=True)
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    schema = merged.get("$jsonSchema")
+    schema = dict(schema) if isinstance(schema, dict) else {}
+    schema.setdefault("bsonType", "object")
+    schema["description"] = _VECTOR_SPACE_DESCRIPTION_PREFIX + payload
+    merged["$jsonSchema"] = schema
+    return merged
+
+
+def _read_validator_vector_space(validator: Any) -> tuple[str | None, int | None]:
+    """Extract ``(model, dim)`` from a stored validator, or ``(None, None)``.
+
+    Every way this can fail reads as "not recorded": no validator, a validator
+    written by something other than LightRAG, a truncated or hand-edited
+    payload. A marker we cannot read is not evidence of a mismatch.
+    """
+    if not isinstance(validator, dict):
+        return None, None
+    description = (validator.get("$jsonSchema") or {}).get("description")
+    if not isinstance(description, str) or not description.startswith(
+        _VECTOR_SPACE_DESCRIPTION_PREFIX
+    ):
+        return None, None
+    try:
+        payload = json.loads(description[len(_VECTOR_SPACE_DESCRIPTION_PREFIX) :])
+    except ValueError:
+        return None, None
+    return read_vector_space_marker(payload)
+
+
+async def _read_collection_validator(db: AsyncDatabase, name: str) -> Any:
+    """The validator currently stored on ``name``, or ``None``."""
+    cursor = await db.list_collections(filter={"name": name})
+    for info in await cursor.to_list(length=1):
+        return (info.get("options") or {}).get("validator")
+    return None
+
+
 @dataclass
 class _PendingVectorDoc:
     """Buffered vector upsert waiting for embedding and/or bulk flush."""
@@ -3568,11 +4307,34 @@ class MongoVectorDBStorage(BaseVectorStorage):
         self._flush_lock = None
 
     async def initialize(self):
+        """Attach to the vector collection, refusing a foreign embedding space.
+
+        The flush lock is taken FIRST, before anything that can refuse. A
+        storage that raises ``VectorSpaceMismatchError`` below must stay able to
+        serve ``drop()``, because dropping and re-provisioning the collection is
+        how ``lightrag-rebuild-vdb`` clears that refusal; taking the lock after
+        the gate would leave ``_flush_lock`` at ``None`` on the refusal path and
+        ``drop()`` would die on ``async with None``. See
+        ``docs/design/VectorSpaceProvenance.md``.
+        """
+        if self._flush_lock is None:
+            self._flush_lock = get_namespace_lock(
+                namespace=self.final_namespace, workspace=""
+            )
         async with get_data_init_lock():
             if self.db is None:
                 self.db = await ClientManager.get_client()
 
-            self._data = await get_or_create_collection(self.db, self._collection_name)
+            # A collection created here carries this instance's embedding-space
+            # marker; an existing one keeps whatever it has, and is judged by
+            # the gate below rather than silently re-stamped.
+            self._data = await get_or_create_collection(
+                self.db,
+                self._collection_name,
+                validator=_vector_space_validator(self.embedding_func),
+            )
+
+            await self._assert_collection_is_usable()
 
             # Ensure vector index exists
             await self.create_vector_index_if_not_exists()
@@ -3581,10 +4343,84 @@ class MongoVectorDBStorage(BaseVectorStorage):
                 f"[{self.workspace}] Use MongoDB as VDB {self._collection_name}"
             )
 
-        if self._flush_lock is None:
-            self._flush_lock = get_namespace_lock(
-                namespace=self.final_namespace, workspace=""
+    async def _assert_collection_is_usable(self) -> None:
+        """Refuse a collection this instance cannot read. THE choke point.
+
+        Two facts, from two different places, because neither alone is enough:
+
+        * **Model**, from the validator marker. The collection name carries no
+          model on this backend, so a same-dimension model swap is invisible
+          without it -- the swap reuses this very collection and every query
+          then returns a previous model's neighbours.
+        * **Dimension**, from the Atlas search index definition. That is the
+          physical truth the index enforces, so it outranks the marker's copy;
+          the marker's dimension is only a fallback for a collection whose
+          index has not been built yet.
+
+        Absent evidence never refuses -- a collection recording neither
+        predates the marker and stays servable.
+        """
+        stored_model, marker_dim = _read_validator_vector_space(
+            await _read_collection_validator(self.db, self._collection_name)
+        )
+        index_dim = await self._read_search_index_dimension()
+        assert_vector_space_matches(
+            backend=type(self).__name__,
+            container=self._collection_name,
+            embedding_func=self.embedding_func,
+            stored_model=stored_model,
+            stored_dim=index_dim if index_dim is not None else marker_dim,
+        )
+
+    async def _read_search_index_dimension(self) -> int | None:
+        """``numDimensions`` of the Atlas vector index, or ``None``.
+
+        ``None`` covers "no index yet" as well as "the definition could not be
+        parsed", and both mean the same thing to every caller: this is not
+        evidence of a mismatch.
+        """
+        indexes_cursor = await self._data.list_search_indexes()
+        for index in await indexes_cursor.to_list(length=None):
+            if index.get("name") != self._index_name:
+                continue
+            for spec in (index.get("latestDefinition") or {}).get("fields", []):
+                if spec.get("type") == "vector" and spec.get("path") == "vector":
+                    dim = spec.get("numDimensions")
+                    return dim if isinstance(dim, int) else None
+        return None
+
+    async def _record_vector_space_marker(self) -> bool:
+        """Stamp this instance's embedding space onto the collection.
+
+        Called only where the marker is trivially TRUE: right after ``drop()``
+        emptied the collection. Never on attach -- an operator who upgrades and
+        swaps to a same-dimension model in one step would otherwise get the new
+        model's name recorded over the old model's vectors, permanently, after
+        which the gate can never fire.
+
+        Returns whether the write landed. A denial is NOT automatically benign,
+        and the caller has to decide: it leaves whatever marker is already
+        there, which on a collection previously marked for another model is the
+        PREVIOUS model's name -- see ``_reprovision_vector_space``. Only when
+        nothing conflicting is recorded does a denial reduce to "unmarked",
+        which is where every collection was before this feature existed.
+        """
+        try:
+            await self.db.command(
+                "collMod",
+                self._collection_name,
+                validator=_vector_space_validator(
+                    self.embedding_func,
+                    await _read_collection_validator(self.db, self._collection_name),
+                ),
             )
+            return True
+        except PyMongoError as e:
+            logger.warning(
+                f"[{self.workspace}] Could not record the embedding-space marker on "
+                f"collection '{self._collection_name}': {e}"
+            )
+            return False
 
     async def finalize(self):
         """Flush pending vector ops, release the Mongo client, surface unflushed data."""
@@ -3654,9 +4490,11 @@ class MongoVectorDBStorage(BaseVectorStorage):
         Two guards run *before* the rebuild: (1) a FAILED index that is still
         ``queryable`` (a background rebuild/update failed but the previously
         built index keeps serving) is left in place to avoid taking a
-        still-serving index offline; (2) a FAILED index built under a
-        different embedding model raises rather than being auto-rebuilt
-        against incompatible stored vectors. Transitional states
+        still-serving index offline; (2) a FAILED index built for a different
+        DIMENSION raises rather than being auto-rebuilt against incompatible
+        stored vectors. A same-dimension model change is invisible here --
+        the index definition records no model -- and is caught by
+        ``_assert_collection_is_usable`` before this runs. Transitional states
         (``PENDING``/``BUILDING``) are left alone -- they become queryable
         without intervention.
         """
@@ -3684,15 +4522,18 @@ class MongoVectorDBStorage(BaseVectorStorage):
 
                 expected_dim = self.embedding_func.embedding_dim
 
-                if existing_dim is not None and existing_dim != expected_dim:
-                    error_msg = (
-                        f"Vector dimension mismatch! Index '{self._index_name}' has "
-                        f"dimension {existing_dim}, but current embedding model expects "
-                        f"dimension {expected_dim}. Please drop the existing index or "
-                        f"use an embedding model with matching dimensions."
-                    )
-                    logger.error(f"[{self.workspace}] {error_msg}")
-                    raise ValueError(error_msg)
+                # Typed, because lightrag-rebuild-vdb answers this condition by
+                # dropping the collection: an untyped refusal would force it to
+                # catch Exception and destroy data on a cluster outage. The
+                # model side is judged by _assert_collection_is_usable; here
+                # only the index's own dimension is in hand.
+                assert_vector_space_matches(
+                    backend=type(self).__name__,
+                    container=self._collection_name,
+                    embedding_func=self.embedding_func,
+                    stored_model=None,
+                    stored_dim=existing_dim,
+                )
 
                 # Self-heal a FAILED index, but ONLY when it is actually
                 # non-queryable. Atlas can report status="FAILED" while
@@ -3832,7 +4673,18 @@ class MongoVectorDBStorage(BaseVectorStorage):
                 }
             },
             {"$addFields": {"score": {"$meta": "vectorSearchScore"}}},
-            {"$match": {"score": {"$gte": self.cosine_better_than_threshold}}},
+            # Atlas Vector Search normalizes a cosine-similarity index's
+            # vectorSearchScore to (1 + cosine_similarity) / 2, in [0, 1] --
+            # not raw cosine similarity, which every other backend compares
+            # cosine_better_than_threshold against. Rescale the threshold the
+            # same way for the server-side filter; the raw score is
+            # converted back below so "distance" matches the other
+            # backends' raw-cosine convention.
+            {
+                "$match": {
+                    "score": {"$gte": (1 + self.cosine_better_than_threshold) / 2}
+                }
+            },
             {"$project": {"vector": 0}},
         ]
 
@@ -3845,7 +4697,9 @@ class MongoVectorDBStorage(BaseVectorStorage):
             {
                 **doc,
                 "id": doc["_id"],
-                "distance": doc.get("score", None),
+                "distance": 2 * doc["score"] - 1
+                if doc.get("score") is not None
+                else None,
                 "created_at": doc.get("created_at"),  # Include created_at field
             }
             for doc in results
@@ -4253,11 +5107,73 @@ class MongoVectorDBStorage(BaseVectorStorage):
             logger.error(f"[{self.workspace}] Error getting vectors: {e}")
             return result
 
+    async def _reprovision_vector_space(self) -> None:
+        """Rebuild the emptied collection for THIS instance's embedding space.
+
+        The step that makes a refusal recoverable on this backend. ``drop()``
+        used to go straight to ``create_vector_index_if_not_exists()``, which
+        re-read the SURVIVING Atlas search index definition and raised the same
+        dimension mismatch again -- ``delete_many({})`` removes documents, not
+        the index, and not the validator either. ``except PyMongoError`` did not
+        catch that raise, so the drop failed and the operator was left deleting
+        the index out of band. Three things have to happen here, in this order:
+
+        1. **Drop the search index when its dimension is wrong.** Only then:
+           the definition records a dimension and nothing else, so a
+           same-dimension MODEL change leaves a perfectly good index, and
+           rebuilding it would cost an Atlas index build for nothing.
+        2. **Rewrite the validator marker.** The collection is empty, so this
+           process's embedding space is now trivially the true one. Skipping it
+           would leave the previous model recorded and make the NEXT
+           ``initialize()`` refuse again -- the recovery would not converge.
+        3. **Recreate the index**, which is now either absent or compatible, so
+           the guard inside it cannot fire.
+        """
+        index_dim = await self._read_search_index_dimension()
+        expected_dim = self.embedding_func.embedding_dim
+        if index_dim is not None and index_dim != expected_dim:
+            logger.warning(
+                f"[{self.workspace}] Dropping vector index {self._index_name}: it was "
+                f"built for dimension {index_dim} and this instance embeds at "
+                f"{expected_dim}"
+            )
+            await self._data.drop_search_index(self._index_name)
+            await self._wait_for_search_index_absent(self._index_name)
+        if not await self._record_vector_space_marker():
+            # A denied write does not leave the collection unmarked -- it
+            # leaves whatever was there. On a collection previously marked for
+            # another model that is the PREVIOUS model's name, and the attach
+            # that ``clear_vector_space_refusal`` runs straight after this drop
+            # is refused all over again. Every vector is already gone by then,
+            # so the one thing this must not do is report success: that would
+            # send the tool off to rebuild into a collection it cannot attach
+            # to. Fail loud instead, naming the permission that is missing.
+            #
+            # When nothing conflicting is recorded the denial really does
+            # reduce to "unmarked", and that is not a failure -- it is where
+            # every collection was before this feature existed.
+            try:
+                await self._assert_collection_is_usable()
+            except VectorSpaceMismatchError as e:
+                raise StorageControlPlaneError(
+                    f"[{self.workspace}] Dropped every vector in "
+                    f"'{self._collection_name}', but could not rewrite its "
+                    f"embedding-space marker: the collection still records the "
+                    f"previous model, so the rebuild would be refused. Grant "
+                    f"collMod on this collection and run lightrag-rebuild-vdb "
+                    f"again."
+                ) from e
+        await self.create_vector_index_if_not_exists()
+
     async def drop(self) -> dict[str, str]:
-        """Drop all documents and recreate the vector index. Destructive.
+        """Drop all documents and re-provision the collection. Destructive.
+
+        Also the recovery path for an embedding-space refusal: the collection
+        comes back empty and marked for THIS instance's model, so the next
+        ``initialize()`` attaches normally. See ``_reprovision_vector_space``.
 
         MUST only be called when ``pipeline_status`` is idle (see the
-        Pipeline concurrency contract in ``AGENTS.md``); the only
+        Pipeline concurrency contract in ``docs/design/PipelineConcurrencyContract.md``); the only
         in-tree caller ``clear_documents`` enforces this.
 
         Caveat — only this instance's buffers are cleared. Other
@@ -4283,8 +5199,9 @@ class MongoVectorDBStorage(BaseVectorStorage):
                 result = await self._data.delete_many({})
                 deleted_count = result.deleted_count
 
-                # Recreate vector index
-                await self.create_vector_index_if_not_exists()
+                # Re-provision in the CURRENT embedding space, not the one the
+                # collection used to hold.
+                await self._reprovision_vector_space()
 
             logger.info(
                 f"[{self.workspace}] Dropped {deleted_count} documents from vector storage {self._collection_name} and recreated vector index"
@@ -4298,13 +5215,30 @@ class MongoVectorDBStorage(BaseVectorStorage):
                 f"[{self.workspace}] Error dropping vector storage {self._collection_name}: {e}"
             )
             return {"status": "error", "message": str(e)}
+        except StorageControlPlaneError as e:
+            # Re-provisioning failed after the documents were already deleted.
+            # The deletion is real and irreversible; what is NOT true is that
+            # the collection is ready to be rebuilt, so this must not be
+            # reported as a success. See _reprovision_vector_space.
+            logger.error(f"[{self.workspace}] {e}")
+            return {"status": "error", "message": str(e)}
 
 
-async def get_or_create_collection(db: AsyncDatabase, collection_name: str):
+async def get_or_create_collection(
+    db: AsyncDatabase, collection_name: str, validator: dict | None = None
+):
+    """Return the collection, creating it with ``validator`` if it is absent.
+
+    ``validator`` is applied ONLY at creation. An existing collection keeps
+    whatever it has: overwriting a validator on attach would stamp this
+    process's embedding-space marker onto vectors it did not write. See
+    ``docs/design/VectorSpaceProvenance.md``.
+    """
     collection_names = await db.list_collection_names()
 
     if collection_name not in collection_names:
-        collection = await db.create_collection(collection_name)
+        kwargs = {"validator": validator} if validator else {}
+        collection = await db.create_collection(collection_name, **kwargs)
         logger.info(f"Created collection: {collection_name}")
         return collection
     else:

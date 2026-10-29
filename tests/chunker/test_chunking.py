@@ -350,6 +350,79 @@ def test_overlap_equal_to_chunk_size_raises():
 
 
 @pytest.mark.offline
+def test_negative_overlap_raises():
+    """Negative overlap makes the stride larger than chunk_token_size (e.g.
+    step = 10 - (-1) = 11 for a 10-token chunk), silently skipping a token
+    between every window instead of the intended overlap. Fail closed,
+    matching the >= chunk_size case above."""
+    tokenizer = make_tokenizer()
+    content = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+    with pytest.raises(ValueError) as excinfo:
+        chunking_by_token_size(
+            tokenizer,
+            content,
+            chunk_token_size=10,
+            chunk_overlap_token_size=-1,
+        )
+
+    message = str(excinfo.value)
+    assert "chunk_overlap_token_size must be non-negative" in message
+    assert "-1" in message
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("chunk_overlap_token_size", [0, 5])
+def test_valid_overlap_still_covers_every_token(chunk_overlap_token_size):
+    """Control: zero and a valid positive overlap must still produce
+    complete, gap-free coverage of the source content -- guards the
+    negative-overlap rejection above against accidentally tightening or
+    loosening a legitimate case.
+
+    DummyTokenizer maps each character to its own token (ord(ch)), so a
+    string of distinct printable characters lets coverage be checked by
+    set membership without collisions.
+    """
+    tokenizer = make_tokenizer()
+    content = "".join(chr(33 + i) for i in range(90))
+
+    chunks = chunking_by_token_size(
+        tokenizer,
+        content,
+        chunk_token_size=10,
+        chunk_overlap_token_size=chunk_overlap_token_size,
+    )
+
+    covered = set()
+    for chunk in chunks:
+        covered.update(chunk["content"])
+
+    assert covered == set(content)
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("split_by_character_only", [False, True])
+def test_negative_overlap_raises_with_split_by_character(split_by_character_only):
+    """Negative overlap must be rejected even when every split_by_character
+    segment stays under chunk_token_size -- that path never reaches
+    _window_step()'s inline calls, so the check has to run up front."""
+    tokenizer = make_tokenizer()
+    content = "abc|def|ghi"
+
+    with pytest.raises(ValueError) as excinfo:
+        chunking_by_token_size(
+            tokenizer,
+            content,
+            split_by_character="|",
+            split_by_character_only=split_by_character_only,
+            chunk_token_size=10,
+            chunk_overlap_token_size=-1,
+        )
+
+    assert "chunk_overlap_token_size must be non-negative" in str(excinfo.value)
+
+
+@pytest.mark.offline
 def test_empty_content():
     """Test chunking with empty content."""
     tokenizer = make_tokenizer()
@@ -1104,3 +1177,77 @@ def test_decode_preserves_content():
         tokens = tokenizer.encode(original)
         decoded = tokenizer.decode(tokens)
         assert decoded == original, f"Failed to decode: {original}"
+
+
+# ============================================================================
+# Tests: the split_by_character path must not encode the whole document
+# (regression guard for the deferred whole-document encode)
+# ============================================================================
+
+
+class CountingTokenizer(DummyTokenizer):
+    """DummyTokenizer that records every string passed to encode()."""
+
+    def __init__(self):
+        self.encoded: list[str] = []
+
+    def encode(self, content: str):
+        self.encoded.append(content)
+        return super().encode(content)
+
+
+def _make_counting_tokenizer() -> tuple[CountingTokenizer, Tokenizer]:
+    inner = CountingTokenizer()
+    return inner, Tokenizer(model_name="counting", tokenizer=inner)
+
+
+@pytest.mark.offline
+def test_split_by_character_does_not_encode_whole_document():
+    """The split_by_character path only encodes each segment, never the
+    whole document (the fixed-window ``else`` branch is the only consumer
+    of the whole-document token list)."""
+    inner, tokenizer = _make_counting_tokenizer()
+    content = "alpha\n\nbeta\n\ngamma"
+
+    chunks = chunking_by_token_size(
+        tokenizer,
+        content,
+        split_by_character="\n\n",
+        chunk_token_size=10,
+    )
+
+    assert [chunk["content"] for chunk in chunks] == ["alpha", "beta", "gamma"]
+    # Exactly one encode per split segment; in particular no call with the
+    # full document, whose token list the split path never reads.
+    assert inner.encoded == ["alpha", "beta", "gamma"]
+
+
+@pytest.mark.offline
+def test_split_by_character_only_does_not_encode_whole_document():
+    """Same guarantee for split_by_character_only=True."""
+    inner, tokenizer = _make_counting_tokenizer()
+    content = "one\ntwo\nthree"
+
+    chunks = chunking_by_token_size(
+        tokenizer,
+        content,
+        split_by_character="\n",
+        split_by_character_only=True,
+        chunk_token_size=10,
+    )
+
+    assert [chunk["content"] for chunk in chunks] == ["one", "two", "three"]
+    assert inner.encoded == ["one", "two", "three"]
+
+
+@pytest.mark.offline
+def test_fixed_window_path_still_encodes_whole_document():
+    """Without split_by_character the whole-document encode still happens."""
+    inner, tokenizer = _make_counting_tokenizer()
+    content = "abcdefghij"
+
+    chunking_by_token_size(
+        tokenizer, content, chunk_token_size=4, chunk_overlap_token_size=0
+    )
+
+    assert inner.encoded == [content]

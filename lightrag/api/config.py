@@ -46,6 +46,7 @@ from lightrag.constants import (
     DEFAULT_SUMMARY_LANGUAGE,
     DEFAULT_EMBEDDING_FUNC_MAX_ASYNC,
     DEFAULT_EMBEDDING_BATCH_NUM,
+    DEFAULT_EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE,
     DEFAULT_OLLAMA_MODEL_NAME,
     DEFAULT_OLLAMA_MODEL_TAG,
     DEFAULT_RERANK_BINDING,
@@ -247,13 +248,14 @@ def _is_set(value: str | None) -> bool:
 
 
 def validate_bedrock_auth_configuration(args: argparse.Namespace) -> None:
-    """Reject Bedrock configuration with no explicit supported auth source."""
-    bearer_token = os.getenv("AWS_BEARER_TOKEN_BEDROCK")
+    """Validate explicitly configured Bedrock credentials.
 
-    def has_valid_auth(prefix: str | None = None) -> bool:
-        if _is_set(bearer_token):
-            return True
+    When no explicit credentials or bearer token is provided, boto3 resolves
+    credentials through its default provider chain, including web identity
+    tokens used by Kubernetes IRSA.
+    """
 
+    def has_no_partial_explicit_credentials(prefix: str | None = None) -> bool:
         if prefix:
             role_access_key = getattr(args, f"{prefix}_aws_access_key_id", None)
             role_secret_key = getattr(args, f"{prefix}_aws_secret_access_key", None)
@@ -262,42 +264,46 @@ def validate_bedrock_auth_configuration(args: argparse.Namespace) -> None:
 
         access_key = getattr(args, "aws_access_key_id", None)
         secret_key = getattr(args, "aws_secret_access_key", None)
-        return _is_set(access_key) and _is_set(secret_key)
+        return not (_is_set(access_key) or _is_set(secret_key)) or (
+            _is_set(access_key) and _is_set(secret_key)
+        )
 
     if getattr(args, "llm_binding", None) == "bedrock":
-        if not has_valid_auth():
+        if not has_no_partial_explicit_credentials():
             raise ValueError(
-                "Bedrock LLM binding requires AWS_ACCESS_KEY_ID and "
-                "AWS_SECRET_ACCESS_KEY, or process-level AWS_BEARER_TOKEN_BEDROCK."
+                "Bedrock LLM binding requires both AWS_ACCESS_KEY_ID and "
+                "AWS_SECRET_ACCESS_KEY when either explicit credential is set."
             )
         if _is_set(getattr(args, "llm_binding_api_key", None)):
             logging.warning(
                 "LLM_BINDING_API_KEY is set but ignored for Bedrock LLM binding. "
-                "Use SigV4 AWS_* variables or process-level AWS_BEARER_TOKEN_BEDROCK instead."
+                "Use AWS credentials, the default AWS credential provider chain, or "
+                "process-level AWS_BEARER_TOKEN_BEDROCK instead."
             )
 
     if getattr(args, "embedding_binding", None) == "bedrock":
-        if not has_valid_auth():
+        if not has_no_partial_explicit_credentials():
             raise ValueError(
-                "Bedrock embedding binding requires AWS_ACCESS_KEY_ID and "
-                "AWS_SECRET_ACCESS_KEY, or process-level AWS_BEARER_TOKEN_BEDROCK."
+                "Bedrock embedding binding requires both AWS_ACCESS_KEY_ID and "
+                "AWS_SECRET_ACCESS_KEY when either explicit credential is set."
             )
         if _is_set(getattr(args, "embedding_binding_api_key", None)):
             logging.warning(
                 "EMBEDDING_BINDING_API_KEY is set but ignored for Bedrock embedding binding. "
-                "Use SigV4 AWS_* variables or process-level AWS_BEARER_TOKEN_BEDROCK instead."
+                "Use AWS credentials, the default AWS credential provider chain, or "
+                "process-level AWS_BEARER_TOKEN_BEDROCK instead."
             )
 
     for spec in ROLES:
         role = spec.name
         if getattr(
             args, f"{role}_llm_binding", None
-        ) == "bedrock" and not has_valid_auth(role):
+        ) == "bedrock" and not has_no_partial_explicit_credentials(role):
             raise ValueError(
-                f"Bedrock role '{role}' requires {spec.env_prefix}_AWS_ACCESS_KEY_ID "
-                f"and {spec.env_prefix}_AWS_SECRET_ACCESS_KEY, global "
-                "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or process-level "
-                "AWS_BEARER_TOKEN_BEDROCK."
+                f"Bedrock role '{role}' requires both "
+                f"{spec.env_prefix}_AWS_ACCESS_KEY_ID and "
+                f"{spec.env_prefix}_AWS_SECRET_ACCESS_KEY when either explicit "
+                "credential is set."
             )
 
 
@@ -341,14 +347,17 @@ def parse_args() -> argparse.Namespace:
     """
     Parse command line arguments with environment variable fallback
 
-    Args:
-        is_uvicorn_mode: Whether running under uvicorn mode
-
     Returns:
         argparse.Namespace: Parsed arguments
     """
 
     parser = argparse.ArgumentParser(description="LightRAG API Server")
+
+    parser.add_argument(
+        "--custom-chunker",
+        default=get_env_value("CUSTOM_CHUNKER", ""),
+        help="Registered third-party chunker name (CUSTOM_CHUNKER); not a Python import path",
+    )
 
     # Server configuration
     parser.add_argument(
@@ -411,7 +420,7 @@ def parse_args() -> argparse.Namespace:
         default=get_env_value(
             "SUMMARY_LENGTH_RECOMMENDED", DEFAULT_SUMMARY_LENGTH_RECOMMENDED, int
         ),
-        help=f"LLM Summary Context size (default: from env or {DEFAULT_SUMMARY_LENGTH_RECOMMENDED})",
+        help=f"Recommended length of the LLM summary output (default: from env or {DEFAULT_SUMMARY_LENGTH_RECOMMENDED})",
     )
 
     # Logging configuration
@@ -482,6 +491,22 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=get_env_value("LIGHTRAG_API_PREFIX", ""),
         help="API path prefix (e.g., /api/v1). Prepended to all API routes. Default: none (root).",
+    )
+
+    # Root-path default UI entry. Scope is pinned to exactly one behavior: the
+    # redirect target of '/'. It does NOT control whether either UI entry is
+    # mounted, and it is an enum on purpose (a free URL would open a redirect
+    # surface and could not participate in the availability degradation logic).
+    parser.add_argument(
+        "--default-ui",
+        type=str,
+        choices=["webui", "workspace"],
+        default=get_env_value("LIGHTRAG_DEFAULT_UI", "webui"),
+        help=(
+            "UI entry the root path '/' redirects to: 'webui' (admin UI, "
+            "default) or 'workspace' (query-user entry). Controls only the "
+            "'/' redirect target."
+        ),
     )
 
     # Server workers configuration
@@ -581,6 +606,17 @@ def parse_args() -> argparse.Namespace:
         GeminiEmbeddingOptions.add_args(parser)
 
     args = parser.parse_args()
+
+    # argparse ``choices`` validates only values explicitly passed on the
+    # command line — an env-provided default bypasses it (same shape as
+    # --rerank-binding). Validate explicitly so a typo like
+    # LIGHTRAG_DEFAULT_UI=workspaces fails at startup instead of silently
+    # falling back to the webui redirect.
+    if args.default_ui not in ("webui", "workspace"):
+        parser.error(
+            "--default-ui / LIGHTRAG_DEFAULT_UI must be 'webui' or "
+            f"'workspace', got {args.default_ui!r}"
+        )
 
     # convert relative path to absolute path
     args.working_dir = os.path.abspath(args.working_dir)
@@ -689,11 +725,29 @@ def parse_args() -> argparse.Namespace:
     # EMBEDDING_DIM defaults to None - each binding will use its own default dimension
     # Value is inherited from provider defaults via wrap_embedding_func_with_attrs decorator
     args.embedding_dim = get_env_value("EMBEDDING_DIM", None, int, special_none=True)
+    # Reject non-positive dimensions here rather than downstream: the embedding
+    # factory resolves the effective dimension with a truthiness test
+    # (`args.embedding_dim if args.embedding_dim else provider_default`), so a
+    # configured 0 would silently fall back to the provider default while still
+    # satisfying the `EMBEDDING_DIM is set` startup guard, and a negative value
+    # would propagate into the vector stores unchecked.
+    if args.embedding_dim is not None and args.embedding_dim <= 0:
+        raise SystemExit(
+            f"EMBEDDING_DIM must be a positive integer (got {args.embedding_dim}). "
+            "Leave it unset to inherit the embedding binding's default dimension."
+        )
     args.embedding_send_dim = get_env_value("EMBEDDING_SEND_DIM", False, bool)
 
     # Inject chunk configuration
     args.chunk_size = get_env_value("CHUNK_SIZE", 1200, int)
     args.chunk_overlap_size = get_env_value("CHUNK_OVERLAP_SIZE", 100, int)
+    # Embedding hard-fallback overlap — independent of chunk_overlap_size above,
+    # see LightRAG.embedding_chunk_overlap_token_size.
+    args.embedding_chunk_overlap_token_size = get_env_value(
+        "EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE",
+        DEFAULT_EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE,
+        int,
+    )
 
     # Inject LLM cache configuration
     # Should not be disabled； LLM cache is required for entity/realtion rebuild after file deletion.
@@ -794,6 +848,29 @@ def parse_args() -> argparse.Namespace:
     args.cors_origins = get_env_value("CORS_ORIGINS", "*")
     args.summary_language = get_env_value("SUMMARY_LANGUAGE", DEFAULT_SUMMARY_LANGUAGE)
     args.whitelist_paths = get_env_value("WHITELIST_PATHS", "/health,/api/*")
+
+    # Single authoritative switch for the interactive API documentation
+    # surfaces (/docs, /docs/oauth2-redirect, /redoc, /openapi.json and the
+    # /static/swagger-ui mount). When False all five return 404 (one flag). Any route audit must condition the same set on this flag.
+    args.enable_api_docs = get_env_value("ENABLE_API_DOCS", True, bool)
+
+    # AI-generated content notice shown under every answer in the two query
+    # UIs (the admin /webui retrieval panel and the /workspace query entry).
+    # Deployments that must label machine-generated output (a regulatory
+    # requirement in several jurisdictions) turn it on here; the default keeps
+    # the existing chat appearance untouched. The flag is deployment-level
+    # display configuration like WEBUI_TITLE, so it travels to the frontend on
+    # the same responses (/auth-status, /login, /health) and never in the
+    # answer text itself.
+    args.enable_ai_content_notice = get_env_value(
+        "ENABLE_AI_CONTENT_NOTICE", False, bool
+    )
+
+    # Optional external UI customization bundle (workspace-entry PRD §8).
+    # Empty/unset means "no customization" — the normal state, not an error;
+    # a set value must point at a bundle that validates completely or the
+    # server refuses to start (see lightrag/api/ui_customization.py).
+    args.ui_templates_dir = get_env_value("UI_TEMPLATES_DIR", "", str)
 
     # For JWT Auth
     args.auth_accounts = get_env_value("AUTH_ACCOUNTS", "")

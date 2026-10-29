@@ -14,6 +14,7 @@ Two contracts introduced for the pipeline scheduling control-plane:
 """
 
 import asyncio
+from collections import Counter
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -624,6 +625,173 @@ async def test_bfs_subgraph_transient_error_raises_not_reports_false_complete(
         await storage.get_knowledge_graph("start", max_depth=2, max_nodes=100)
 
 
+def _bfs_mget_side_effect(real_nodes: dict):
+    """Mock ``client.mget`` for both the single-id start-node lookup and the
+    batched per-level neighbor resolution. Ids absent from `real_nodes` come
+    back ``found: False``, mirroring a dangling edge endpoint. Writes now
+    materialize both endpoints, so new data cannot produce one, but documents
+    written before that change still can and the traversal must keep tolerating
+    them."""
+
+    async def _mget(index=None, body=None, **kwargs):
+        docs = []
+        for node_id in body["ids"]:
+            if node_id in real_nodes:
+                docs.append(
+                    {"_id": node_id, "found": True, "_source": real_nodes[node_id]}
+                )
+            else:
+                docs.append({"_id": node_id, "found": False})
+        return {"docs": docs}
+
+    return _mget
+
+
+def _bfs_search_side_effect(edges: list):
+    """Mock ``client.search`` for the per-level edge scan (``should``, at least
+    one endpoint in the frontier), the degree aggregation that ranks a level
+    (``aggs``, same ``should`` query shape), and the final PIT-scrolled edge
+    fetch (``must``, both endpoints in the seen-node set)."""
+
+    async def _search(index=None, body=None, **kwargs):
+        bool_query = body["query"]["bool"]
+        if "aggs" in body:
+            ids = set(bool_query["should"][0]["terms"]["source_node_id"])
+            matching = [
+                e
+                for e in edges
+                if e["source_node_id"] in ids or e["target_node_id"] in ids
+            ]
+
+            def _buckets(name, field):
+                # The degree aggregations are `filter`-wrapped so their bucket
+                # keys cannot escape the requested ids; mirror both the filter
+                # and the nested "ids" level here.
+                allowed = set(body["aggs"][name]["filter"]["terms"][field])
+                counts = Counter(e[field] for e in matching if e[field] in allowed)
+                return {
+                    "ids": {
+                        "buckets": [
+                            {"key": key, "doc_count": count}
+                            for key, count in counts.items()
+                        ]
+                    }
+                }
+
+            return {
+                "hits": {"hits": []},
+                "aggregations": {
+                    "source_degrees": _buckets("source_degrees", "source_node_id"),
+                    "target_degrees": _buckets("target_degrees", "target_node_id"),
+                },
+            }
+        if "should" in bool_query:
+            ids = set(bool_query["should"][0]["terms"]["source_node_id"])
+            hits = [
+                {"_source": e}
+                for e in edges
+                if e["source_node_id"] in ids or e["target_node_id"] in ids
+            ]
+        else:
+            ids = set(bool_query["must"][0]["terms"]["source_node_id"])
+            hits = [
+                {"_source": e}
+                for e in edges
+                if e["source_node_id"] in ids and e["target_node_id"] in ids
+            ]
+        return {"hits": {"hits": hits}}
+
+    return _search
+
+
+async def _make_bfs_storage(global_config, real_nodes: dict, edges: list):
+    client = _make_graph_client()
+    storage = await _make_graph(global_config, client)
+    storage._ppl_graphlookup_available = False
+    client.mget = AsyncMock(side_effect=_bfs_mget_side_effect(real_nodes))
+    client.search = AsyncMock(side_effect=_bfs_search_side_effect(edges))
+    return storage
+
+
+async def test_bfs_subgraph_counter_example_not_falsely_truncated(global_config):
+    """A only connects to B and C, and B/C's only neighbor is the already-
+    visited A. Filling max_nodes=3 exactly on round 1 must not make round 2's
+    top-of-loop capacity check falsely declare truncation before confirming
+    there is nothing left to explore."""
+    real_nodes = {n: {"entity_type": "person"} for n in ["A", "B", "C"]}
+    edges = [
+        {"source_node_id": "A", "target_node_id": "B"},
+        {"source_node_id": "A", "target_node_id": "C"},
+    ]
+    storage = await _make_bfs_storage(global_config, real_nodes, edges)
+
+    result = await storage.get_knowledge_graph("A", max_depth=2, max_nodes=3)
+
+    assert {n.id for n in result.nodes} == {"A", "B", "C"}
+    assert result.is_truncated is False
+
+
+async def test_bfs_subgraph_diamond_not_truncated(global_config):
+    real_nodes = {n: {"entity_type": "person"} for n in ["A", "B", "C", "D"]}
+    edges = [
+        {"source_node_id": "A", "target_node_id": "B"},
+        {"source_node_id": "A", "target_node_id": "C"},
+        {"source_node_id": "B", "target_node_id": "D"},
+        {"source_node_id": "C", "target_node_id": "D"},
+    ]
+    storage = await _make_bfs_storage(global_config, real_nodes, edges)
+
+    result = await storage.get_knowledge_graph("A", max_depth=2, max_nodes=4)
+
+    assert {n.id for n in result.nodes} == {"A", "B", "C", "D"}
+    assert result.is_truncated is False
+
+
+async def test_bfs_subgraph_star_reports_truncated_and_respects_cap(global_config):
+    leaves = ["B", "C", "D", "E", "F"]
+    real_nodes = {n: {"entity_type": "person"} for n in ["A"] + leaves}
+    edges = [{"source_node_id": "A", "target_node_id": leaf} for leaf in leaves]
+    storage = await _make_bfs_storage(global_config, real_nodes, edges)
+
+    result = await storage.get_knowledge_graph("A", max_depth=2, max_nodes=3)
+
+    assert result.is_truncated is True
+    assert len(result.nodes) <= 3
+
+
+async def test_bfs_subgraph_dangling_only_neighbor_not_falsely_truncated(
+    global_config,
+):
+    """The only neighbor is a dangling id (edge-referenced, no node
+    document) -- nothing real was cut, so this must not be truncated."""
+    real_nodes = {"A": {"entity_type": "person"}}
+    edges = [{"source_node_id": "A", "target_node_id": "X"}]
+    storage = await _make_bfs_storage(global_config, real_nodes, edges)
+
+    result = await storage.get_knowledge_graph("A", max_depth=2, max_nodes=1)
+
+    assert {n.id for n in result.nodes} == {"A"}
+    assert result.is_truncated is False
+
+
+async def test_bfs_subgraph_dangling_candidate_does_not_steal_real_node_slot(
+    global_config,
+):
+    """A occupies one of max_nodes=2 slots; the real neighbor B must fill the
+    second slot even though a dangling candidate X is also in the frontier."""
+    real_nodes = {"A": {"entity_type": "person"}, "B": {"entity_type": "person"}}
+    edges = [
+        {"source_node_id": "A", "target_node_id": "X"},
+        {"source_node_id": "A", "target_node_id": "B"},
+    ]
+    storage = await _make_bfs_storage(global_config, real_nodes, edges)
+
+    result = await storage.get_knowledge_graph("A", max_depth=2, max_nodes=2)
+
+    assert {n.id for n in result.nodes} == {"A", "B"}
+    assert result.is_truncated is False
+
+
 async def test_vector_query_raises_on_whole_call_transient(global_config):
     """Matches the raise-on-unexpected-error convention every other vector
     backend's query() follows (Postgres/Milvus/Qdrant/Mongo)."""
@@ -653,10 +821,12 @@ async def test_vector_query_missing_index_still_returns_empty(global_config):
 # ---------------------------------------------------------------------------
 
 
-async def test_upsert_edge_raises_when_has_node_check_fails(global_config):
+async def test_upsert_edge_raises_when_endpoint_existence_check_fails(global_config):
+    # upsert_edge materializes BOTH endpoints and probes them with one mget
+    # (has_nodes_batch), like upsert_edges_batch does.
     client = _make_graph_client()
     storage = await _make_graph(global_config, client)
-    client.exists = AsyncMock(side_effect=_transient_error())
+    client.mget = AsyncMock(side_effect=_transient_error())
     with pytest.raises(TransportError):
         await storage.upsert_edge("A", "B", {})
 

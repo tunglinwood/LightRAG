@@ -3,6 +3,7 @@ LightRAG FastAPI Server
 """
 
 from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, Response
 from fastapi.openapi.docs import (
@@ -38,18 +39,21 @@ from lightrag.api.utils_api import (
 )
 from lightrag.api.admission_middleware import AdmissionMiddleware
 from lightrag.api.body_limit_middleware import BodyLimitMiddleware, resolve_body_limits
+from lightrag.api.rag_factory import (
+    LLMConfigCache as LLMConfigCache,
+    _create_llm_model_kwargs as _create_llm_model_kwargs,
+    build_rag_from_args,
+    create_embedding_function_from_args as create_embedding_function_from_args,
+    create_optimized_embedding_function as create_optimized_embedding_function,
+)
 from .config import (
     global_args,
     normalize_api_prefix,
     update_uvicorn_mode_config,
-    get_default_host,
-    resolve_asymmetric_embedding_opt_in,
-    PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS,
 )
+from lightrag import __version__ as core_version
 from lightrag.utils import get_env_value
-from lightrag import LightRAG, ROLES, RoleLLMConfig, __version__ as core_version
 from lightrag.api import __api_version__
-from lightrag.utils import EmbeddingFunc
 from lightrag.constants import (
     DEFAULT_LOG_MAX_BYTES,
     DEFAULT_LOG_BACKUP_COUNT,
@@ -59,7 +63,10 @@ from lightrag.api.routers.document_routes import (
     DocumentManager,
     create_document_routes,
 )
+from lightrag.parser.docx.smart_heading.nlp import SmartHeadingNLPError
 from lightrag.parser.plugins import load_third_party_parsers
+from lightrag.chunker.plugins import load_and_resolve_chunker
+from lightrag.chunker.registry import log_chunker_selection
 from lightrag.parser.routing import (
     parser_rules_from_env,
     validate_parser_routing_config,
@@ -70,6 +77,12 @@ from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.graph3d_routes import create_graph3d_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.routers.ui_customization_routes import create_ui_customization_routes
+from lightrag.api.ui_customization import (
+    WEBUI_CHROME_LOCALES,
+    locales_without_chrome_translation,
+    resolve_ui_customization_snapshot,
+)
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -90,7 +103,7 @@ from lightrag.api.login_rate_limit import LoginRateLimiter
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
-load_dotenv(dotenv_path=".env", override=False)
+load_dotenv(dotenv_path=os.environ.get("DOTENV_PATH", ".env"), override=False)
 
 
 webui_title = os.getenv("WEBUI_TITLE")
@@ -400,6 +413,20 @@ def _inject_swagger_theme(html: str, theme: str) -> str:
 # docs/MultiSiteDeployment.md.
 WEBUI_PATH = "/webui"
 
+# Fixed mount path of the query-user entry (the "workspace" UI). Serves the
+# same static build directory as WEBUI_PATH but with workspace.html as its
+# directory index, so the entry identity is decided entirely by the URL.
+# NOTE: this is a WebUI URL, not the knowledge-base `workspace` parameter used
+# for data isolation — the two are unrelated (see the workspace-entry PRD).
+WORKSPACE_PATH = "/workspace"
+
+# Entry HTML filenames inside the shared build directory. Each mount serves
+# only its own file as the directory index and returns 404 for the other
+# entry's HTML (otherwise both files would be reachable under both mounts,
+# creating fully working aliases like /webui/workspace.html).
+WEBUI_INDEX_FILENAME = "index.html"
+WORKSPACE_INDEX_FILENAME = "workspace.html"
+
 
 class _RootPathNormalizationMiddleware:
     """Make Mount sub-apps work when the reverse proxy strips the API prefix.
@@ -534,537 +561,6 @@ def _build_docling_status() -> dict[str, Any]:
     }
 
 
-class LLMConfigCache:
-    """Smart LLM and Embedding configuration cache class"""
-
-    def __init__(self, args):
-        self.args = args
-
-        # Initialize configurations based on binding conditions
-        self.openai_llm_options = None
-        self.gemini_llm_options = None
-        self.gemini_embedding_options = None
-        self.ollama_llm_options = None
-        self.ollama_embedding_options = None
-        self.bedrock_llm_options = None
-
-        # Only initialize and log OpenAI options when using OpenAI-related bindings
-        if args.llm_binding in ["openai", "azure_openai"]:
-            from lightrag.llm.binding_options import OpenAILLMOptions
-
-            self.openai_llm_options = OpenAILLMOptions.options_dict(args)
-            logger.info(f"OpenAI LLM Options: {self.openai_llm_options}")
-
-        if args.llm_binding == "gemini":
-            from lightrag.llm.binding_options import GeminiLLMOptions
-
-            self.gemini_llm_options = GeminiLLMOptions.options_dict(args)
-            logger.info(f"Gemini LLM Options: {self.gemini_llm_options}")
-
-        if args.llm_binding == "bedrock":
-            from lightrag.llm.binding_options import BedrockLLMOptions
-
-            self.bedrock_llm_options = BedrockLLMOptions.options_dict(args)
-            logger.info(f"Bedrock LLM Options: {self.bedrock_llm_options}")
-
-        # Only initialize and log Ollama LLM options when using Ollama LLM binding
-        if args.llm_binding == "ollama":
-            try:
-                from lightrag.llm.binding_options import OllamaLLMOptions
-
-                self.ollama_llm_options = OllamaLLMOptions.options_dict(args)
-                logger.info(f"Ollama LLM Options: {self.ollama_llm_options}")
-            except ImportError:
-                logger.warning(
-                    "OllamaLLMOptions not available, using default configuration"
-                )
-                self.ollama_llm_options = {}
-
-        # Only initialize and log Ollama Embedding options when using Ollama Embedding binding
-        if args.embedding_binding == "ollama":
-            try:
-                from lightrag.llm.binding_options import OllamaEmbeddingOptions
-
-                self.ollama_embedding_options = OllamaEmbeddingOptions.options_dict(
-                    args
-                )
-                logger.info(
-                    f"Ollama Embedding Options: {self.ollama_embedding_options}"
-                )
-            except ImportError:
-                logger.warning(
-                    "OllamaEmbeddingOptions not available, using default configuration"
-                )
-                self.ollama_embedding_options = {}
-
-        # Only initialize and log Gemini Embedding options when using Gemini Embedding binding
-        if args.embedding_binding == "gemini":
-            try:
-                from lightrag.llm.binding_options import GeminiEmbeddingOptions
-
-                self.gemini_embedding_options = GeminiEmbeddingOptions.options_dict(
-                    args
-                )
-                logger.info(
-                    f"Gemini Embedding Options: {self.gemini_embedding_options}"
-                )
-            except ImportError:
-                logger.warning(
-                    "GeminiEmbeddingOptions not available, using default configuration"
-                )
-                self.gemini_embedding_options = {}
-
-
-_PROVIDER_LOG_LABELS = {
-    "azure_openai": "Azure OpenAI",
-    "bedrock": "Bedrock",
-    "gemini": "Gemini",
-    "lollms": "Lollms",
-    "ollama": "Ollama",
-    "openai": "OpenAI",
-}
-
-
-def create_optimized_embedding_function(
-    config_cache: LLMConfigCache,
-    binding,
-    model,
-    host,
-    api_key,
-    args,
-    document_prefix=None,
-    query_prefix=None,
-) -> EmbeddingFunc:
-    """
-    Create optimized embedding function and return an EmbeddingFunc instance
-    with proper max_token_size inheritance from provider defaults.
-
-    This function:
-    1. Imports the provider embedding function
-    2. Extracts max_token_size and embedding_dim from provider if it's an EmbeddingFunc
-    3. Creates an optimized wrapper that calls the underlying function directly (avoiding double-wrapping)
-    4. Returns a properly configured EmbeddingFunc instance
-
-    Configuration Rules:
-    - When EMBEDDING_MODEL is not set: Uses provider's default model and dimension
-      (e.g., jina-embeddings-v4 with 2048 dims, text-embedding-3-small with 1536 dims)
-    - When EMBEDDING_MODEL is set to a custom model: User MUST also set EMBEDDING_DIM
-      to match the custom model's dimension (e.g., for jina-embeddings-v3, set EMBEDDING_DIM=1024)
-
-    Note: The embedding_dim parameter is automatically injected by EmbeddingFunc wrapper
-    when send_dimensions=True (enabled for Jina and Gemini bindings). This wrapper calls
-    the underlying provider function directly (.func) to avoid double-wrapping, so we must
-    explicitly pass embedding_dim to the provider's underlying function.
-    """
-
-    # Step 1: Import provider function and extract default attributes
-    provider_func = None
-    provider_max_token_size = None
-    provider_embedding_dim = None
-    provider_supports_asymmetric = False
-
-    try:
-        if binding == "openai":
-            from lightrag.llm.openai import openai_embed
-
-            provider_func = openai_embed
-        elif binding == "ollama":
-            from lightrag.llm.ollama import ollama_embed
-
-            provider_func = ollama_embed
-        elif binding == "gemini":
-            from lightrag.llm.gemini import gemini_embed
-
-            provider_func = gemini_embed
-        elif binding == "jina":
-            from lightrag.llm.jina import jina_embed
-
-            provider_func = jina_embed
-        elif binding == "azure_openai":
-            from lightrag.llm.azure_openai import azure_openai_embed
-
-            provider_func = azure_openai_embed
-        elif binding == "bedrock":
-            from lightrag.llm.bedrock import bedrock_embed
-
-            provider_func = bedrock_embed
-        elif binding == "lollms":
-            from lightrag.llm.lollms import lollms_embed
-
-            provider_func = lollms_embed
-        elif binding == "voyageai":
-            from lightrag.llm.voyageai import voyageai_embed
-
-            provider_func = voyageai_embed
-        # Extract attributes if provider is an EmbeddingFunc
-        if provider_func and isinstance(provider_func, EmbeddingFunc):
-            provider_max_token_size = provider_func.max_token_size
-            provider_embedding_dim = provider_func.embedding_dim
-            provider_supports_asymmetric = provider_func.supports_asymmetric
-            logger.debug(
-                f"Extracted from {binding} provider: "
-                f"max_token_size={provider_max_token_size}, "
-                f"embedding_dim={provider_embedding_dim}, "
-                f"supports_asymmetric={provider_supports_asymmetric}"
-            )
-    except ImportError as e:
-        logger.warning(f"Could not import provider function for {binding}: {e}")
-
-    # Step 2: Apply priority (user config > provider default)
-    # For max_token_size: explicit env var > provider default > None
-    final_max_token_size = args.embedding_token_limit or provider_max_token_size
-    # For embedding_dim: user config (always has value) takes priority
-    # Only use provider default if user config is explicitly None (which shouldn't happen)
-    final_embedding_dim = (
-        args.embedding_dim if args.embedding_dim else provider_embedding_dim
-    )
-    # Asymmetric embedding is explicit opt-in only. Provider-specific
-    # validation decides whether task parameters or prefixes are required.
-    asymmetric_opt_in = resolve_asymmetric_embedding_opt_in(
-        binding=binding,
-        embedding_asymmetric=args.embedding_asymmetric,
-        embedding_asymmetric_configured=args.embedding_asymmetric_configured,
-        query_prefix=query_prefix,
-        document_prefix=document_prefix,
-        query_prefix_configured=args.embedding_query_prefix_configured,
-        document_prefix_configured=args.embedding_document_prefix_configured,
-    )
-
-    # Step 3: Create optimized embedding function (calls underlying function directly)
-    # Note: When model is None, each binding will use its own default model
-    async def optimized_embedding_function(
-        texts, embedding_dim=None, context="document"
-    ):
-        try:
-            if binding == "lollms":
-                from lightrag.llm.lollms import lollms_embed
-
-                # Get real function, skip EmbeddingFunc wrapper if present
-                actual_func = (
-                    lollms_embed.func
-                    if isinstance(lollms_embed, EmbeddingFunc)
-                    else lollms_embed
-                )
-                # lollms embed_model is not used (server uses configured vectorizer)
-                # Only pass base_url and api_key
-                return await actual_func(texts, base_url=host, api_key=api_key)
-            elif binding == "ollama":
-                from lightrag.llm.ollama import ollama_embed
-
-                # Get real function, skip EmbeddingFunc wrapper if present
-                actual_func = (
-                    ollama_embed.func
-                    if isinstance(ollama_embed, EmbeddingFunc)
-                    else ollama_embed
-                )
-
-                # Use pre-processed configuration if available
-                if config_cache.ollama_embedding_options is not None:
-                    ollama_options = config_cache.ollama_embedding_options
-                else:
-                    from lightrag.llm.binding_options import OllamaEmbeddingOptions
-
-                    ollama_options = OllamaEmbeddingOptions.options_dict(args)
-
-                # Pass embed_model only if provided, let function use its default (bge-m3:latest)
-                kwargs = {
-                    "texts": texts,
-                    "host": host,
-                    "api_key": api_key,
-                    "options": ollama_options,
-                }
-                if provider_supports_asymmetric and asymmetric_opt_in:
-                    kwargs["context"] = context
-                    if query_prefix:
-                        kwargs["query_prefix"] = query_prefix
-                    if document_prefix:
-                        kwargs["document_prefix"] = document_prefix
-                if model:
-                    kwargs["embed_model"] = model
-                return await actual_func(**kwargs)
-            elif binding == "azure_openai":
-                from lightrag.llm.azure_openai import azure_openai_embed
-
-                actual_func = (
-                    azure_openai_embed.func
-                    if isinstance(azure_openai_embed, EmbeddingFunc)
-                    else azure_openai_embed
-                )
-                # Pass model only if provided, let function use its default otherwise
-                kwargs = {
-                    "texts": texts,
-                    "api_key": api_key,
-                    "embedding_dim": embedding_dim,
-                }
-                if model:
-                    kwargs["model"] = model
-                if provider_supports_asymmetric and asymmetric_opt_in:
-                    kwargs["context"] = context
-                    if query_prefix:
-                        kwargs["query_prefix"] = query_prefix
-                    if document_prefix:
-                        kwargs["document_prefix"] = document_prefix
-                return await actual_func(**kwargs)
-            elif binding == "bedrock":
-                from lightrag.llm.bedrock import bedrock_embed
-
-                actual_func = (
-                    bedrock_embed.func
-                    if isinstance(bedrock_embed, EmbeddingFunc)
-                    else bedrock_embed
-                )
-                # Pass model only if provided, let function use its default otherwise
-                kwargs = {
-                    "texts": texts,
-                    "aws_region": getattr(args, "aws_region", None),
-                    "aws_access_key_id": getattr(args, "aws_access_key_id", None),
-                    "aws_secret_access_key": getattr(
-                        args, "aws_secret_access_key", None
-                    ),
-                    "aws_session_token": getattr(args, "aws_session_token", None),
-                }
-                if host is not None:
-                    kwargs["endpoint_url"] = host
-                if model:
-                    kwargs["model"] = model
-                return await actual_func(**kwargs)
-            elif binding == "jina":
-                from lightrag.llm.jina import jina_embed
-
-                actual_func = (
-                    jina_embed.func
-                    if isinstance(jina_embed, EmbeddingFunc)
-                    else jina_embed
-                )
-                # Pass model only if provided, let function use its default (jina-embeddings-v4)
-                kwargs = {
-                    "texts": texts,
-                    "embedding_dim": embedding_dim,
-                    "base_url": host,
-                    "api_key": api_key,
-                }
-                if model:
-                    kwargs["model"] = model
-                if provider_supports_asymmetric and asymmetric_opt_in:
-                    kwargs["context"] = context
-                    kwargs["task"] = None
-                return await actual_func(**kwargs)
-            elif binding == "gemini":
-                from lightrag.llm.gemini import gemini_embed
-
-                actual_func = (
-                    gemini_embed.func
-                    if isinstance(gemini_embed, EmbeddingFunc)
-                    else gemini_embed
-                )
-
-                # Use pre-processed configuration if available
-                if config_cache.gemini_embedding_options is not None:
-                    gemini_options = config_cache.gemini_embedding_options
-                else:
-                    from lightrag.llm.binding_options import GeminiEmbeddingOptions
-
-                    gemini_options = GeminiEmbeddingOptions.options_dict(args)
-                # Pass model only if provided, let function use its default (gemini-embedding-001)
-                kwargs = {
-                    "texts": texts,
-                    "base_url": host,
-                    "api_key": api_key,
-                    "embedding_dim": embedding_dim,
-                }
-                if model:
-                    kwargs["model"] = model
-                task_type = gemini_options.get("task_type")
-                if task_type is not None:
-                    kwargs["task_type"] = task_type
-                if provider_supports_asymmetric and asymmetric_opt_in:
-                    kwargs["context"] = context
-                return await actual_func(**kwargs)
-            elif binding == "voyageai":
-                from lightrag.llm.voyageai import voyageai_embed
-
-                actual_func = (
-                    voyageai_embed.func
-                    if isinstance(voyageai_embed, EmbeddingFunc)
-                    else voyageai_embed
-                )
-                kwargs = {
-                    "texts": texts,
-                    "api_key": api_key,
-                    "embedding_dim": embedding_dim,
-                }
-                if model:
-                    kwargs["model"] = model
-                if provider_supports_asymmetric and asymmetric_opt_in:
-                    kwargs["context"] = context
-                return await actual_func(**kwargs)
-            else:  # openai and compatible
-                from lightrag.llm.openai import openai_embed
-
-                actual_func = (
-                    openai_embed.func
-                    if isinstance(openai_embed, EmbeddingFunc)
-                    else openai_embed
-                )
-                # Pass model only if provided, let function use its default (text-embedding-3-small)
-                kwargs = {
-                    "texts": texts,
-                    "base_url": host,
-                    "api_key": api_key,
-                    "embedding_dim": embedding_dim,
-                }
-                if model:
-                    kwargs["model"] = model
-                if provider_supports_asymmetric and asymmetric_opt_in:
-                    kwargs["context"] = context
-                    if query_prefix:
-                        kwargs["query_prefix"] = query_prefix
-                    if document_prefix:
-                        kwargs["document_prefix"] = document_prefix
-                return await actual_func(**kwargs)
-        except ImportError as e:
-            raise Exception(f"Failed to import {binding} embedding: {e}")
-
-    # Step 4: Wrap in EmbeddingFunc and return
-    embedding_func_instance = EmbeddingFunc(
-        embedding_dim=final_embedding_dim,
-        func=optimized_embedding_function,
-        max_token_size=final_max_token_size,
-        send_dimensions=False,  # Will be set later based on binding requirements
-        model_name=model,
-        supports_asymmetric=provider_supports_asymmetric and asymmetric_opt_in,
-    )
-
-    # Log final embedding configuration. Only include prefix info when
-    # prefixes will actually be applied (prefix-based asymmetric mode).
-    prefix_info = ""
-    if (
-        asymmetric_opt_in
-        and binding in PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS
-        and (document_prefix or query_prefix)
-    ):
-        prefix_info = f" document_prefix={repr(document_prefix)} query_prefix={repr(query_prefix)}"
-    logger.info(
-        f"Embedding config: binding={binding} model={model} "
-        f"embedding_dim={final_embedding_dim} max_token_size={final_max_token_size}{prefix_info}"
-    )
-
-    return embedding_func_instance
-
-
-def create_embedding_function_from_args(
-    args, config_cache: LLMConfigCache | None = None
-) -> EmbeddingFunc:
-    """Build the fully configured EmbeddingFunc used by the LightRAG server.
-
-    Combines the provider embedding factory with the send_dimensions policy
-    so that offline tools (e.g. lightrag-rebuild-vdb) can embed in exactly
-    the same vector space as the running server.
-    """
-    import inspect
-
-    if config_cache is None:
-        config_cache = LLMConfigCache(args)
-
-    # Create the EmbeddingFunc instance (now returns complete EmbeddingFunc with max_token_size)
-    embedding_func = create_optimized_embedding_function(
-        config_cache=config_cache,
-        binding=args.embedding_binding,
-        model=args.embedding_model,
-        host=args.embedding_binding_host,
-        api_key=None
-        if args.embedding_binding == "bedrock"
-        else args.embedding_binding_api_key,
-        args=args,
-        document_prefix=args.embedding_document_prefix,
-        query_prefix=args.embedding_query_prefix,
-    )
-
-    # Get embedding_send_dim from centralized configuration
-    embedding_send_dim = args.embedding_send_dim
-
-    # Check if the underlying function signature has embedding_dim parameter
-    sig = inspect.signature(embedding_func.func)
-    has_embedding_dim_param = "embedding_dim" in sig.parameters
-
-    # Determine send_dimensions value based on binding type
-    # Jina and Gemini REQUIRE dimension parameter (forced to True)
-    # OpenAI and others: controlled by EMBEDDING_SEND_DIM environment variable
-    if args.embedding_binding in ["jina", "gemini"]:
-        # Jina and Gemini APIs require dimension parameter - always send it
-        send_dimensions = has_embedding_dim_param
-        dimension_control = f"forced by {args.embedding_binding.title()} API"
-    else:
-        # For OpenAI and other bindings, respect EMBEDDING_SEND_DIM setting
-        send_dimensions = embedding_send_dim and has_embedding_dim_param
-        if send_dimensions or not embedding_send_dim:
-            dimension_control = "by env var"
-        else:
-            dimension_control = "by not hasparam"
-
-    # Set send_dimensions on the EmbeddingFunc instance
-    embedding_func.send_dimensions = send_dimensions
-
-    logger.info(
-        f"Send embedding dimension: {send_dimensions} {dimension_control} "
-        f"(dimensions={embedding_func.embedding_dim}, has_param={has_embedding_dim_param}, "
-        f"binding={args.embedding_binding})"
-    )
-
-    # Log max_token_size source
-    if embedding_func.max_token_size:
-        source = (
-            "env variable"
-            if args.embedding_token_limit
-            else f"{args.embedding_binding} provider default"
-        )
-        logger.info(
-            f"Embedding max_token_size: {embedding_func.max_token_size} (from {source})"
-        )
-    else:
-        logger.info(
-            "Embedding max_token_size: None (Embedding token limit is disabled)."
-        )
-
-    return embedding_func
-
-
-def _provider_log_label(binding: Any) -> str:
-    binding_name = str(binding)
-    return _PROVIDER_LOG_LABELS.get(
-        binding_name, binding_name.replace("_", " ").title()
-    )
-
-
-def _log_role_provider_options(rag: Any) -> None:
-    """Log sanitized provider options for every role LLM."""
-    try:
-        role_configs = rag.get_llm_role_config()
-    except Exception as e:
-        logger.warning(f"Failed to read role LLM configuration for logging: {e}")
-        return
-
-    logger.info("Role LLM Option:")
-
-    for spec in ROLES:
-        role_config = role_configs.get(spec.name)
-        if not isinstance(role_config, dict):
-            continue
-
-        metadata = role_config.get("metadata") or {}
-        binding = role_config.get("binding") or metadata.get("binding")
-        if not binding:
-            continue
-
-        provider_options = metadata.get("provider_options") or {}
-        logger.info(
-            " - %s: %s %s",
-            spec.name,
-            _provider_log_label(binding),
-            provider_options,
-        )
-
-
 def check_frontend_build():
     """Check if frontend is built and optionally check if source is up-to-date
 
@@ -1194,6 +690,26 @@ def check_frontend_build():
         return (True, False)  # Assume assets exist and up-to-date on error
 
 
+def check_workspace_frontend_build() -> bool:
+    """Whether the workspace query entry's HTML (workspace.html) is bundled.
+
+    Checked independently from ``check_frontend_build()``: a stale build
+    directory (new server + old WebUI bundle) legitimately contains only
+    index.html, and that must degrade ONLY the /workspace entry — treating
+    the whole WebUI as "not built" would needlessly take the admin /webui
+    down with it.
+    """
+    workspace_html = Path(__file__).parent / "webui" / WORKSPACE_INDEX_FILENAME
+    if workspace_html.exists():
+        return True
+    ASCIIColors.yellow(
+        "WARNING: workspace.html is missing from the WebUI build directory. "
+        "The /workspace query entry will be unavailable (admin /webui is not "
+        "affected). Rebuild the frontend to enable it."
+    )
+    return False
+
+
 def _build_capability_status(rag) -> dict:
     """Strict-capability report, or ``{}`` when it cannot be determined.
 
@@ -1252,9 +768,144 @@ def _build_scheduling_status(pipeline_snapshot: dict, ingress_counts: dict) -> d
     }
 
 
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Render a request-validation refusal in the shape each endpoint promises.
+
+    Module-level rather than a closure inside ``create_app`` so the real
+    handler can be exercised without standing up the whole application.
+    """
+    # Check if this is a request to /query/data endpoint
+    if request.url.path.endswith("/query/data"):
+        # Extract error details
+        error_details = []
+        for error in exc.errors():
+            field_path = " -> ".join(str(loc) for loc in error["loc"])
+            error_details.append(f"{field_path}: {error['msg']}")
+
+        error_message = "; ".join(error_details)
+
+        # Return in the expected format for /query/data
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "failure",
+                "message": f"Validation error: {error_message}",
+                "data": {},
+                "metadata": {},
+            },
+        )
+
+    # For other endpoints, return the default FastAPI validation error.
+    # `jsonable_encoder` is not optional here: a rejection raised as a
+    # ValueError inside a validator (the RAG query minimum, the non-empty
+    # check, the keyword and history checks, the aggregate text budget)
+    # carries the exception object itself in `ctx.error`, which json.dumps
+    # cannot serialize — without the encoder this handler raises and the
+    # client gets a 500 in place of the 422 the refusal actually is.
+    return JSONResponse(
+        status_code=422, content={"detail": jsonable_encoder(exc.errors())}
+    )
+
+
 def create_app(args):
-    # Check frontend build first and get status
+    # A server with no configured embedding model cannot protect its vectors.
+    # The marker every vector backend records is what detects a swap to a
+    # DIFFERENT model of the same dimension -- the one change no dimension
+    # check can see -- and with no name to record, every container this server
+    # provisions is unprotected for life.
+    #
+    # Refusing at startup rather than degrading is the same call the rest of
+    # this feature makes: LightRAG supports neither multi-process configuration
+    # propagation nor rolling updates, so an embedding-model change means
+    # stopping the server and rebuilding the indexes with lightrag-rebuild-vdb.
+    # A deployment that cannot tell which model wrote its vectors has no safe
+    # way through that, and finding out at query time means wrong answers, not
+    # an error. Only the SERVER refuses: the library stays usable without a
+    # model name, and lightrag-rebuild-vdb in particular must keep running,
+    # since it is the way out.
+    #
+    # An args object that never carried the field is refused the same way. The
+    # ``default_ui`` tolerance below is for a cosmetic default; a safety guard
+    # with an exemption for "the attribute was never set" is a guard with a
+    # bypass, and the server's own parser always sets this one.
+    if not (getattr(args, "embedding_model", None) or "").strip():
+        raise SystemExit(
+            "EMBEDDING_MODEL is not set. The server refuses to start without it: "
+            "the embedding model's name is what every vector storage records "
+            "alongside its vectors, and it is the only thing that detects a later "
+            "switch to a different model of the same dimension -- which otherwise "
+            "returns confidently wrong results with no error anywhere. Set "
+            "EMBEDDING_MODEL to the model this deployment embeds with (and "
+            "EMBEDDING_DIM when it is not the binding's default). Changing it "
+            "later requires stopping the server and running lightrag-rebuild-vdb; "
+            "rolling an embedding-model change through a live deployment is not "
+            "supported."
+        )
+
+    # Check frontend build first and get status. The two entries are checked
+    # independently: an old build directory may carry only index.html, which
+    # degrades /workspace alone (see check_workspace_frontend_build).
     webui_assets_exist, is_frontend_outdated = check_frontend_build()
+    workspace_assets_exist = check_workspace_frontend_build()
+    # Scope of default_ui is exactly one behavior: the '/' redirect target.
+    # getattr default keeps create_app working for programmatic callers that
+    # build args without this field (tests, embedding).
+    default_ui = getattr(args, "default_ui", "webui")
+
+    # UI customization bundle (workspace-entry PRD §8). Completely orthogonal
+    # to the entry-HTML checks above: a configured-but-broken bundle fails
+    # startup regardless of which entry products exist, and a missing
+    # workspace.html never suppresses bundle validation. bundle_revision is
+    # logged HERE only — it appears in no /health tier.
+    ui_templates_dir = (getattr(args, "ui_templates_dir", "") or "").strip()
+    ui_customization_snapshot = None
+    if ui_templates_dir:
+        # Raises UICustomizationError → server startup fails (fail-fast; a
+        # silent fallback would show LightRAG content while the operator
+        # believes the customer branding is live). Returns None for the one
+        # sanctioned exception: a configured directory that holds no
+        # manifest.json yet, i.e. the unpopulated mount every default Docker
+        # deployment starts with (see resolve_ui_customization_snapshot).
+        ui_customization_snapshot = resolve_ui_customization_snapshot(ui_templates_dir)
+    if ui_customization_snapshot is not None:
+        logger.info(
+            "UI customization: bundle %s %s",
+            ui_customization_snapshot.bundle_revision,
+            sorted(ui_customization_snapshot.locales),
+        )
+        # A bundle may declare any valid BCP 47 locale, but the WebUI chrome
+        # only exists in the languages it ships. Content in another language
+        # renders fine while the buttons and settings around it stay in the
+        # visitor's resolved UI language — nothing the frontend can fix, so
+        # say it here instead of leaving the operator to discover it from a
+        # user's screenshot.
+        untranslated = locales_without_chrome_translation(
+            ui_customization_snapshot.locales
+        )
+        if untranslated:
+            logger.warning(
+                "UI customization: the WebUI ships no interface translation for "
+                "%s — content in %s locale(s) will render beside controls in the "
+                "visitor's resolved UI language (supported: %s)",
+                untranslated,
+                len(untranslated),
+                sorted(WEBUI_CHROME_LOCALES),
+            )
+    elif ui_templates_dir:
+        # Not an error, but not silent either: the only way to tell "I have
+        # not written my bundle yet" from "my mount did not land where I
+        # thought" is the path this names.
+        logger.warning(
+            "UI customization: UI_TEMPLATES_DIR=%s holds no manifest.json — "
+            "serving the built-in LightRAG branding. Put a bundle there and "
+            "restart to activate it; if you expected one, check that the "
+            "directory is the one you populated.",
+            ui_templates_dir,
+        )
+    else:
+        logger.info("UI customization: no bundle configured (UI_TEMPLATES_DIR unset)")
 
     # Create unified API version display with warning symbol if frontend is outdated
     api_version_display = (
@@ -1267,45 +918,50 @@ def create_app(args):
     # Discover third-party parser engines (``lightrag.parsers`` entry points)
     # BEFORE validating routing rules, so LIGHTRAG_PARSER may reference them.
     load_third_party_parsers()
+    # Same reason as the smart_heading block below: an invalid CUSTOM_CHUNKER
+    # is an operator configuration mistake, and a raw ValueError traceback
+    # buries the one sentence that says how to fix it. Re-raised, never
+    # swallowed — an unselectable chunker must still abort startup (the
+    # deployment would otherwise chunk its C documents the wrong way).
+    try:
+        selected_chunker = load_and_resolve_chunker(getattr(args, "custom_chunker", ""))
+    except ValueError as exc:
+        # markup=False: ASCIIColors interprets "[...]" as rich markup tags.
+        ASCIIColors.red("\n" + "=" * 80, markup=False)
+        ASCIIColors.red("ERROR: invalid CUSTOM_CHUNKER selection", markup=False)
+        ASCIIColors.red("=" * 80, markup=False)
+        ASCIIColors.red(str(exc), markup=False)
+        ASCIIColors.red("\nAuthoring and selection guide:", markup=False)
+        ASCIIColors.cyan("    docs/ThirdPartyChunker.md", markup=False)
+        ASCIIColors.red("=" * 80 + "\n", markup=False)
+        raise
+    log_chunker_selection(selected_chunker)
     validate_parser_routing_config()
     # Fail fast when DOCX_SMART_HEADING / a LIGHTRAG_PARSER rule enables
     # smart_heading but the pinned spaCy models are missing — surfacing the
     # install step at startup instead of failing mid-pipeline. Runs in
     # create_app so both the uvicorn and gunicorn (preload) paths hit it.
-    validate_smart_heading_dependencies()
-
-    # Create configuration cache (this will output configuration logs)
-    config_cache = LLMConfigCache(args)
-
-    # Verify that bindings are correctly setup
-    if args.llm_binding not in [
-        "lollms",
-        "ollama",
-        "openai",
-        "azure_openai",
-        "bedrock",
-        "gemini",
-    ]:
-        raise Exception("llm binding not supported")
-
-    if args.embedding_binding not in [
-        "lollms",
-        "ollama",
-        "openai",
-        "azure_openai",
-        "bedrock",
-        "jina",
-        "gemini",
-        "voyageai",
-    ]:
-        raise Exception(f"embedding binding '{args.embedding_binding}' not supported")
-
-    # Set default hosts if not provided
-    if args.llm_binding_host is None:
-        args.llm_binding_host = get_default_host(args.llm_binding)
-
-    if args.embedding_binding_host is None:
-        args.embedding_binding_host = get_default_host(args.embedding_binding)
+    # Caught here (instead of letting it propagate as a raw traceback) so the
+    # missing-dependency message reads like the other boxed startup notices.
+    try:
+        validate_smart_heading_dependencies()
+    except SmartHeadingNLPError as exc:
+        # markup=False: ASCIIColors interprets "[...]" as rich markup tags and
+        # silently drops anything it doesn't recognize (e.g. "[api]").
+        ASCIIColors.red("\n" + "=" * 80, markup=False)
+        ASCIIColors.red("ERROR: smart_heading dependencies missing", markup=False)
+        ASCIIColors.red("=" * 80, markup=False)
+        ASCIIColors.red(exc.problem, markup=False)
+        ASCIIColors.red("\nInstall with:", markup=False)
+        ASCIIColors.cyan(
+            "    pip install lightrag-hku[api] && lightrag-download-cache --spacy-install",
+            markup=False,
+        )
+        ASCIIColors.red(
+            "(offline: see requirements-offline-smart-heading.txt)", markup=False
+        )
+        ASCIIColors.red("=" * 80 + "\n", markup=False)
+        sys.exit(1)
 
     # Add SSL validation
     if args.ssl:
@@ -1376,7 +1032,7 @@ def create_app(args):
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
-                logger.debug("Unvicorn Mode: finalizing shared storage...")
+                logger.debug("Uvicorn Mode: finalizing shared storage...")
                 finalize_share_data()
             else:
                 # In Gunicorn mode with preload_app=True, cleanup is handled by on_exit hooks
@@ -1388,27 +1044,42 @@ def create_app(args):
             if shutdown_cancel is not None:
                 raise shutdown_cancel
 
+    # Single switch for every interactive API documentation surface: /docs,
+    # /docs/oauth2-redirect, /redoc, /openapi.json and the /static/swagger-ui
+    # mount. All five must stay conditioned on this one flag (one flag) — a route audit that special-cases only the APIRoutes would
+    # diverge from the real route table.
+    api_docs_enabled = bool(getattr(args, "enable_api_docs", True))
+
+    # Whether the two query UIs label every answer as AI-generated
+    # (ENABLE_AI_CONTENT_NOTICE). Deployment-level display configuration, so
+    # it rides the same responses as webui_title/webui_description: both
+    # entries read it once at boot from /auth-status (or /login), and the
+    # admin shell keeps it fresh from its /health poll. getattr keeps
+    # create_app working for callers that build args programmatically.
+    ai_content_notice_enabled = bool(getattr(args, "enable_ai_content_notice", False))
+
+    # The WebUI mount path is fixed at "/webui" — see
+    # docs/MultiSiteDeployment.md for the rationale. Computed before
+    # swagger_description below, which embeds it in the ReDoc link.
+    api_prefix = normalize_api_prefix(getattr(args, "api_prefix", None))
+    webui_path = WEBUI_PATH
+
     base_description = (
         "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
     )
     swagger_description = (
         base_description
         + (" (API-Key Enabled)" if api_key else "")
-        + "\n\n[View ReDoc documentation](/redoc)"
+        + f"\n\n[View ReDoc documentation]({api_prefix}/redoc)"
     )
-
-    # The WebUI mount path is fixed at "/webui" — see
-    # docs/MultiSiteDeployment.md for the rationale.
-    api_prefix = normalize_api_prefix(getattr(args, "api_prefix", None))
-    webui_path = WEBUI_PATH
 
     app_kwargs = {
         "title": "LightRAG Server API",
         "description": swagger_description,
         "version": __api_version__,
-        "openapi_url": "/openapi.json",
+        "openapi_url": "/openapi.json" if api_docs_enabled else None,
         "docs_url": None,  # custom endpoint for offline Swagger support
-        "redoc_url": "/redoc",
+        "redoc_url": "/redoc" if api_docs_enabled else None,
         "root_path": api_prefix if api_prefix else None,
         "lifespan": lifespan,
     }
@@ -1422,34 +1093,9 @@ def create_app(args):
 
     app = FastAPI(**app_kwargs)
 
-    # Add custom validation error handler for /query/data endpoint
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(
-        request: Request, exc: RequestValidationError
-    ):
-        # Check if this is a request to /query/data endpoint
-        if request.url.path.endswith("/query/data"):
-            # Extract error details
-            error_details = []
-            for error in exc.errors():
-                field_path = " -> ".join(str(loc) for loc in error["loc"])
-                error_details.append(f"{field_path}: {error['msg']}")
-
-            error_message = "; ".join(error_details)
-
-            # Return in the expected format for /query/data
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "failure",
-                    "message": f"Validation error: {error_message}",
-                    "data": {},
-                    "metadata": {},
-                },
-            )
-        else:
-            # For other endpoints, return the default FastAPI validation error
-            return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    # Custom validation error handler, shaped per endpoint (see the
+    # module-level function for why it is not a closure).
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
 
     # Last-resort handler for any exception that escapes a route without being
     # converted to an HTTPException. It guarantees raw exception text never
@@ -1588,707 +1234,8 @@ def create_app(args):
 
         return workspace
 
-    # Create working directory if it doesn't exist
-    Path(args.working_dir).mkdir(parents=True, exist_ok=True)
+    rag = build_rag_from_args(args, selected_chunker=selected_chunker)
 
-    def create_optimized_openai_llm_func(
-        config_cache: LLMConfigCache, args, llm_timeout: int
-    ):
-        """Create optimized OpenAI LLM function with pre-processed configuration"""
-
-        async def optimized_openai_alike_model_complete(
-            prompt,
-            system_prompt=None,
-            history_messages=None,
-            **kwargs,
-        ) -> str:
-            from lightrag.llm.openai import openai_complete_if_cache
-
-            if history_messages is None:
-                history_messages = []
-
-            # Use pre-processed configuration to avoid repeated parsing.
-            # response_format and legacy keyword_extraction/entity_extraction
-            # flags flow through **kwargs; openai_complete_if_cache handles
-            # the deprecation shim for the legacy booleans.
-            kwargs["timeout"] = llm_timeout
-            if config_cache.openai_llm_options:
-                kwargs.update(config_cache.openai_llm_options)
-
-            return await openai_complete_if_cache(
-                args.llm_model,
-                prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
-                base_url=args.llm_binding_host,
-                api_key=args.llm_binding_api_key,
-                **kwargs,
-            )
-
-        return optimized_openai_alike_model_complete
-
-    def create_optimized_azure_openai_llm_func(
-        config_cache: LLMConfigCache, args, llm_timeout: int
-    ):
-        """Create optimized Azure OpenAI LLM function with pre-processed configuration"""
-
-        async def optimized_azure_openai_model_complete(
-            prompt,
-            system_prompt=None,
-            history_messages=None,
-            **kwargs,
-        ) -> str:
-            from lightrag.llm.azure_openai import azure_openai_complete_if_cache
-
-            if history_messages is None:
-                history_messages = []
-
-            # response_format and legacy extraction booleans flow through kwargs
-            # to azure_openai_complete_if_cache, which handles deprecation shims.
-            kwargs["timeout"] = llm_timeout
-            if config_cache.openai_llm_options:
-                kwargs.update(config_cache.openai_llm_options)
-
-            return await azure_openai_complete_if_cache(
-                args.llm_model,
-                prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
-                base_url=args.llm_binding_host,
-                api_key=os.getenv("AZURE_OPENAI_API_KEY", args.llm_binding_api_key),
-                api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
-                **kwargs,
-            )
-
-        return optimized_azure_openai_model_complete
-
-    def create_optimized_gemini_llm_func(
-        config_cache: LLMConfigCache, args, llm_timeout: int
-    ):
-        """Create optimized Gemini LLM function with cached configuration"""
-
-        async def optimized_gemini_model_complete(
-            prompt,
-            system_prompt=None,
-            history_messages=None,
-            **kwargs,
-        ) -> str:
-            from lightrag.llm.gemini import gemini_complete_if_cache
-
-            if history_messages is None:
-                history_messages = []
-
-            # response_format and legacy extraction booleans flow through kwargs
-            # to gemini_complete_if_cache, which handles deprecation shims.
-            kwargs["timeout"] = llm_timeout
-            if (
-                config_cache.gemini_llm_options is not None
-                and "generation_config" not in kwargs
-            ):
-                kwargs["generation_config"] = dict(config_cache.gemini_llm_options)
-
-            return await gemini_complete_if_cache(
-                args.llm_model,
-                prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
-                api_key=args.llm_binding_api_key,
-                base_url=args.llm_binding_host,
-                **kwargs,
-            )
-
-        return optimized_gemini_model_complete
-
-    def create_llm_model_func(binding: str):
-        """
-        Create LLM model function based on binding type.
-        Uses optimized functions for OpenAI bindings and lazy import for others.
-        """
-        try:
-            if binding == "lollms":
-                from lightrag.llm.lollms import lollms_model_complete
-
-                return lollms_model_complete
-            elif binding == "ollama":
-                from lightrag.llm.ollama import ollama_model_complete
-
-                return ollama_model_complete
-            elif binding == "bedrock":
-                return bedrock_model_complete  # Already defined locally
-            elif binding == "azure_openai":
-                # Use optimized function with pre-processed configuration
-                return create_optimized_azure_openai_llm_func(
-                    config_cache, args, llm_timeout
-                )
-            elif binding == "gemini":
-                return create_optimized_gemini_llm_func(config_cache, args, llm_timeout)
-            else:  # openai and compatible
-                # Use optimized function with pre-processed configuration
-                return create_optimized_openai_llm_func(config_cache, args, llm_timeout)
-        except ImportError as e:
-            raise Exception(f"Failed to import {binding} LLM binding: {e}")
-
-    def create_llm_model_kwargs(binding: str, args, llm_timeout: int) -> dict:
-        """
-        Create LLM model kwargs based on binding type.
-        Uses lazy import for binding-specific options.
-        """
-        if binding in ["lollms", "ollama"]:
-            try:
-                from lightrag.llm.binding_options import OllamaLLMOptions
-
-                return {
-                    "host": args.llm_binding_host,
-                    "timeout": llm_timeout,
-                    "options": OllamaLLMOptions.options_dict(args),
-                    "api_key": args.llm_binding_api_key,
-                }
-            except ImportError as e:
-                raise Exception(f"Failed to import {binding} options: {e}")
-        return {}
-
-    def resolve_role_llm_settings(
-        role: str, override_meta: dict | None = None
-    ) -> dict[str, Any]:
-        attr = role.lower()
-        override_meta = override_meta or {}
-
-        role_binding = (
-            override_meta.get("binding")
-            or getattr(args, f"{attr}_llm_binding", None)
-            or args.llm_binding
-        )
-        role_model = (
-            override_meta.get("model")
-            or getattr(args, f"{attr}_llm_model", None)
-            or args.llm_model
-        )
-        role_host = (
-            override_meta.get("host")
-            or getattr(args, f"{attr}_llm_binding_host", None)
-            or args.llm_binding_host
-        )
-        explicit_role_apikey = override_meta.get("api_key") or getattr(
-            args, f"{attr}_llm_binding_api_key", None
-        )
-        if role_binding == "bedrock":
-            if explicit_role_apikey:
-                raise ValueError(
-                    f"Bedrock role '{role}' does not support role-specific "
-                    "LLM_BINDING_API_KEY; use role-specific SigV4 AWS_* "
-                    "variables or process-level AWS_BEARER_TOKEN_BEDROCK."
-                )
-            role_apikey = None
-        else:
-            role_apikey = explicit_role_apikey or args.llm_binding_api_key
-        role_timeout = (
-            override_meta.get("timeout")
-            or getattr(args, f"{attr}_llm_timeout", None)
-            or llm_timeout
-        )
-        role_max_async = override_meta.get("max_async")
-        if role_max_async is None:
-            role_max_async = getattr(args, f"{attr}_llm_max_async", None)
-        is_cross_provider = role_binding != args.llm_binding
-
-        role_provider_options = override_meta.get("provider_options")
-        if role_provider_options is None:
-            if role_binding in ["openai", "azure_openai"]:
-                from lightrag.llm.binding_options import OpenAILLMOptions
-
-                role_provider_options = OpenAILLMOptions.options_dict_for_role(
-                    args, role, is_cross_provider
-                )
-            elif role_binding == "gemini":
-                from lightrag.llm.binding_options import GeminiLLMOptions
-
-                role_provider_options = GeminiLLMOptions.options_dict_for_role(
-                    args, role, is_cross_provider
-                )
-            elif role_binding in ["lollms", "ollama"]:
-                from lightrag.llm.binding_options import OllamaLLMOptions
-
-                role_provider_options = OllamaLLMOptions.options_dict_for_role(
-                    args, role, is_cross_provider
-                )
-            elif role_binding == "bedrock":
-                from lightrag.llm.binding_options import BedrockLLMOptions
-
-                role_provider_options = BedrockLLMOptions.options_dict_for_role(
-                    args, role, is_cross_provider
-                )
-            else:
-                role_provider_options = {}
-
-        bedrock_aws_options = {}
-        if role_binding == "bedrock":
-            override_bedrock_aws_options = override_meta.get("bedrock_aws_options", {})
-            bedrock_aws_options = {
-                "aws_region": override_meta.get("aws_region")
-                or override_bedrock_aws_options.get("aws_region")
-                or getattr(args, f"{attr}_aws_region", None)
-                or getattr(args, "aws_region", None),
-                "aws_access_key_id": override_meta.get("aws_access_key_id")
-                or override_bedrock_aws_options.get("aws_access_key_id")
-                or getattr(args, f"{attr}_aws_access_key_id", None)
-                or getattr(args, "aws_access_key_id", None),
-                "aws_secret_access_key": override_meta.get("aws_secret_access_key")
-                or override_bedrock_aws_options.get("aws_secret_access_key")
-                or getattr(args, f"{attr}_aws_secret_access_key", None)
-                or getattr(args, "aws_secret_access_key", None),
-                "aws_session_token": override_meta.get("aws_session_token")
-                or override_bedrock_aws_options.get("aws_session_token")
-                or getattr(args, f"{attr}_aws_session_token", None)
-                or getattr(args, "aws_session_token", None),
-            }
-
-        return {
-            "binding": role_binding,
-            "model": role_model,
-            "host": role_host,
-            "api_key": role_apikey,
-            "timeout": role_timeout,
-            "max_async": role_max_async,
-            "provider_options": role_provider_options,
-            "is_cross_provider": is_cross_provider,
-            "bedrock_aws_options": bedrock_aws_options,
-        }
-
-    def create_role_llm_func(role: str, override_meta: dict | None = None):
-        """Create an independent raw LLM function for a role."""
-        settings = resolve_role_llm_settings(role, override_meta)
-        role_binding = settings["binding"]
-        role_model = settings["model"]
-        role_host = settings["host"]
-        role_apikey = settings["api_key"]
-        role_timeout = settings["timeout"]
-        role_provider_options = settings["provider_options"]
-        bedrock_aws_options = settings["bedrock_aws_options"]
-
-        try:
-            if role_binding == "ollama":
-                from lightrag.llm.ollama import _ollama_model_if_cache
-
-                async def role_ollama_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    enable_cot: bool = False,
-                    **kwargs,
-                ):
-                    # response_format and legacy extraction booleans flow
-                    # through kwargs to _ollama_model_if_cache, which handles
-                    # the deprecation shim and emits a single warning.
-                    if history_messages is None:
-                        history_messages = []
-                    if role_provider_options:
-                        kwargs.setdefault("options", dict(role_provider_options))
-                    return await _ollama_model_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        enable_cot=enable_cot,
-                        host=role_host,
-                        timeout=role_timeout,
-                        api_key=role_apikey,
-                        **kwargs,
-                    )
-
-                return role_ollama_complete
-            if role_binding == "lollms":
-                from lightrag.llm.lollms import lollms_model_if_cache
-
-                async def role_lollms_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    enable_cot: bool = False,
-                    **kwargs,
-                ):
-                    # response_format and legacy extraction booleans flow
-                    # through kwargs to lollms_model_if_cache, which drops
-                    # them and emits deprecation warnings when booleans are set.
-                    if history_messages is None:
-                        history_messages = []
-                    if role_provider_options:
-                        kwargs = {**role_provider_options, **kwargs}
-                    return await lollms_model_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        enable_cot=enable_cot,
-                        base_url=role_host,
-                        api_key=role_apikey,
-                        timeout=role_timeout,
-                        **kwargs,
-                    )
-
-                return role_lollms_complete
-            if role_binding == "bedrock":
-                from lightrag.llm.bedrock import bedrock_complete_if_cache
-
-                async def role_bedrock_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    **kwargs,
-                ) -> str:
-                    if history_messages is None:
-                        history_messages = []
-                    # Server-configured timeout overrides any caller-passed value,
-                    # matching the OpenAI/Azure/Gemini role wrappers.
-                    kwargs["timeout"] = role_timeout
-                    if role_provider_options:
-                        kwargs = {**role_provider_options, **kwargs}
-                    return await bedrock_complete_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        endpoint_url=role_host,
-                        **bedrock_aws_options,
-                        **kwargs,
-                    )
-
-                return role_bedrock_complete
-            if role_binding == "azure_openai":
-                from lightrag.llm.azure_openai import azure_openai_complete_if_cache
-
-                async def role_azure_openai_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    **kwargs,
-                ) -> str:
-                    if history_messages is None:
-                        history_messages = []
-                    kwargs["timeout"] = role_timeout
-                    if role_provider_options:
-                        kwargs.update(role_provider_options)
-                    return await azure_openai_complete_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        base_url=role_host,
-                        api_key=role_apikey or os.getenv("AZURE_OPENAI_API_KEY"),
-                        api_version=os.getenv(
-                            "AZURE_OPENAI_API_VERSION", "2024-08-01-preview"
-                        ),
-                        **kwargs,
-                    )
-
-                return role_azure_openai_complete
-            if role_binding == "gemini":
-                from lightrag.llm.gemini import gemini_complete_if_cache
-
-                async def role_gemini_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    **kwargs,
-                ) -> str:
-                    if history_messages is None:
-                        history_messages = []
-                    kwargs["timeout"] = role_timeout
-                    if role_provider_options and "generation_config" not in kwargs:
-                        kwargs["generation_config"] = dict(role_provider_options)
-                    return await gemini_complete_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        api_key=role_apikey,
-                        base_url=role_host,
-                        **kwargs,
-                    )
-
-                return role_gemini_complete
-
-            from lightrag.llm.openai import openai_complete_if_cache
-
-            async def role_openai_complete(
-                prompt,
-                system_prompt=None,
-                history_messages=None,
-                **kwargs,
-            ) -> str:
-                if history_messages is None:
-                    history_messages = []
-                kwargs["timeout"] = role_timeout
-                if role_provider_options:
-                    kwargs.update(role_provider_options)
-                return await openai_complete_if_cache(
-                    role_model,
-                    prompt,
-                    system_prompt=system_prompt,
-                    history_messages=history_messages,
-                    base_url=role_host,
-                    api_key=role_apikey,
-                    **kwargs,
-                )
-
-            return role_openai_complete
-        except ImportError as e:
-            raise Exception(f"Failed to create LLM for role '{role}': {e}")
-
-    def create_role_llm_model_kwargs(
-        role: str, override_meta: dict | None = None
-    ) -> dict[str, Any] | None:
-        """Create role-specific kwargs for runtime wrapper injection.
-
-        Role functions built above already encapsulate provider host/model/api_key/options,
-        so we intentionally return an empty dict here to prevent base kwargs inheritance
-        from polluting cross-provider role calls.
-        """
-        _ = role
-        _ = override_meta
-        return {}
-
-    llm_timeout = args.llm_timeout
-    embedding_timeout = args.embedding_timeout
-
-    async def bedrock_model_complete(
-        prompt,
-        system_prompt=None,
-        history_messages=None,
-        **kwargs,
-    ) -> str:
-        # Lazy import
-        from lightrag.llm.bedrock import bedrock_complete_if_cache
-
-        if history_messages is None:
-            history_messages = []
-
-        # Bedrock Converse API has no JSON mode; response_format and the legacy
-        # extraction booleans flow through kwargs to bedrock_complete_if_cache,
-        # which drops them and emits deprecation warnings when booleans are set.
-        if config_cache.bedrock_llm_options:
-            kwargs = {**config_cache.bedrock_llm_options, **kwargs}
-        # Server-configured timeout overrides any caller-passed value, matching
-        # the OpenAI wrapper (create_optimized_openai_llm_func).
-        kwargs["timeout"] = llm_timeout
-
-        return await bedrock_complete_if_cache(
-            args.llm_model,
-            prompt,
-            system_prompt=system_prompt,
-            history_messages=history_messages,
-            endpoint_url=args.llm_binding_host,
-            aws_region=getattr(args, "aws_region", None),
-            aws_access_key_id=getattr(args, "aws_access_key_id", None),
-            aws_secret_access_key=getattr(args, "aws_secret_access_key", None),
-            aws_session_token=getattr(args, "aws_session_token", None),
-            **kwargs,
-        )
-
-    # Create embedding function with optimized configuration and max_token_size inheritance
-    import inspect
-
-    embedding_func = create_embedding_function_from_args(args, config_cache)
-
-    # Configure rerank function based on args.rerank_bindingparameter
-    rerank_model_func = None
-    if args.rerank_binding != "null":
-        from lightrag.rerank import (
-            cohere_rerank,
-            jina_rerank,
-            ali_rerank,
-            DEFAULT_RERANK_MAX_TOKENS_PER_DOC,
-            MIN_PRACTICAL_RERANK_MAX_TOKENS,
-        )
-
-        # Map rerank binding to corresponding function
-        rerank_functions = {
-            "cohere": cohere_rerank,
-            "jina": jina_rerank,
-            "aliyun": ali_rerank,
-        }
-
-        # Select the appropriate rerank function based on binding
-        selected_rerank_func = rerank_functions.get(args.rerank_binding)
-        if not selected_rerank_func:
-            logger.error(f"Unsupported rerank binding: {args.rerank_binding}")
-            raise ValueError(f"Unsupported rerank binding: {args.rerank_binding}")
-
-        # Get default values from selected_rerank_func if args values are None
-        if args.rerank_model is None or args.rerank_binding_host is None:
-            sig = inspect.signature(selected_rerank_func)
-
-            # Set default model if args.rerank_model is None
-            if args.rerank_model is None and "model" in sig.parameters:
-                default_model = sig.parameters["model"].default
-                if default_model != inspect.Parameter.empty:
-                    args.rerank_model = default_model
-
-            # Set default base_url if args.rerank_binding_host is None
-            if args.rerank_binding_host is None and "base_url" in sig.parameters:
-                default_base_url = sig.parameters["base_url"].default
-                if default_base_url != inspect.Parameter.empty:
-                    args.rerank_binding_host = default_base_url
-
-        # Cohere binding supports optional document chunking (useful for models with
-        # token limits like ColBERT). Parse and validate its config ONCE at startup so a
-        # misconfigured RERANK_MAX_TOKENS_PER_DOC fails fast here instead of surfacing on
-        # the first user query, and so the value is not re-parsed on every rerank call.
-        rerank_enable_chunking = False
-        rerank_max_tokens_per_doc = DEFAULT_RERANK_MAX_TOKENS_PER_DOC
-        if args.rerank_binding == "cohere":
-            rerank_enable_chunking = (
-                os.getenv("RERANK_ENABLE_CHUNKING", "false").lower() == "true"
-            )
-            raw_max_tokens = os.getenv(
-                "RERANK_MAX_TOKENS_PER_DOC", str(DEFAULT_RERANK_MAX_TOKENS_PER_DOC)
-            )
-            try:
-                rerank_max_tokens_per_doc = int(raw_max_tokens)
-            except ValueError as e:
-                raise ValueError(
-                    f"RERANK_MAX_TOKENS_PER_DOC must be an integer, got {raw_max_tokens!r}"
-                ) from e
-            if rerank_max_tokens_per_doc < 1:
-                raise ValueError(
-                    f"RERANK_MAX_TOKENS_PER_DOC must be >= 1, got {rerank_max_tokens_per_doc}"
-                )
-            if (
-                rerank_enable_chunking
-                and rerank_max_tokens_per_doc < MIN_PRACTICAL_RERANK_MAX_TOKENS
-            ):
-                logger.warning(
-                    f"RERANK_MAX_TOKENS_PER_DOC={rerank_max_tokens_per_doc} is below the "
-                    f"practical minimum ({MIN_PRACTICAL_RERANK_MAX_TOKENS}); chunking will "
-                    f"split each document into many tiny, low-signal chunks."
-                )
-
-        async def server_rerank_func(
-            query: str, documents: list, top_n: int = None, extra_body: dict = None
-        ):
-            """Server rerank function with configuration from environment variables"""
-            # Prepare kwargs for rerank function
-            kwargs = {
-                "query": query,
-                "documents": documents,
-                "top_n": top_n,
-                "api_key": args.rerank_binding_api_key,
-                "model": args.rerank_model,
-                "base_url": args.rerank_binding_host,
-            }
-
-            # Add Cohere-specific parameters if using cohere binding (validated at startup)
-            if args.rerank_binding == "cohere":
-                kwargs["enable_chunking"] = rerank_enable_chunking
-                kwargs["max_tokens_per_doc"] = rerank_max_tokens_per_doc
-
-            return await selected_rerank_func(**kwargs, extra_body=extra_body)
-
-        rerank_model_func = server_rerank_func
-        logger.info(
-            f"Reranking is enabled: {args.rerank_model or 'default model'} using {args.rerank_binding} provider"
-        )
-    else:
-        logger.info("Reranking is disabled")
-
-    # Create ollama_server_infos from command line arguments
-    from lightrag.api.config import OllamaServerInfos
-
-    ollama_server_infos = OllamaServerInfos(
-        name=args.simulated_model_name, tag=args.simulated_model_tag
-    )
-
-    # LightRAG.__post_init__ normalizes addon_params and backfills env-based defaults
-    # (SUMMARY_LANGUAGE, ENTITY_TYPE_PROMPT_FILE, ...), so we only need to pass the
-    # API-level overrides here.
-    addon_params = {
-        "language": args.summary_language,
-    }
-
-    role_llm_configs = {
-        spec.name: {
-            **resolve_role_llm_settings(spec.name),
-            "func": create_role_llm_func(spec.name),
-            "kwargs": create_role_llm_model_kwargs(spec.name),
-        }
-        for spec in ROLES
-    }
-
-    # Initialize RAG with unified configuration
-    try:
-        rag = LightRAG(
-            working_dir=args.working_dir,
-            workspace=args.workspace,
-            llm_model_func=create_llm_model_func(args.llm_binding),
-            llm_model_name=args.llm_model,
-            llm_model_max_async=args.max_async,
-            summary_max_tokens=args.summary_max_tokens,
-            summary_context_size=args.summary_context_size,
-            chunk_token_size=int(args.chunk_size),
-            chunk_overlap_token_size=int(args.chunk_overlap_size),
-            llm_model_kwargs=create_llm_model_kwargs(
-                args.llm_binding, args, llm_timeout
-            ),
-            embedding_func=embedding_func,
-            default_llm_timeout=llm_timeout,
-            default_embedding_timeout=embedding_timeout,
-            kv_storage=args.kv_storage,
-            graph_storage=args.graph_storage,
-            vector_storage=args.vector_storage,
-            doc_status_storage=args.doc_status_storage,
-            vector_db_storage_cls_kwargs={
-                "cosine_better_than_threshold": args.cosine_threshold
-            },
-            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
-            enable_llm_cache=args.enable_llm_cache,
-            vlm_process_enable=args.vlm_process_enable,
-            rerank_model_func=rerank_model_func,
-            rerank_model_max_async=args.rerank_max_async,
-            default_rerank_timeout=args.rerank_timeout,
-            max_parallel_insert=args.max_parallel_insert,
-            pipeline_scheduling_page_size=args.pipeline_scheduling_page_size,
-            pipeline_require_strict_storage_reads=args.pipeline_require_strict_storage_reads,
-            max_pending_documents=args.max_pending_documents,
-            max_graph_nodes=args.max_graph_nodes,
-            addon_params=addon_params,
-            ollama_server_infos=ollama_server_infos,
-            role_llm_configs={
-                spec.name: RoleLLMConfig(
-                    func=role_llm_configs[spec.name]["func"],
-                    kwargs=role_llm_configs[spec.name]["kwargs"],
-                    max_async=role_llm_configs[spec.name]["max_async"],
-                    timeout=role_llm_configs[spec.name]["timeout"],
-                    metadata={
-                        "base_binding": args.llm_binding,
-                        "binding": role_llm_configs[spec.name]["binding"],
-                        "model": role_llm_configs[spec.name]["model"],
-                        "host": role_llm_configs[spec.name]["host"],
-                        "api_key": role_llm_configs[spec.name]["api_key"],
-                        "provider_options": role_llm_configs[spec.name][
-                            "provider_options"
-                        ],
-                        "bedrock_aws_options": role_llm_configs[spec.name][
-                            "bedrock_aws_options"
-                        ],
-                        "is_cross_provider": role_llm_configs[spec.name][
-                            "is_cross_provider"
-                        ],
-                    },
-                )
-                for spec in ROLES
-            },
-        )
-    except Exception as e:
-        logger.error(f"Failed to initialize LightRAG: {e}")
-        raise
-
-    _log_role_provider_options(rag)
-
-    rag.register_role_llm_builder(
-        lambda role, meta: (
-            create_role_llm_func(role, meta),
-            create_role_llm_model_kwargs(role, meta),
-        )
-    )
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
@@ -2297,48 +1244,132 @@ def create_app(args):
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
     app.include_router(create_graph3d_routes(rag, api_key))
+    # Public read-only customization surface — registered unconditionally:
+    # without a bundle it answers 200 {"customized": false, ...}.
+    app.include_router(
+        create_ui_customization_routes(
+            ui_customization_snapshot, webui_title, webui_description
+        )
+    )
 
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
 
-    # Custom Swagger UI endpoint for offline support
-    @app.get("/docs", include_in_schema=False)
-    async def custom_swagger_ui_html(request: Request):
-        """Custom Swagger UI HTML with local static files"""
-        response = get_swagger_ui_html(
-            openapi_url=app.openapi_url,
-            title=app.title + " - Swagger UI",
-            oauth2_redirect_url="/docs/oauth2-redirect",
-            swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
-            swagger_css_url="/static/swagger-ui/swagger-ui.css",
-            swagger_favicon_url="/static/swagger-ui/favicon-32x32.png",
-            swagger_ui_parameters=app.swagger_ui_parameters,
-        )
-        html = response.body.decode("utf-8")
-        html = _inject_swagger_theme(
-            html, request.query_params.get("theme", "auto").lower()
-        )
-        return HTMLResponse(content=html)
+    if api_docs_enabled:
+        # Custom Swagger UI endpoint for offline support
+        @app.get("/docs", include_in_schema=False)
+        async def custom_swagger_ui_html(request: Request):
+            """Custom Swagger UI HTML with local static files"""
+            root = request.scope.get("root_path", "").rstrip("/")
+            response = get_swagger_ui_html(
+                openapi_url=f"{root}{app.openapi_url}",
+                title=app.title + " - Swagger UI",
+                oauth2_redirect_url=f"{root}/docs/oauth2-redirect",
+                swagger_js_url=f"{root}/static/swagger-ui/swagger-ui-bundle.js",
+                swagger_css_url=f"{root}/static/swagger-ui/swagger-ui.css",
+                swagger_favicon_url=f"{root}/static/swagger-ui/favicon-32x32.png",
+                swagger_ui_parameters=app.swagger_ui_parameters,
+            )
+            html = response.body.decode("utf-8")
+            html = _inject_swagger_theme(
+                html, request.query_params.get("theme", "auto").lower()
+            )
+            return HTMLResponse(content=html)
 
-    @app.get("/docs/oauth2-redirect", include_in_schema=False)
-    async def swagger_ui_redirect():
-        """OAuth2 redirect for Swagger UI"""
-        return get_swagger_ui_oauth2_redirect_html()
+        @app.get("/docs/oauth2-redirect", include_in_schema=False)
+        async def swagger_ui_redirect():
+            """OAuth2 redirect for Swagger UI"""
+            return get_swagger_ui_oauth2_redirect_html()
+
+    def service_info_response(request: Request) -> JSONResponse:
+        """Fixed JSON fallback when neither the WebUI nor /docs can be served.
+
+        HTTP 200 with a root_path-aware health_url, so multi-site deployments
+        behind LIGHTRAG_API_PREFIX get a correct absolute path.
+        """
+        root = request.scope.get("root_path", "")
+        return JSONResponse(
+            {
+                "status": "healthy",
+                "service": "LightRAG Server",
+                "api_version": api_version_display,
+                "message": (
+                    "WebUI assets are not bundled and API docs are disabled "
+                    "(ENABLE_API_DOCS=false)."
+                ),
+                "health_url": f"{root}/health",
+            }
+        )
+
+    def workspace_unavailable_response(request: Request) -> JSONResponse:
+        """Fixed JSON degradation for the /workspace query entry.
+
+        Unlike the /webui fallback, this NEVER redirects to — nor links or
+        points at — the API docs, regardless of ENABLE_API_DOCS: sending a
+        query user to /docs is the same cross-entry leak as sending them to
+        the admin login page. HTTP 200 with a root_path-aware health_url.
+        """
+        root = request.scope.get("root_path", "")
+        return JSONResponse(
+            {
+                "status": "healthy",
+                "service": "LightRAG Server",
+                "api_version": api_version_display,
+                "message": (
+                    "The workspace query entry is not available: "
+                    "workspace.html is not bundled with this server. "
+                    "Rebuild the frontend to enable it."
+                ),
+                "health_url": f"{root}/health",
+            }
+        )
 
     @app.get("/")
-    async def redirect_to_webui(request: Request):
-        """Redirect root path based on WebUI availability.
+    async def redirect_to_default_ui(request: Request):
+        """Redirect root path to the configured default UI entry.
 
         Prepend the ASGI root_path so that, behind a reverse proxy, the
         absolute redirect target keeps the configured prefix instead of
-        bypassing it.
+        bypassing it. The '/' behavior equals the chosen entry's behavior
+        INCLUDING its degradation branch: when the default entry's assets
+        are missing, '/' answers with that entry's own fallback rather than
+        rerouting to the other entry (or, for workspace, to the API docs).
         """
         root = request.scope.get("root_path", "")
+        if default_ui == "workspace":
+            if workspace_assets_exist:
+                return RedirectResponse(url=f"{root}{WORKSPACE_PATH}/")
+            return workspace_unavailable_response(request)
         if webui_assets_exist:
             return RedirectResponse(url=f"{root}{webui_path}/")
-        else:
+        elif api_docs_enabled:
             return RedirectResponse(url=f"{root}/docs")
+        else:
+            return service_info_response(request)
+
+    # The verifier ignores WHITELIST_PATHS: its whole purpose is to report
+    # credential validity, and a whitelist entry covering it (e.g. "/auth/*")
+    # would otherwise turn it into an unconditional 200 while the protected
+    # routes still reject.
+    credential_verify_auth = get_combined_auth_dependency(
+        api_key, respect_whitelist=False
+    )
+
+    @app.get("/auth/verify", dependencies=[Depends(credential_verify_auth)])
+    async def verify_credentials():
+        """Verify that the caller's credentials satisfy the combined auth.
+
+        /health deliberately stays on the default whitelist as an
+        unauthenticated liveness probe, so it can never distinguish valid,
+        invalid and missing credentials. This endpoint ALWAYS runs the
+        combined dependency — WHITELIST_PATHS is deliberately ignored here —
+        so a missing or wrong X-API-Key fails with the standard 403 detail
+        ("API Key required" / "Invalid API Key"), which the WebUI's API-key
+        dialogs key on, while valid credentials get a trivial 200. No data is
+        exposed.
+        """
+        return {"status": "ok"}
 
     @app.get("/auth-status")
     async def get_auth_status():
@@ -2359,6 +1390,7 @@ def create_app(args):
                 "api_version": api_version_display,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
+                "ai_content_notice_enabled": ai_content_notice_enabled,
             }
 
         return {
@@ -2368,6 +1400,7 @@ def create_app(args):
             "api_version": api_version_display,
             "webui_title": webui_title,
             "webui_description": webui_description,
+            "ai_content_notice_enabled": ai_content_notice_enabled,
         }
 
     # Brute-force protection for /login (CWE-307): throttle failed attempts per
@@ -2396,6 +1429,7 @@ def create_app(args):
                 "api_version": api_version_display,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
+                "ai_content_notice_enabled": ai_content_notice_enabled,
             }
         username = form_data.username
         # Rate-limit key is client IP + username. X-Forwarded-For is NOT trusted
@@ -2454,6 +1488,7 @@ def create_app(args):
             "api_version": api_version_display,
             "webui_title": webui_title,
             "webui_description": webui_description,
+            "ai_content_notice_enabled": ai_content_notice_enabled,
         }
 
     @app.get(
@@ -2475,6 +1510,7 @@ def create_app(args):
                         "example": {
                             "status": "healthy",
                             "webui_available": True,
+                            "api_docs_available": True,
                             "working_directory": "/path/to/working/dir",
                             "input_directory": "/path/to/input/dir",
                             "configuration": {
@@ -2577,8 +1613,18 @@ def create_app(args):
                 "core_version": core_version,
                 "api_version": api_version_display,
                 "webui_available": webui_assets_exist,
+                # Same liveness tier as webui_available (both are trivially
+                # probeable by requesting the mount path). The two fields are
+                # independent checks over their own entry HTML — /health must
+                # be able to express "admin UI up, query entry missing".
+                "workspace_available": workspace_assets_exist,
+                # Whether /docs, /redoc and /openapi.json are served — same
+                # liveness tier as webui_available: the state is trivially
+                # probeable by requesting /docs, so it leaks nothing.
+                "api_docs_available": api_docs_enabled,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
+                "ai_content_notice_enabled": ai_content_notice_enabled,
                 "pipeline_busy": pipeline_busy,
                 "pipeline_active": pipeline_active,
             }
@@ -2586,7 +1632,7 @@ def create_app(args):
             # Sensitive runtime configuration and operational diagnostics
             # (filesystem paths, LLM/embedding provider + model + host, storage
             # backends, queue status, keyed locks, ...) are revealed only to
-            # authenticated callers — see Issue #3294. The skipped queue-status
+            # authenticated callers. The skipped queue-status
             # and keyed-lock-cleanup calls also keep unauthenticated probes cheap.
             if not authenticated:
                 return status_data
@@ -2620,13 +1666,13 @@ def create_app(args):
                         "storage_workspaces": _get_storage_workspaces(rag),
                         "max_graph_nodes": args.max_graph_nodes,
                         # Rerank configuration
-                        "enable_rerank": rerank_model_func is not None,
+                        "enable_rerank": rag.rerank_model_func is not None,
                         "rerank_binding": args.rerank_binding,
                         "rerank_model": args.rerank_model
-                        if rerank_model_func
+                        if rag.rerank_model_func
                         else None,
                         "rerank_binding_host": args.rerank_binding_host
-                        if rerank_model_func
+                        if rag.rerank_model_func
                         else None,
                         "rerank_max_async": args.rerank_max_async,
                         "rerank_timeout": args.rerank_timeout,
@@ -2690,23 +1736,75 @@ def create_app(args):
     # `</` → `<\/` escaping prevents an embedded "</script>" sequence from
     # breaking out of the inline script (defense-in-depth — values come from
     # admin config, not user input).
+    #
+    # `webuiTitle` (WEBUI_TITLE) rides along and is applied to `document.title`
+    # in the same snippet: the tag sits in <head> right after the static
+    # <title>, so the tab carries the deployment's own name from the FIRST
+    # paint. Waiting for the SPA to read it from /health would show "LightRAG"
+    # until the bundle boots, and browsers cache that first title for history
+    # entries and bookmarks. `or None` normalizes an unset/empty variable to a
+    # single falsy value, which the client reads as "no custom title".
     _runtime_config_payload = json.dumps(
         {
             "apiPrefix": api_prefix,
             "webuiPrefix": f"{api_prefix}{webui_path}/",
+            "webuiTitle": webui_title or None,
         }
     ).replace("</", "<\\/")
     runtime_config_script = (
-        f"<script>window.__LIGHTRAG_CONFIG__ = {_runtime_config_payload};</script>"
+        f"<script>window.__LIGHTRAG_CONFIG__ = {_runtime_config_payload};"
+        "if(window.__LIGHTRAG_CONFIG__.webuiTitle)"
+        "{document.title=window.__LIGHTRAG_CONFIG__.webuiTitle;}</script>"
     )
 
     # Custom StaticFiles class for smart caching + runtime config injection
     class SmartStaticFiles(StaticFiles):  # Renamed from NoCacheStaticFiles
-        # Replaced in index.html on every request. Keep in sync with
-        # lightrag_webui/index.html.
+        # Replaced in every entry HTML on each request. Keep in sync with
+        # lightrag_webui/index.html AND lightrag_webui/workspace.html — the
+        # placeholder must exist in both entry files.
         RUNTIME_CONFIG_PLACEHOLDER = b"<!-- __LIGHTRAG_RUNTIME_CONFIG__ -->"
 
+        def __init__(
+            self,
+            *args,
+            index_file: str = WEBUI_INDEX_FILENAME,
+            blocked_html: tuple[str, ...] = (),
+            **kwargs,
+        ):
+            """``index_file``: directory-index filename for this mount.
+
+            Starlette's StaticFiles hardcodes ``index.html`` under
+            ``html=True`` with no configuration hook, so the workspace mount
+            overrides it here to serve workspace.html at its root.
+
+            ``blocked_html``: the OTHER entry's HTML filename(s); requests
+            for them return 404 on this mount. Both entry files live in one
+            shared directory, so without this each mount would also serve a
+            fully working alias of the other entry (/webui/workspace.html,
+            /workspace/index.html) and the URL would stop indicating the
+            entry. Same-entry explicit filenames (/webui/index.html,
+            /workspace/workspace.html) stay reachable.
+
+            Matched case-INSENSITIVELY: on a case-insensitive filesystem
+            (macOS, Windows) the underlying StaticFiles would happily serve
+            /webui/WORKSPACE.HTML, so an exact-case check would leave the
+            alias open exactly where the OS opens it.
+            """
+            super().__init__(*args, **kwargs)
+            self.index_file = index_file
+            self.blocked_html = {name.lower() for name in blocked_html}
+
         async def get_response(self, path: str, scope):
+            if path.lower() in self.blocked_html:
+                raise HTTPException(status_code=404, detail="Not Found")
+
+            # Rewrite the mount-root request ('' / '.') to this mount's own
+            # index file. The Router's redirect_slashes has already forced a
+            # trailing slash on the mount root, so this rewrite cannot bypass
+            # any redirect.
+            if path in ("", "."):
+                path = self.index_file
+
             response = await super().get_response(path, scope)
 
             # `path` is empty when accessing the mount root (StaticFiles
@@ -2732,9 +1830,11 @@ def create_app(args):
                 )
                 response.headers["Pragma"] = "no-cache"
                 response.headers["Expires"] = "0"
-            elif (
-                "/assets/" in path
-            ):  # Assets (JS, CSS, images, fonts) generated by Vite with hash in filename
+            elif path.startswith("assets/") or "/assets/" in path:
+                # Assets (JS, CSS, images, fonts) generated by Vite with hash
+                # in filename. Inside a Mount, `path` is relative (no leading
+                # slash) — "assets/x.js" — so match the top-level assets dir
+                # explicitly.
                 response.headers["Cache-Control"] = (
                     "public, max-age=31536000, immutable"
                 )
@@ -2776,25 +1876,31 @@ def create_app(args):
 
     # Mount Swagger UI static files for offline support
     swagger_static_dir = Path(__file__).parent / "static" / "swagger-ui"
-    if swagger_static_dir.exists():
+    if api_docs_enabled and swagger_static_dir.exists():
         app.mount(
             "/static/swagger-ui",
             StaticFiles(directory=swagger_static_dir),
             name="swagger-ui-static",
         )
 
-    # Conditionally mount WebUI only if assets exist
+    # Conditionally mount each UI entry only if its own entry HTML exists.
+    # Both mounts serve the SAME build directory; entry identity is decided
+    # by which file each mount uses as its directory index.
+    static_dir = Path(__file__).parent / "webui"
     if webui_assets_exist:
-        static_dir = Path(__file__).parent / "webui"
         static_dir.mkdir(exist_ok=True)
         app.mount(
             webui_path,
             SmartStaticFiles(
-                directory=static_dir, html=True, check_dir=True
-            ),  # Use SmartStaticFiles
+                directory=static_dir,
+                html=True,
+                check_dir=True,
+                index_file=WEBUI_INDEX_FILENAME,
+                blocked_html=(WORKSPACE_INDEX_FILENAME,),
+            ),
             name="webui",
         )
-        logger.info(f"WebUI assets mounted at {webui_path}")
+        logger.info(f"Admin WebUI mounted at {api_prefix}{webui_path}/")
     else:
         logger.info("WebUI assets not available, WebUI route not mounted")
 
@@ -2802,9 +1908,42 @@ def create_app(args):
         @app.get(webui_path)
         @app.get(f"{webui_path}/")
         async def webui_redirect_to_docs(request: Request):
-            """Redirect WebUI path to /docs when WebUI is not available."""
+            """Redirect WebUI path to /docs when WebUI is not available.
+
+            With docs disabled there is no page to redirect to, so answer
+            with the JSON service info instead of a 404.
+            """
+            if not api_docs_enabled:
+                return service_info_response(request)
             root = request.scope.get("root_path", "")
             return RedirectResponse(url=f"{root}/docs")
+
+    if workspace_assets_exist:
+        app.mount(
+            WORKSPACE_PATH,
+            SmartStaticFiles(
+                directory=static_dir,
+                html=True,
+                check_dir=True,
+                index_file=WORKSPACE_INDEX_FILENAME,
+                blocked_html=(WEBUI_INDEX_FILENAME,),
+            ),
+            name="workspace",
+        )
+        logger.info(f"Workspace query UI mounted at {api_prefix}{WORKSPACE_PATH}/")
+    else:
+        logger.info(
+            "Workspace entry HTML not available, /workspace serves the "
+            "fixed service-info degradation"
+        )
+
+        # Fixed degradation, explicitly registered for both trailing-slash
+        # forms. Never redirects to /docs (or anywhere else) — see
+        # workspace_unavailable_response.
+        @app.get(WORKSPACE_PATH)
+        @app.get(f"{WORKSPACE_PATH}/")
+        async def workspace_unavailable(request: Request):
+            return workspace_unavailable_response(request)
 
     return app
 

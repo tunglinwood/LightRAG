@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends
 from lightrag.base import QueryParam
 from lightrag.api.input_limits import count_conversation_input_chars
 from lightrag.api.utils_api import get_combined_auth_dependency, internal_server_error
@@ -22,6 +22,7 @@ from lightrag.constants import (
     MAX_RESPONSE_TYPE_CHARS,
     MAX_ROLE_CHARS,
 )
+from lightrag.query_validation import validate_query_not_empty, validate_rag_query
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -30,12 +31,32 @@ _recent_query_activations: List[Dict[str, Any]] = []
 _MAX_ACTIVATIONS_TO_KEEP = 100
 _ACTIVATION_TTL_SECONDS = 60  # Activations expire after 60 seconds
 
+# Daily cache of query activations for idle replay in the 3D viewer.
+# Keyed by day ("2026-08-05"); previous days are dropped on the next write.
+_daily_query_cache: Dict[str, List[Dict[str, Any]]] = {}
+_MAX_DAILY_CACHE = 500
+
+
+def _record_daily_activation(activation_data: Dict[str, Any]) -> None:
+    """Cache a query activation under today's date for idle replay."""
+    day_key = time.strftime("%Y-%m-%d")
+    bucket = _daily_query_cache.setdefault(day_key, [])
+    bucket.append(activation_data)
+    while len(bucket) > _MAX_DAILY_CACHE:
+        bucket.pop(0)
+    # Drop previous days
+    for key in list(_daily_query_cache.keys()):
+        if key != day_key:
+            del _daily_query_cache[key]
 
 class QueryRequest(BaseModel):
     query: str = Field(
-        min_length=3,
         max_length=MAX_QUERY_CHARS,
-        description="The query text",
+        description=(
+            "The query text. Must not be empty. RAG modes additionally require "
+            "an English-equivalent length of at least 3; each Chinese, "
+            "Japanese or Korean character counts as 2."
+        ),
     )
 
     mode: Literal["local", "global", "hybrid", "naive", "mix", "bypass"] = Field(
@@ -115,7 +136,26 @@ class QueryRequest(BaseModel):
     user_prompt: Optional[str] = Field(
         default=None,
         max_length=MAX_QUERY_CHARS,
-        description="User-provided prompt for the query. If provided, this will be used instead of the default value from prompt template.",
+        description=(
+            "Additional instructions for the LLM, injected into the "
+            "'Additional Instructions' section of the answer prompt. It does not "
+            "affect retrieval. The server may prepend a global prefix to this "
+            "value; if this field is empty the prefix alone becomes the "
+            "instructions sent to the LLM. Set disable_user_prompt_prefix to "
+            "opt out of the prefix."
+        ),
+    )
+
+    disable_user_prompt_prefix: Optional[bool] = Field(
+        default=None,
+        description=(
+            "If True, the server-side global prompt prefix is not prepended to "
+            "user_prompt, leaving the client in full control of the final "
+            "instruction text. This is the only way to suppress the prefix -- "
+            "sending an empty user_prompt does not, it makes the prefix the "
+            "whole instruction. The prefix itself is server configuration and "
+            "cannot be read or replaced by a request. Default is False."
+        ),
     )
 
     enable_rerank: Optional[bool] = Field(
@@ -151,11 +191,10 @@ class QueryRequest(BaseModel):
     @field_validator("query", mode="after")
     @classmethod
     def query_strip_after(cls, query: str) -> str:
-        # min_length runs before strip; re-check so pads cannot shrink below 3 chars.
-        stripped = query.strip()
-        if len(stripped) < 3:
-            raise ValueError("query must be at least 3 characters after stripping")
-        return stripped
+        # Mode-independent: `bypass` is exempt from the RAG minimum below, not
+        # from having to carry a prompt at all. `min_length` on the field would
+        # run before the strip and let "   " through.
+        return validate_query_not_empty(query)
 
     @field_validator("hl_keywords", "ll_keywords", mode="after")
     @classmethod
@@ -203,6 +242,18 @@ class QueryRequest(BaseModel):
         return conversation_history
 
     @model_validator(mode="after")
+    def enforce_rag_query_minimum(self) -> "QueryRequest":
+        """Hold RAG queries to a length that can actually retrieve something.
+
+        `bypass` goes straight to the LLM without touching the index, so the
+        retrieval-shaped minimum does not apply to it; the non-empty check on
+        the field does.
+        """
+        if self.mode != "bypass":
+            validate_rag_query(self.query)
+        return self
+
+    @model_validator(mode="after")
     def bound_aggregate_text(self) -> "QueryRequest":
         """Bound all model-facing request input in one request.
 
@@ -211,6 +262,10 @@ class QueryRequest(BaseModel):
         history dict is forwarded verbatim, so count its serialized form rather
         than only the ``content`` key.
         """
+        # The server-side user_prompt_prefix is deliberately NOT counted: it is
+        # operator configuration, not client-supplied text, and folding it in
+        # would make previously-legal requests start failing the moment an
+        # operator edits USER_PROMPT_PREFIX.
         total = count_conversation_input_chars(
             self.query,
             self.user_prompt,
@@ -261,6 +316,16 @@ class QueryResponse(BaseModel):
         default=None,
         description="Total server-side processing time in seconds (retrieval + LLM generation)",
     )
+    llm_generated: bool = Field(
+        default=True,
+        description=(
+            "Whether the answering LLM actually wrote this response. False when "
+            "the query returned text produced without calling it: the canned "
+            "no-context reply, or the only_need_context / only_need_prompt debug "
+            "output. Clients that label machine-written text cannot recover this "
+            "from the response text alone."
+        ),
+    )
 
 
 class QueryDataResponse(BaseModel):
@@ -308,6 +373,16 @@ class StreamChunkResponse(BaseModel):
     response_time: Optional[float] = Field(
         default=None,
         description="Total server-side processing time in seconds (final metadata line when include_progress=True)",
+    )
+    llm_generated: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Whether the answering LLM wrote the content on this line. Carried "
+            "only on a complete (non-streamed) response line — the canned "
+            "no-context reply and the only_need_context / only_need_prompt debug "
+            "output are the cases that report False. Streamed response chunks "
+            "always come from the LLM and carry no flag."
+        ),
     )
 
 
@@ -419,16 +494,29 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     }
                 },
             },
-            400: {
-                "description": "Bad Request - Invalid input parameters",
+            422: {
+                "description": "Unprocessable Entity - Request validation failed",
                 "content": {
                     "application/json": {
                         "schema": {
                             "type": "object",
-                            "properties": {"detail": {"type": "string"}},
+                            "properties": {
+                                "detail": {"type": "array", "items": {"type": "object"}}
+                            },
                         },
                         "example": {
-                            "detail": "Query text must be at least 3 characters long"
+                            "detail": [
+                                {
+                                    "type": "value_error",
+                                    "loc": ["body"],
+                                    "msg": (
+                                        "Value error, RAG query is too short. Enter at "
+                                        "least 3 English characters or an equivalent "
+                                        "combination where each Chinese, Japanese or "
+                                        "Korean character counts as 2."
+                                    ),
+                                }
+                            ]
                         },
                     }
                 },
@@ -507,7 +595,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
         Args:
             request (QueryRequest): The request object containing query parameters:
-                - **query**: The question or prompt to process (min 3 characters)
+                - **query**: The question or prompt to process. Must not be empty. RAG modes additionally require an English-equivalent length of at least 3; each Chinese, Japanese or Korean character counts as 2. Bypass mode is exempt from the minimum, not from being non-empty.
                 - **mode**: Query strategy - "mix" recommended for best results
                 - **include_references**: Whether to include source citations
                 - **response_type**: Format preference (e.g., "Multiple Paragraphs")
@@ -522,7 +610,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
         Raises:
             HTTPException:
-                - 400: Invalid input parameters (e.g., query too short)
+                - 422: Request validation failed (e.g., query empty or too short)
                 - 500: Internal processing error (e.g., LLM service unavailable)
         """
         try:
@@ -543,8 +631,13 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             # Get the non-streaming response content
             response_content = llm_response.get("content", "")
+            # Whether the answering LLM wrote it. A missing flag means a result
+            # shape that predates it, which only the LLM paths produce.
+            llm_generated = bool(llm_response.get("llm_generated", True))
             if not response_content:
                 response_content = "No relevant context found for the query."
+                # Substituted placeholder: nothing was generated.
+                llm_generated = False
 
             # Enrich references with chunk content if requested
             if request.include_references and request.include_chunk_content:
@@ -575,16 +668,18 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     response=response_content,
                     references=references,
                     response_time=response_time,
+                    llm_generated=llm_generated,
                 )
             else:
                 return QueryResponse(
                     response=response_content,
                     references=None,
                     response_time=response_time,
+                    llm_generated=llm_generated,
                 )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise internal_server_error(e)
 
     def _build_stream_generator(
         *,
@@ -643,10 +738,20 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             else:
                 # Non-streaming: complete response in one message
                 response_content = llm_response.get("content", "")
+                llm_generated = bool(llm_response.get("llm_generated", True))
                 if not response_content:
                     response_content = "No relevant context found for the query."
+                    llm_generated = False
 
-                complete_response = {"response": response_content}
+                # The flag rides this line rather than a separate one: it
+                # describes THIS content, and a client that ignores the key
+                # still reads the response exactly as before. Streamed chunks
+                # (the branch above) always come from the LLM, so they need no
+                # flag.
+                complete_response: dict[str, Any] = {
+                    "response": response_content,
+                    "llm_generated": llm_generated,
+                }
                 if include_references:
                     complete_response["references"] = references
 
@@ -708,16 +813,29 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     }
                 },
             },
-            400: {
-                "description": "Bad Request - Invalid input parameters",
+            422: {
+                "description": "Unprocessable Entity - Request validation failed",
                 "content": {
                     "application/json": {
                         "schema": {
                             "type": "object",
-                            "properties": {"detail": {"type": "string"}},
+                            "properties": {
+                                "detail": {"type": "array", "items": {"type": "object"}}
+                            },
                         },
                         "example": {
-                            "detail": "Query text must be at least 3 characters long"
+                            "detail": [
+                                {
+                                    "type": "value_error",
+                                    "loc": ["body"],
+                                    "msg": (
+                                        "Value error, RAG query is too short. Enter at "
+                                        "least 3 English characters or an equivalent "
+                                        "combination where each Chinese, Japanese or "
+                                        "Korean character counts as 2."
+                                    ),
+                                }
+                            ]
                         },
                     }
                 },
@@ -859,7 +977,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
         Args:
             request (QueryRequest): The request object containing query parameters:
-                - **query**: The question or prompt to process (min 3 characters)
+                - **query**: The question or prompt to process. Must not be empty. RAG modes additionally require an English-equivalent length of at least 3; each Chinese, Japanese or Korean character counts as 2. Bypass mode is exempt from the minimum, not from being non-empty.
                 - **mode**: Query strategy - "mix" recommended for best results
                 - **stream**: Enable streaming (True) or complete response (False)
                 - **include_references**: Whether to include source citations
@@ -882,7 +1000,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
         Raises:
             HTTPException:
-                - 400: Invalid input parameters (e.g., query too short, invalid mode)
+                - 422: Request validation failed (e.g., query empty or too short, invalid mode)
                 - 500: Internal processing error (e.g., LLM service unavailable)
 
         Note:
@@ -1013,7 +1131,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 )
         except Exception as e:
             logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise internal_server_error(e)
 
     @router.post(
         "/query/data",
@@ -1049,6 +1167,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                                     "description": {"type": "string"},
                                                     "source_id": {"type": "string"},
                                                     "file_path": {"type": "string"},
+                                                    "html_url": {"type": "string"},
                                                     "reference_id": {"type": "string"},
                                                 },
                                             },
@@ -1066,6 +1185,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                                     "weight": {"type": "number"},
                                                     "source_id": {"type": "string"},
                                                     "file_path": {"type": "string"},
+                                                    "html_url": {"type": "string"},
                                                     "reference_id": {"type": "string"},
                                                 },
                                             },
@@ -1078,6 +1198,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                                 "properties": {
                                                     "content": {"type": "string"},
                                                     "file_path": {"type": "string"},
+                                                    "html_url": {"type": "string"},
                                                     "chunk_id": {"type": "string"},
                                                     "reference_id": {"type": "string"},
                                                 },
@@ -1165,7 +1286,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                                 "tgt_id": "Machine Learning",
                                                 "description": "Neural networks are a subset of machine learning algorithms",
                                                 "keywords": "subset, algorithm, learning",
-                                                "weight": 0.85,
+                                                "weight": 1.0,
                                                 "source_id": "chunk-123",
                                                 "file_path": "/documents/ai_basics.pdf",
                                                 "reference_id": "1",
@@ -1220,7 +1341,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                                 "tgt_id": "Machine Learning",
                                                 "description": "AI encompasses machine learning as a core component",
                                                 "keywords": "encompasses, component, field",
-                                                "weight": 0.92,
+                                                "weight": 2.0,
                                                 "source_id": "chunk-456",
                                                 "file_path": "/documents/ai_overview.pdf",
                                                 "reference_id": "2",
@@ -1282,15 +1403,28 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 },
             },
             400: {
-                "description": "Bad Request - Invalid input parameters",
+                "description": "Bad Request - Request validation failed",
                 "content": {
                     "application/json": {
                         "schema": {
                             "type": "object",
-                            "properties": {"detail": {"type": "string"}},
+                            "properties": {
+                                "status": {"type": "string"},
+                                "message": {"type": "string"},
+                                "data": {"type": "object"},
+                                "metadata": {"type": "object"},
+                            },
                         },
                         "example": {
-                            "detail": "Query text must be at least 3 characters long"
+                            "status": "failure",
+                            "message": (
+                                "Validation error: body: Value error, RAG query is "
+                                "too short. Enter at least 3 English characters or "
+                                "an equivalent combination where each Chinese, "
+                                "Japanese or Korean character counts as 2."
+                            ),
+                            "data": {},
+                            "metadata": {},
                         },
                     }
                 },
@@ -1390,7 +1524,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
         Args:
             request (QueryRequest): The request object containing query parameters:
-                - **query**: The search query to analyze (min 3 characters)
+                - **query**: The search query to analyze. Must not be empty. RAG modes additionally require an English-equivalent length of at least 3; each Chinese, Japanese or Korean character counts as 2. Bypass mode is exempt from the minimum, not from being non-empty.
                 - **mode**: Retrieval strategy affecting data types returned
                 - **top_k**: Number of top entities/relationships to retrieve
                 - **chunk_top_k**: Number of text chunks to retrieve
@@ -1407,7 +1541,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
         Raises:
             HTTPException:
-                - 400: Invalid input parameters (e.g., query too short, invalid mode)
+                - 400: Request validation failed (e.g., query empty or too short, invalid mode)
                 - 500: Internal processing error (e.g., knowledge graph unavailable)
 
         Note:
@@ -1450,6 +1584,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
                     _recent_query_activations.append(activation_data)
 
+                    # Cache under today's date for idle replay in the 3D viewer
+                    _record_daily_activation(activation_data)
+
                     # Log the activation
                     entity_count = len(activation_data["entities"])
                     rel_count = len(activation_data["relationships"])
@@ -1480,60 +1617,28 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 )
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise internal_server_error(e)
 
     @router.get(
-        "/query/activations",
+        "/query/activations/daily_replay",
         dependencies=[Depends(combined_auth)],
-        summary="Get recent query activations for 3D viewer",
-        description="Returns recent query results with entity/relationship data for real-time 3D visualization activation",
+        summary="Get a random cached query activation for idle replay",
+        description="Returns a random activation from today's query cache so the 3D viewer can replay activations when idle",
+        include_in_schema=False,
     )
-    async def get_query_activations(
-        since: Optional[float] = Query(
-            None,
-            description="Return activations after this timestamp (Unix epoch seconds)",
-        ),
-        limit: int = Query(
-            10,
-            ge=1,
-            le=100,
-            description="Maximum number of activations to return",
-        ),
-    ):
-        """Get recent query activations for 3D viewer real-time activation.
+    async def get_daily_replay():
+        """Return a random activation from today's cache for idle replay.
 
-        Returns query results that can be used to activate neurons in the 3D visualization.
-        Optionally filter by timestamp to get only new activations since last poll.
-        Activations older than 60 seconds are automatically expired.
+        The 3D viewer polls this when no new query has arrived for a while and
+        replays the returned activation in a dimmed style. Pure read — replays
+        are never recorded back into the cache.
         """
-        # Clean up expired activations
-        current_time = time.time()
-        _recent_query_activations[:] = [
-            a for a in _recent_query_activations
-            if current_time - a["timestamp"] < _ACTIVATION_TTL_SECONDS
-        ]
+        import random
 
-        if since is None:
-            # Return most recent activations
-            activations = _recent_query_activations[-limit:]
-        else:
-            # Return activations since timestamp
-            activations = [
-                a for a in _recent_query_activations
-                if a["timestamp"] > since
-            ][-limit:]
-
-        # Log the retrieval
-        if activations:
-            logger.debug(
-                f"Retrieved {len(activations)} activations "
-                f"(total in queue: {len(_recent_query_activations)})"
-            )
-
-        return {
-            "activations": activations,
-            "count": len(activations),
-            "latest_timestamp": activations[-1]["timestamp"] if activations else None,
-        }
+        day_key = time.strftime("%Y-%m-%d")
+        bucket = _daily_query_cache.get(day_key) or []
+        if not bucket:
+            return {"activation": None, "cached_count": 0}
+        return {"activation": random.choice(bucket), "cached_count": len(bucket)}
 
     return router

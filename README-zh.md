@@ -34,6 +34,7 @@
       <a href="README-zh.md"><img src="https://img.shields.io/badge/🇨🇳中文版-1a1a2e?style=for-the-badge"></a>
       <a href="README.md"><img src="https://img.shields.io/badge/🇺🇸English-1a1a2e?style=for-the-badge"></a>
       <a href="README-ja.md"><img src="https://img.shields.io/badge/🇯🇵日本語版-1a1a2e?style=for-the-badge"></a>
+      <a href="README-id.md"><img src="https://img.shields.io/badge/🇮🇩Bahasa%20Indonesia-1a1a2e?style=for-the-badge"></a>
     </p>
     <p>
       <a href="https://pepy.tech/projects/lightrag-hku"><img src="https://static.pepy.tech/personalized-badge/lightrag-hku?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads"></a>
@@ -220,7 +221,7 @@ make env-security-check # 可选：审计当前 .env 中的安全风险
 Native docx 解析器的可选引擎参数 `smart_heading` 使用 spaCy 做分句/NER 启发式判断。spaCy 运行时已包含在 `api` extra 中——只有两个钉定版本的语言模型（`zh_core_web_sm` / `en_core_web_sm` 3.8.0，GitHub release wheel，未发布到 PyPI）需要额外一步安装：
 
 ```bash
-lightrag-download-cache --spacy --spacy-install
+lightrag-download-cache --spacy-install
 ```
 
 可以按文件/规则启用 smart_heading（如 `LIGHTRAG_PARSER=docx:native(smart_heading=true)`），也可以在 `.env` 中全局启用：
@@ -232,6 +233,27 @@ DOCX_SMART_HEADING=true
 ```
 
 全局开关开启（或 `LIGHTRAG_PARSER` 规则携带 `native(smart_heading=true)`）时，服务器会在启动阶段校验模型并在缺失时立即报错（附安装指引）。从不启用 smart_heading 的部署无需安装模型。Docker 主镜像已内置模型（lite 镜像不含）；离线环境请参阅[离线部署指南](./docs/OfflineDeployment.md)。
+
+### 可选：SVG 栅格化所需的 libcairo（native md/textpack）
+
+Native markdown/textpack 解析器会通过 `cairosvg` 把内嵌的 SVG 图片栅格化为 PNG。`cairosvg` 是对 cairo 的 cffi 绑定：`pip install cairosvg`（随 `api` extra 一起安装）总能成功，但只有宿主机同时装了原生的 `libcairo` 共享库，栅格化才真正能跑——`pip`/`uv` 装不了系统库。缺失时栅格化会在运行时失败，对应的 SVG 会被跳过（不影响文档其余内容）；服务器会在启动时探测这一能力，缺失时以醒目的黄色警告提示，避免这个缺口一直藏到某篇文档处理时才被发现。
+
+按平台安装对应的系统包：
+
+```bash
+# Debian / Ubuntu（官方 Docker 镜像已内置）
+sudo apt-get install -y libcairo2
+
+# RHEL / Fedora
+sudo dnf install -y cairo
+
+# macOS（Homebrew）
+brew install cairo
+
+# Windows：安装内含 libcairo-2.dll 的 GTK3 运行时
+```
+
+从不处理带内嵌 SVG 的 markdown/textpack 文档的部署，可以忽略这条启动警告。
 
 ## 关于LightRAG
 
@@ -247,7 +269,7 @@ DOCX_SMART_HEADING=true
 4. **支持增量更新与局部删除**：LightRAG 解决了基于图的知识库难以增量更新和局部删除的问题，保证系统在动态数据环境下的时效性。删除文档时，系统可以利用构建阶段的 LLM 缓存快速重建受影响的实体与关系，大幅提升知识库的更新效率。
 5. **支持多种文档解析引擎**：LightRAG 的文件处理管线支持 MinerU、Docling 和 Native 等文档解析引擎，也支持第三方扩展解析引擎。LightRAG 专属的 Native 引擎可高效解析 Word 和 Markdown 文档中的图片、表格和公式，尤其适合处理多模态内容丰富的文档。Native 引擎还支持自动识别和纠正 Word 文档的章节标题，即使文档大纲不规范，也能改善内容提取效果，为后续按章节进行文本分块打下基础。
 6. **支持多种文本分块策略**：LightRAG 支持 4 种文本分块策略，分别是 `固定长度分块(F)`、`递归字符分块(R)`、`向量语义分块(V)` 和 `段落语义分块(P)`。其中，`段落语义分块(P)` 是 LightRAG 专属的分块策略，可以**让分块边界尽可能对齐文档原生的语义边界**（标题、段落和表格），从而减少标题与内容错配、长表格切分后丢失标题行等问题。
-7. **支持多种存储后端**：LightRAG 默认的 KV、向量和图存储均采用基于本地文件持久化的内存数据库，非常适合研究者快速评估项目。LightRAG 还支持多种主流后端存储，可用于大规模数据集的生产部署。
+7. **支持多种存储后端**：LightRAG 默认的 KV、向量和图存储均采用基于本地文件持久化的内存数据库，**仅适合小数据量的测试与效果评估，不适用于生产环境**。LightRAG 还支持多种主流后端存储（推荐 PostgreSQL），可用于大规模数据集的生产部署。
 
 ### 多模态能力的升级
 
@@ -313,8 +335,9 @@ VLM_LLM_MODEL=<your_vlm_model_name>
 
 对于大规模的文档处理，需要提高文档处理的并发能力。几个涉及文件并发处理性能的关键环境变量包括：
 
-- **MAX_ASYNC_LLM/EXTRACT_ASYNC_LLM**：控制 LLM 模型的最大并发数。
-- **MAX_PARALLEL_INSERT**：控制并行处理文件的最大数量。单个文件内的文本、表格、公式、图片之间的处理也会并发进行。`MAX_PARALLEL_INSERT` 应该为 `MAX_ASYNC_LLM` 的 1/3 左右为宜。
+- **MAX_ASYNC_LLM**：设置 LLM 角色的基础并发数（`MAX_ASYNC` 仍作为兼容旧名保留）。文件处理时，它还限制单个文档内各文本块的实体/关系抽取 task 数；每个实体合并或关系合并阶段最多可运行其两倍数量的 task。
+- **EXTRACT_MAX_ASYNC_LLM**：可选地覆盖 Extract 角色的实际 LLM 请求并发数，适用于抽取和合并时的摘要请求。未设置时继承 `MAX_ASYNC_LLM`；它不会改变前述流水线 task 上限。
+- **MAX_PARALLEL_INSERT**：控制可并行处理的文件数量，而非单个文档内的 chunk 或图合并 task 上限。建议约为 `MAX_ASYNC_LLM` 的 1/3。
 - **MAX_PARALLEL_PARSE_MINERU**：控制 MinerU 文件解析的并发处理文件数。
 - **MAX_PARALLEL_PARSE_DOCLING**：控制 Docling 文件解析的并发处理文件数。
 - **EMBEDDING_FUNC_MAX_ASYNC**：控制嵌入模型的最大并发数。
@@ -337,7 +360,11 @@ LightRAG 需要使用到 4 种后台存储类型，分别是：
 - **GRAPH_STORAGE**：用于保存知识图谱。
 - **DOC_STATUS_STORAGE**：用于保存文件列表。
 
-LightRAG 的默认存储全部都是基于文件进行持久化的内存数据库。默认存储仅用于开发调试，不适合用于生产环境部署。生产环境如果希望使用同一个后台数据解决 4 种类型的后台存储，可以选择 PostgreSQL、MongoDB 或 OpenSearch。也可以单独为向量存储或图存储选择专业化的数据库，例如使用 Milvus 或 Qdrant 作为向量存储，使用 Neo4j 或 Memgraph 作为图存储。
+**4 种默认存储全部都是内存数据库**（`JsonKVStorage`、`NanoVectorDBStorage`、`NetworkXStorage`、`JsonDocStatusStorage`）：全部数据常驻服务进程的内存中，`WORKING_DIR` 下的本地文件仅用于持久化，因此容量受可用内存限制。默认存储**仅适合小数据量的测试、效果评估与开发调试，不能用于生产环境部署**。
+
+生产环境**推荐使用 PostgreSQL** —— 它可以独自承担全部 4 种类型的后台存储；MongoDB 与 OpenSearch 是另外两个单一后端方案。也可以单独为向量存储或图存储选择专业化的数据库，例如使用 Milvus 或 Qdrant 作为向量存储，使用 Neo4j 或 Memgraph 作为图存储。
+
+各存储类型的完整可选实现列表，请参考 [支持的存储类型](./docs/LightRAG-API-Server-zh.md#支持的存储类型)。
 
 ### 文档处理阶段其他重要配置
 
@@ -365,6 +392,17 @@ LightRAG 的默认存储全部都是基于文件进行持久化的内存数据�
 - **MAX_ENTITY_TOKENS / MAX_RELATION_TOKENS / MAX_TOTAL_TOKENS**：控制召回内容送给LLM上下文的Token长度。召回内容包含`实体`、`关系`和`文本块`三部分，实体和关系的长度可以单独控制长度，文本块的长度由总长度减去实体和关系的长度来控制。
 - **ENABLE_CONTENT_HEADINGS**：控制是否把文本块所在的章节标题送给LLM；默认开启，可以为LLM提供更加丰富的上下文信息，提高回答质量。
 - **ENABLE_LLM_CACHE**：是否允许缓存查询结果。默认开启，相同的查询问题、查询模式、LLM模型参数将返回相同的结果。
+- **USER_PROMPT_PREFIX / USER_PROMPT_PREFIX_FILE**：拼接在每个请求的 `user_prompt` 前面的全局指令（对应回答提示词中的"Additional Instructions"部分），为运维方提供一个统一定制LLM输出的入口。拼接是逐字节的、不会自动插入分隔符，请自行在内容结尾加上 `\n\n`。如果请求的 `user_prompt` 为空，该前缀将单独成为送给 LLM 的指令；只有 API 字段 `disable_user_prompt_prefix` 能禁用它，且请求无法读取或替换它。较长或多段落的内容请使用 `USER_PROMPT_PREFIX_FILE`（`PROMPT_DIR/user_prompt` 目录下的 `.md`/`.txt` 文件名），因为 `.env` 中的值必须写在一行内。
+
+### WebUI 入口与默认入口
+
+服务器基于同一次前端构建挂载两个 WebUI 入口。**`/webui`** 是后台管理界面：文档管理、知识图谱浏览，以及带完整查询参数面板的查询调试。**`/workspace`** 是面向日常查询用户的纯问答入口：只有聊天界面（无文档管理、无知识图谱、无查询参数侧栏、无 API 文档入口），针对移动端优化，未登录的访客会先看到欢迎页。
+
+- **LIGHTRAG_DEFAULT_UI**：根路径 `/` 重定向到哪个入口——`webui`（默认）或 `workspace`。它**只**控制这一个行为：该重定向。无论取值如何，两个入口都保持挂载、各自的 URL 始终可访问；取其它值会导致启动失败。当部署的主要使用者是查询用户而非管理员时，可将其设为 `workspace`。
+- **UI_TEMPLATES_DIR**：指向一个可选的多语言定制包，用你自己的内容替换欢迎页、登录页文案、查询空白页、品牌 Logo 和版权行，无需重新构建 WebUI。参见 [UserDefinedUI-zh.md](./docs/UserDefinedUI-zh.md)。
+- **ENABLE_AI_CONTENT_NOTICE**：在两个查询界面（`/workspace` 与 `/webui` 的检索面板）中为每条**由 LLM 生成的**回答标注"由AI生成"；不是模型写的文本——无检索结果时的固定回复、管理面板的调试输出——不会被标注。默认关闭；它只是界面元素，不会进入 API 响应，也不会写入聊天历史。
+
+把最终用户引导到 `/workspace` 之前有两点需要了解。其一，那里的查询参数**只继承、不可编辑**：每次查询使用同一浏览器中 `/webui` 保存的设置（未保存时使用前端默认值），这是按浏览器的本地状态，不是服务端全局策略。其二，隐藏后台界面是使用体验上的划分，**不是**安全边界——服务端仍会对每个接口执行鉴权。查询入口的完整行为参见 [LightRAG-API-Server-zh.md](./docs/LightRAG-API-Server-zh.md#workspace-查询入口)。
 
 ## 使用LightRAG SDK
 
@@ -408,7 +446,7 @@ python examples/lightrag_openai_demo.py
 
 如需流式响应示例的实现代码，请参阅 `examples/lightrag_openai_compatible_demo.py`。运行前，请确保根据需求修改示例代码中的LLM及嵌入模型配置。
 
-**注意1**：在运行demo程序的时候需要注意，不同的测试程序可能使用的是不同的embedding模型，更换不同的embeding模型的时候需要把清空数据目录（`./dickens`），否则层序执行会出错。如果你想保留LLM缓存，可以在清除数据目录时保留`kv_store_llm_response_cache.json`文件。
+**注意1**：在运行 demo 程序的时候需要注意，不同的测试程序可能使用的是不同的 embedding 模型。一个模型写入的向量对另一个模型不可用，所以更换 embedding 模型后必须重建向量。对 **demo 数据**而言，最简单的做法是直接删除 demo 目录（`./dickens`）后重跑——语料很小且可丢弃；想保留 LLM 缓存可以保留 `kv_store_llm_response_cache.json` 文件。但**生产部署请不要删除工作目录**：它保存着知识图谱和文本块，删掉会把重新嵌入变成全量重新摄取。正确做法是运行 `lightrag-rebuild-vdb`，参见 [Switching embedding models](./docs/ProgramingWithCore.md#switching-embedding-models)。
 
 **注意2**：官方支持的示例代码仅为 `lightrag_openai_demo.py` 和 `lightrag_openai_compatible_demo.py` 两个文件。其他示例文件均为社区贡献内容，尚未经过完整测试与优化。
 
@@ -485,6 +523,7 @@ LightRAG 在农业、计算机科学、法律和混合等领域均显著优于 N
 | 文档 | 内容 |
 |---|---|
 | [RoleSpecificLLMConfiguration-zh.md](./docs/RoleSpecificLLMConfiguration-zh.md) | 按角色（`EXTRACT` / `QUERY` / `KEYWORD` / `VLM`）配置 LLM 与 VLM |
+| [LLMProviderOptions.md](./docs/LLMProviderOptions.md) | provider 生成参数完整参考（`OPENAI_LLM_*`、`OLLAMA_LLM_*`、`GEMINI_LLM_*`、`BEDROCK_LLM_*`、`*_EMBEDDING_*`，英文） |
 | [AsymmetricEmbedding.md](./docs/AsymmetricEmbedding.md) | 查询/文档非对称 embedding（`EMBEDDING_ASYMMETRIC`）与各模型的前缀 |
 | [MilvusConfigurationGuide.md](./docs/MilvusConfigurationGuide.md) | 通过 `vector_db_storage_cls_kwargs` 调整 Milvus 索引参数 |
 
@@ -520,7 +559,7 @@ LightRAG 在农业、计算机科学、法律和混合等领域均显著优于 N
 
 列出争用同一个规范 source key 的文档，并把运维人员未选中的候选降级为重复项。工具本身从不自行裁定胜者，也从不删除内容。
 
-**`download_cache.py`** — `lightrag-download-cache [--spacy --spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
+**`download_cache.py`** — `lightrag-download-cache [--spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
 
 预先下载离线部署及 docx `smart_heading` 引擎参数所需的 tiktoken 编码与钉版 spaCy 模型。
 

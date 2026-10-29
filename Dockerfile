@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/root/.local/share/uv \
 # pinned spaCy model wheels for the docx smart_heading engine parameter.
 # Use uv run to execute commands from the virtual environment
 RUN mkdir -p /app/data/tiktoken \
-    && uv run lightrag-download-cache --cache-dir /app/data/tiktoken --spacy --spacy-dir /app/spacy_models || status=$?; \
+    && uv run lightrag-download-cache --cache-dir /app/data/tiktoken --spacy-dir /app/spacy_models || status=$?; \
     if [ -n "${status:-}" ] && [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then exit "$status"; fi
 
 # Final stage
@@ -116,10 +116,13 @@ ENV PROMPT_DIR=/app/data/prompts
 
 # Create a non-root user (CIS Docker 4.1) and install gosu for privilege drop.
 # Fixed UID/GID 1000 gives predictable ownership for bind-mounts / PVCs.
+# libcairo2 is the native library cairosvg (SVG->PNG rasterization for native
+# markdown images) binds to via cffi at runtime; cairosvg installs fine without
+# it but svg2png() fails with "no library called cairo-2 was found".
 # chown -R /app MUST run after every data COPY above so the venv (pipmaster
 # installs packages at runtime), data dirs, and the tiktoken cache are writable.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gosu \
+    && apt-get install -y --no-install-recommends gosu libcairo2 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 1000 lightrag \
     && useradd -u 1000 -g lightrag -m -d /home/lightrag -s /usr/sbin/nologin lightrag \

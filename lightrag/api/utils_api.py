@@ -37,6 +37,18 @@ logger = logging.getLogger("lightrag")
 _INTERNAL_SERVER_ERROR_MESSAGE = "Internal server error"
 
 
+def new_error_id() -> str:
+    """Mint a short correlation id joining a client-visible error to the log.
+
+    Use it whenever a client-facing message must stay free of raw exception
+    text (CWE-209) but an operator still has to find the detail server-side:
+    log the full text with the id, put only the id in the response. Emit it to
+    the client in the same ``(error_id: ...)`` spelling used below so one grep
+    pattern covers every path.
+    """
+    return uuid.uuid4().hex[:12]
+
+
 def internal_server_error(exc: Exception) -> HTTPException:
     """Build a client-safe HTTP 500 that never exposes raw exception text (CWE-209).
 
@@ -54,7 +66,7 @@ def internal_server_error(exc: Exception) -> HTTPException:
             logger.error(traceback.format_exc())
             raise internal_server_error(e)
     """
-    error_id = uuid.uuid4().hex[:12]
+    error_id = new_error_id()
     logger.error(
         f"Returning HTTP 500 to client [error_id={error_id}] ({type(exc).__name__})"
     )
@@ -218,7 +230,12 @@ def check_env_file():
     env_path = ".env"
 
     if not os.path.exists(env_path):
-        warning_msg = "Warning: Startup directory must contain .env file for multi-instance support."
+        warning_msg = (
+            "Warning: No .env file found in the current directory. "
+            "If you are running multiple LightRAG instances, each instance's "
+            "startup directory must have its own .env file so their configurations "
+            "stay isolated."
+        )
         ASCIIColors.yellow(warning_msg)
 
         # Check if running in interactive terminal
@@ -372,13 +389,20 @@ def credentials_accepted(
     return False
 
 
-def get_combined_auth_dependency(api_key: Optional[str] = None):
+def get_combined_auth_dependency(
+    api_key: Optional[str] = None, *, respect_whitelist: bool = True
+):
     """
     Create a combined authentication dependency that implements authentication logic
     based on API key, OAuth2 token, and whitelist paths.
 
     Args:
         api_key (Optional[str]): API key for validation
+        respect_whitelist: When False, ``WHITELIST_PATHS`` is ignored and the
+            credential checks always run. Used by ``/auth/verify``, whose whole
+            purpose is to report credential validity: a deployment whose
+            whitelist happens to cover it (e.g. ``/auth/*``) must not turn it
+            into an unconditional 200 while the protected routes still reject.
 
     Returns:
         Callable: A dependency function that implements the authentication logic
@@ -414,7 +438,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
         # mount prefix (see get_route_path), and both the whitelist and the
         # renewal skip list below are written as unprefixed route paths.
         path = get_route_path(request.scope)
-        if path_is_whitelisted(request.scope):
+        if respect_whitelist and path_is_whitelisted(request.scope):
             return  # Whitelist path, allow access
 
         # 2. Validate token first if provided in the request (Ensure 401 error if token is invalid)
@@ -724,16 +748,21 @@ def display_splash_screen(args: argparse.Namespace) -> None:
 
     # Server Access Information
     protocol = "https" if args.ssl else "http"
+    api_docs_enabled = bool(getattr(args, "enable_api_docs", True))
     if args.host == "0.0.0.0":
         ASCIIColors.magenta("\n🌐 Server Access Information:")
         ASCIIColors.white("    ├─ WebUI (local): ", end="")
         ASCIIColors.yellow(f"{protocol}://localhost:{args.port}")
         ASCIIColors.white("    ├─ Remote Access: ", end="")
         ASCIIColors.yellow(f"{protocol}://<your-ip-address>:{args.port}")
-        ASCIIColors.white("    ├─ API Documentation (local): ", end="")
-        ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/docs")
-        ASCIIColors.white("    └─ Alternative Documentation (local): ", end="")
-        ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/redoc")
+        if api_docs_enabled:
+            ASCIIColors.white("    ├─ API Documentation (local): ", end="")
+            ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/docs")
+            ASCIIColors.white("    └─ Alternative Documentation (local): ", end="")
+            ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/redoc")
+        else:
+            ASCIIColors.white("    └─ API Documentation: ", end="")
+            ASCIIColors.yellow("disabled (ENABLE_API_DOCS=false)")
 
         ASCIIColors.magenta("\n📝 Note:")
         ASCIIColors.cyan("""    Since the server is running on 0.0.0.0:
@@ -748,10 +777,14 @@ def display_splash_screen(args: argparse.Namespace) -> None:
         ASCIIColors.magenta("\n🌐 Server Access Information:")
         ASCIIColors.white("    ├─ WebUI (local): ", end="")
         ASCIIColors.yellow(f"{base_url}")
-        ASCIIColors.white("    ├─ API Documentation: ", end="")
-        ASCIIColors.yellow(f"{base_url}/docs")
-        ASCIIColors.white("    └─ Alternative Documentation: ", end="")
-        ASCIIColors.yellow(f"{base_url}/redoc")
+        if api_docs_enabled:
+            ASCIIColors.white("    ├─ API Documentation: ", end="")
+            ASCIIColors.yellow(f"{base_url}/docs")
+            ASCIIColors.white("    └─ Alternative Documentation: ", end="")
+            ASCIIColors.yellow(f"{base_url}/redoc")
+        else:
+            ASCIIColors.white("    └─ API Documentation: ", end="")
+            ASCIIColors.yellow("disabled (ENABLE_API_DOCS=false)")
 
     # Security Notice
     if args.key:
@@ -823,6 +856,7 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     """)
 
     _warn_about_body_limits(args)
+    _warn_about_svg_rasterizer()
 
     # Ensure splash output flush to system log
     sys.stdout.flush()
@@ -866,4 +900,29 @@ def _warn_about_body_limits(args) -> None:
         ASCIIColors.white("""    MAX_UPLOAD_SIZE is unset or unlimited, so /documents/upload has no raw
     request-body ceiling to derive and accepts a body of any size. Set
     MAX_UPLOAD_SIZE to the largest file you intend to accept.
+    """)
+
+
+def _warn_about_svg_rasterizer() -> None:
+    """Flag a missing/broken cairosvg->libcairo rasterization path.
+
+    ``cairosvg`` is a cffi binding: ``pip install cairosvg`` always succeeds,
+    but rendering only works if the native ``libcairo`` shared library is also
+    present on the host, which pip/uv cannot install. Without it, SVG images in
+    markdown/textpack documents are silently skipped (the rest of the document
+    is unaffected) — surfacing the gap here, once, is cheaper for an operator
+    to notice than a per-document warning buried in later processing logs.
+    """
+    from lightrag.parser.markdown.parser import check_svg_rasterizer
+
+    error = check_svg_rasterizer()
+    if error is None:
+        return
+    ASCIIColors.yellow("\n⚠️  SVG Rasterization Warning:")
+    ASCIIColors.white(f"""    {error}
+    Install the native libcairo library to fix this:
+      Debian/Ubuntu : sudo apt-get install -y libcairo2
+      RHEL/Fedora   : sudo dnf install -y cairo
+      macOS         : brew install cairo
+      Windows       : install the GTK3 runtime (bundles libcairo-2.dll)
     """)

@@ -4,7 +4,6 @@ import weakref
 import sys
 
 import asyncio
-import bisect
 import contextvars
 import html
 import csv
@@ -27,12 +26,15 @@ from hashlib import md5
 from pathlib import Path
 from typing import (
     Any,
+    Awaitable,
     Protocol,
     Callable,
     TYPE_CHECKING,
     List,
+    NamedTuple,
     Optional,
     Iterable,
+    Iterator,
     Sequence,
     Collection,
 )
@@ -40,6 +42,11 @@ import numpy as np
 from dotenv import load_dotenv
 import json_repair
 
+from lightrag.exceptions import (
+    ChunkBlockMatchError,
+    CommitBookkeepingError,
+    EmptyTruncatedResponseError,
+)
 from lightrag.constants import (
     DEFAULT_LOG_MAX_BYTES,
     DEFAULT_LOG_BACKUP_COUNT,
@@ -261,6 +268,57 @@ def parse_optional_float(raw: str | None) -> float | None:
     return value
 
 
+def validate_file_path_security(file_path_str: str, base_dir: Path) -> Optional[Path]:
+    """
+    Validate file path security to prevent Path Traversal attacks.
+
+    Args:
+        file_path_str: The file path string to validate
+        base_dir: The base directory that the file must be within
+
+    Returns:
+        Path: Safe file path (resolved, contained to ``base_dir``) if valid;
+            None if unsafe, malformed, or unresolvable. Does NOT check
+            existence — a returned path is guaranteed inside ``base_dir`` but
+            may not exist; the caller decides what "inside but absent" means.
+    """
+    if not file_path_str or not file_path_str.strip():
+        return None
+
+    try:
+        # Clean the file path string
+        clean_path_str = file_path_str.strip()
+
+        # Check for obvious path traversal patterns before processing
+        # This catches both Unix (..) and Windows (..\) style traversals
+        if ".." in clean_path_str:
+            # Additional check for Windows-style backslash traversal
+            if (
+                "\\..\\" in clean_path_str
+                or clean_path_str.startswith("..\\")
+                or clean_path_str.endswith("\\..")
+            ):
+                return None
+
+        # Normalize path separators (convert backslashes to forward slashes)
+        # This helps handle Windows-style paths on Unix systems
+        normalized_path = clean_path_str.replace("\\", "/")
+
+        # Create path object and resolve it (handles symlinks and relative paths)
+        candidate_path = (base_dir / normalized_path).resolve()
+        base_dir_resolved = base_dir.resolve()
+
+        # Check if the resolved path is within the base directory
+        if not candidate_path.is_relative_to(base_dir_resolved):
+            return None
+
+        return candidate_path
+
+    except Exception as e:
+        logger.warning(f"Invalid file path detected: {file_path_str} - {str(e)}")
+        return None
+
+
 def get_env_value(
     env_key: str, default: any, value_type: type = str, special_none: bool = False
 ) -> any:
@@ -285,7 +343,7 @@ def get_env_value(
         return None
 
     if value_type is bool:
-        return value.lower() in ("true", "1", "yes", "t", "on")
+        return value.strip().lower() in ("true", "1", "yes", "t", "on")
 
     # Handle list type with JSON parsing
     if value_type is list:
@@ -325,6 +383,47 @@ def get_env_value(
         )
         return default
     return converted
+
+
+class EffectiveUserPrompt(NamedTuple):
+    """The instruction text a query actually sends, and how it renders."""
+
+    text: str
+    """Composed instructions, ``""`` when there are none. Cache-key material."""
+
+    slot: str
+    """Value for the ``{user_prompt}`` placeholder; ``"n/a"`` when there are none."""
+
+
+def resolve_user_prompt(
+    user_prompt: str | None,
+    prefix: str | None,
+    disable_prefix: bool = False,
+) -> EffectiveUserPrompt:
+    """Compose the server-side prompt prefix with a request's ``user_prompt``.
+
+    ``prefix`` is operator configuration (``USER_PROMPT_PREFIX`` or
+    ``USER_PROMPT_PREFIX_FILE``); ``user_prompt`` is what the caller sent.
+
+    Neither side is normalized: no stripping, no separator inserted. The
+    operator owns the formatting and ends the prefix with its own ``\n\n``
+    when it should not run into the caller's text — stripping here would eat
+    exactly that. Not stripping ``user_prompt`` matters too: it keeps
+    ``text`` byte-identical to the pre-prefix ``user_prompt or ""`` whenever no
+    prefix is configured, so existing answer-cache entries keep hitting (see
+    :func:`compute_args_hash` call sites in ``operate.py``).
+
+    **An empty ``user_prompt`` does not disable the prefix.** When the caller
+    sends nothing, the prefix alone becomes the instructions sent to the LLM --
+    it is indistinguishable downstream from a caller having sent exactly that
+    text, which is also why the prompt templates need no second placeholder.
+    Only ``disable_prefix`` suppresses it. ``"n/a"`` is reached solely when
+    BOTH sides are empty.
+    """
+
+    resolved_prefix = "" if disable_prefix else (prefix or "")
+    text = resolved_prefix + (user_prompt or "")
+    return EffectiveUserPrompt(text=text, slot=f"\n\n{text}" if text else "n/a")
 
 
 # Use TYPE_CHECKING to avoid circular imports
@@ -409,7 +508,6 @@ class LightragPathFilter(logging.Filter):
         super().__init__()
         # Define paths to be filtered
         self.filtered_paths = [
-            "/documents",
             "/documents/paginated",
             "/health",
             "/webui/",
@@ -568,6 +666,30 @@ class EmbeddingFunc:
             embeddings = await embed_func(texts, context="document")  # For indexing
             embeddings = await embed_func([query], context="query")   # For search
 
+    Return shape contract:
+        The wrapped function MUST return a 2D numpy array of shape
+        ``(len(texts), embedding_dim)`` -- exactly one row per input text, in
+        input order. Every storage backend consumes the result positionally
+        (``embeddings[i]`` belongs to ``texts[i]``), so any other shape is
+        rejected with a ValueError; the wrapper never reshapes, slices or pads
+        the result, because the row-to-input mapping cannot be recovered once
+        it is wrong.
+
+        Rank and dimension are always checked. The row count is checked
+        against the input batch, resolved from the first positional argument
+        or from the kwarg named after the wrapped function's first parameter;
+        when neither applies the row count is left unverified rather than
+        guessed at. In particular:
+
+        - A single input still returns ``(1, embedding_dim)``, not
+          ``(embedding_dim,)``.
+        - A provider that returns more vectors than inputs (e.g. one vector
+          per internally split segment of an over-long text) needs its token
+          limit declared via ``max_token_size``, or a dedicated adapter that
+          normalizes the output to one vector per input.
+        - An empty input list may return any empty array, including a bare
+          ``np.array([])``.
+
     Args:
         embedding_dim: Expected dimension of the embeddings(For dimension checking and workspace data isolation in vector DB)
         func: The actual embedding function to wrap
@@ -616,6 +738,40 @@ class EmbeddingFunc:
                 "Consider using .func to access the unwrapped function directly."
             )
 
+    def _resolve_input_batch(self, args: tuple, kwargs: dict) -> Any:
+        """Return the sequence of texts the caller passed, or None if unknown.
+
+        The vector count can only be checked against something. Positional is
+        the overwhelmingly common path and costs nothing to read. A keyword
+        call needs the wrapped function's first parameter name to know which
+        kwarg holds the texts, so the signature is inspected only on that
+        path -- and only the parameter name is read, never a full bind(),
+        which would raise on the extra kwargs this wrapper and its priority
+        decorator pass through (``_priority``, ``context``, ...).
+
+        Returning None means "not resolvable", which downgrades the vector
+        count check to unverifiable rather than guessing at a mapping.
+        """
+        if args:
+            return args[0]
+        if not kwargs:
+            return None
+        try:
+            params = inspect.signature(self.func).parameters
+        except (TypeError, ValueError):
+            # Builtins and C-implemented callables expose no signature.
+            return None
+        for param in params.values():
+            if param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                return kwargs.get(param.name)
+            # A positional-only or *args first parameter cannot be addressed
+            # by keyword at all, so the batch stays unknown.
+            return None
+        return None
+
     async def __call__(self, *args, **kwargs) -> np.ndarray:
         # Only inject embedding_dim when send_dimensions is True
         if self.send_dimensions:
@@ -652,27 +808,92 @@ class EmbeddingFunc:
         # Call the actual embedding function
         result = await self.func(*args, **kwargs)
 
-        # Validate embedding dimensions using total element count
-        total_elements = result.size  # Total number of elements in the numpy array
+        # Validate the result shape directly rather than inferring it from a
+        # total-element count. A total-element check cannot tell a genuine
+        # vector-count mismatch (2N, D) apart from a dimension mismatch
+        # (N, 2D) -- both divide out to the same "actual vectors" number, so
+        # the wrong one of the two gets reported. Checking ndim/shape[0]/
+        # shape[1] directly identifies which one actually happened.
+        #
+        # Every mismatch is fatal: the wrapper never reshapes, slices or pads
+        # the result. Each raise is preceded by a logger.error carrying the
+        # likely cause and the fix, so the short exception message stays
+        # readable while the diagnosis is still available in the logs.
         expected_dim = self.embedding_dim
+        # None means the input batch could not be resolved from the call, so
+        # the vector count is unverifiable -- see _resolve_input_batch.
+        input_batch = self._resolve_input_batch(args, kwargs)
+        expected_vectors = (
+            len(input_batch) if isinstance(input_batch, (list, tuple)) else None
+        )
 
-        # Check if total elements can be evenly divided by embedding_dim
-        if total_elements % expected_dim != 0:
+        # An empty batch carries no vectors and no dimension to validate. A
+        # provider that short-circuits with `if not texts: return np.array([])`
+        # yields a 1D (0,) array, which is a correct answer to a zero-input
+        # request and must not be rejected by the 2D check below. An empty
+        # input paired with a non-empty result still falls through and fails.
+        if expected_vectors == 0 and result.size == 0:
+            return result
+
+        if result.ndim != 2:
+            logger.error(
+                f"Embedding result has unexpected shape {result.shape}: this "
+                f"wrapper requires a 2D array of exactly one row per input "
+                f"text, i.e. (len(texts), {expected_dim}). A single input "
+                f"must still come back as (1, {expected_dim}), not "
+                f"({expected_dim},); a flattened or nested array is rejected "
+                f"rather than reshaped, because the row-to-input mapping "
+                f"cannot be recovered from it."
+            )
             raise ValueError(
-                f"Embedding dimension mismatch detected: "
-                f"total elements ({total_elements}) cannot be evenly divided by "
-                f"expected dimension ({expected_dim}). "
+                f"Embedding result has unexpected shape: expected a 2D "
+                f"array (vectors, dimension) but got ndim={result.ndim} "
+                f"(shape={result.shape})."
             )
 
-        # Optional: Verify vector count matches input text count
-        actual_vectors = total_elements // expected_dim
-        if args and isinstance(args[0], (list, tuple)):
-            expected_vectors = len(args[0])
-            if actual_vectors != expected_vectors:
-                raise ValueError(
-                    f"Vector count mismatch: "
-                    f"expected {expected_vectors} vectors but got {actual_vectors} vectors (from embedding result)."
-                )
+        if expected_vectors is not None and result.shape[0] != expected_vectors:
+            logger.error(
+                f"Embedding vector count mismatch: {expected_vectors} text(s) "
+                f"in, {result.shape[0]} vector(s) out (shape={result.shape}). "
+                f"The usual cause is an embedding service that splits an "
+                f"over-long input internally and returns one vector per "
+                f"segment: declare the model's real token limit so texts are "
+                f"truncated before the call -- EMBEDDING_TOKEN_LIMIT on the "
+                f"API server, or max_token_size on "
+                f"@wrap_embedding_func_with_attrs for a custom embedding "
+                f"function. A provider that legitimately returns multiple "
+                f"vectors per input needs a dedicated adapter that normalizes "
+                f"its output to one vector per input before it reaches this "
+                f"wrapper; nothing is reshaped or truncated here, since there "
+                f"is no general contract for which rows correspond to which "
+                f"inputs."
+            )
+            raise ValueError(
+                f"Vector count mismatch: expected {expected_vectors} vectors "
+                f"(one per input text) but got {result.shape[0]} "
+                f"(shape={result.shape})."
+            )
+
+        if result.shape[1] != expected_dim:
+            logger.error(
+                f"Embedding dimension mismatch: the model returned "
+                f"{result.shape[1]}-dimensional vectors but this embedding "
+                f"function declares {expected_dim} (shape={result.shape}). "
+                f"Check that EMBEDDING_DIM (or the embedding_dim passed to "
+                f"@wrap_embedding_func_with_attrs / EmbeddingFunc) matches "
+                f"the model actually being called, and that the endpoint "
+                f"honours the requested output dimension. Vectors already "
+                f"stored under the previously declared dimension do not match "
+                f"the corrected one; unless nothing has been indexed yet, "
+                f"rebuild them with `lightrag-rebuild-vdb` after fixing the "
+                f"configuration. Do NOT clear the working directory -- that "
+                f"destroys the knowledge graph and text chunks the rebuild "
+                f"reads from."
+            )
+            raise ValueError(
+                f"Embedding dimension mismatch: expected dimension "
+                f"{expected_dim} but got {result.shape[1]} (shape={result.shape})."
+            )
 
         return result
 
@@ -903,13 +1124,26 @@ class QueueFullError(Exception):
 
 
 class VectorStorageConsistencyError(Exception):
-    """Raised when a vector storage write fails after the graph has already been updated.
+    """Raised when a step AFTER a durable graph update fails.
 
     The knowledge graph (plus the text_chunks KV store) is the authoritative data
-    source, so no data is lost — but the vector storage no longer mirrors the graph
-    and query results may be incomplete until it is rebuilt. Stop the LightRAG
-    server and run the offline rebuild tool (``lightrag-rebuild-vdb``) to restore
-    consistency.
+    source, so no data is lost — but something that mirrors or annotates it did
+    not complete:
+
+    * a **vector storage** write, so the vector records no longer mirror the
+      graph and query results may be incomplete until they are rebuilt. Stop the
+      LightRAG server and run the offline rebuild tool (``lightrag-rebuild-vdb``)
+      to restore consistency.
+    * a **chunk-tracking** retirement, so rows survive for graph objects a merge
+      or rename has removed. Those are dead bookkeeping until the same key
+      recurs; the message names the keys.
+
+    What every case shares is the reason this type exists at all: the graph
+    mutation IS durable, so the failure must not be reported as one that did not
+    happen. ``_edit_entity_impl``'s ``allow_merge`` handler re-raises exactly
+    this type and folds every other exception into a partial-success summary
+    answering HTTP 200 — which for a landed merge would name the source entity
+    it just deleted as the surviving one.
     """
 
     pass
@@ -932,6 +1166,27 @@ class HealthCheckTimeoutError(Exception):
         self.execution_duration = execution_duration
         super().__init__(
             f"Task forcefully terminated due to execution timeout (>{timeout_value}s, actual: {execution_duration:.1f}s)"
+        )
+
+
+class TokenBudgetError(Exception):
+    """Raised by :class:`Tokenizer`'s split/truncate contract when not even the
+    first complete Unicode code point of a candidate fits within ``max_tokens``.
+
+    Carries the fields needed to diagnose the failure without re-deriving them:
+    the budget that was violated, the independently-encoded token count of that
+    single code point under the same tokenizer, and a bounded preview of the
+    offending text.
+    """
+
+    def __init__(self, max_tokens: int, code_point_token_count: int, preview: str):
+        self.max_tokens = max_tokens
+        self.code_point_token_count = code_point_token_count
+        self.preview = preview
+        super().__init__(
+            f"Cannot fit content within max_tokens={max_tokens}: the first "
+            f"complete Unicode code point alone encodes to "
+            f"{code_point_token_count} token(s). Preview: {preview!r}"
         )
 
 
@@ -2580,6 +2835,23 @@ def write_json(json_obj, file_name):
     return sanitized
 
 
+@dataclass(frozen=True, slots=True)
+class TokenSpan:
+    """A character-offset span into an original string, plus its own token count.
+
+    ``content[start:end]`` is always a verbatim substring of the string that
+    produced this span — never a decoded reconstruction — and independently
+    re-encoding it under the same :class:`Tokenizer` yields exactly
+    ``token_count`` tokens, which is guaranteed to be ``<= max_tokens`` for
+    whatever budget produced the span. See the ``Tokenizer.split_by_token_limit``
+    / ``truncate_by_token_limit`` docstrings for the full contract.
+    """
+
+    start: int
+    end: int
+    token_count: int
+
+
 class TokenizerInterface(Protocol):
     """
     Defines the interface for a tokenizer, requiring encode and decode methods.
@@ -2636,28 +2908,185 @@ def _consume_future_exception(fut: "asyncio.Future") -> None:
         fut.exception()
 
 
-async def bounded_submit(
+# Marker stamped on a ``CancelledError`` that was WITHHELD while a region which
+# must not be interrupted ran to its end -- see
+# :func:`_wait_deferring_cancellation`. It states one narrow fact: the operation
+# kept running AFTER its cancellation was requested, so the storage write that
+# region was performing had the chance to become durable even though the
+# operation is about to report failure.
+#
+# Read it through :func:`cancellation_was_deferred`. A caller that converts a
+# cancellation into an error of its own MUST NOT describe such an operation as
+# one that did not happen -- ``AGENTS.md`` *Consistency without transactions*:
+# "a durable write must never be reported as one that did not happen". The
+# admin-write hold ceiling (``LightRAG._AdminHoldCeiling``) is the reference
+# consumer.
+_DEFERRED_PAST_CANCEL_ATTR = "lightrag_deferred_past_cancel"
+
+
+def cancellation_was_deferred(exc: BaseException) -> bool:
+    """Whether ``exc`` is a cancellation that was held while an uninterruptible
+    region ran to a SUCCESSFUL end, so what that region wrote is durable.
+
+    Success is part of the claim, not an approximation of it. A region whose
+    work RAISED (a full disk, an I/O error) also withholds the cancellation, and
+    ``_bounded_submit_impl`` gives the cancellation precedence over that failure
+    -- it only logs it -- so the exception the caller sees looks the same in both
+    cases. Reporting the failed one as durable is the mirror of the defect this
+    stamp exists to prevent: it would tell a caller their write landed when
+    nothing did, and a caller told that does not retry.
+
+    See :data:`_DEFERRED_PAST_CANCEL_ATTR`. ``False`` for any other exception,
+    for a cancellation delivered at an ordinary suspension point, and for one
+    withheld across work that failed.
+    """
+    return getattr(exc, _DEFERRED_PAST_CANCEL_ATTR, False) is True
+
+
+def mark_cancellation_deferred(exc: BaseException) -> None:
+    """Record on ``exc`` that a storage commit completed despite it.
+
+    The stamp normally comes from an uninterruptible region WITHHOLDING a
+    pending cancellation (``_wait_deferring_cancellation``) or from the
+    operation-level view of one (``_bounded_submit_impl``). This is the third
+    author, for the case neither can see: a commit that STARTS after the
+    cancellation has already been delivered, from a ``finally`` unwinding on it.
+    No cancellation is pending there for those two to notice, yet the write is
+    just as durable, and a caller told otherwise retries a change that landed.
+
+    A no-op unless ``exc`` is a cancellation: nothing else carries this claim,
+    and stamping an arbitrary exception would put a durability promise on an
+    object no reader of the stamp expects to find one on.
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        setattr(exc, _DEFERRED_PAST_CANCEL_ATTR, True)
+
+
+async def _wait_deferring_cancellation(
+    future: "asyncio.Future",
+    pending_cancel: Optional[asyncio.CancelledError],
+) -> Optional[asyncio.CancelledError]:
+    """Await ``future`` to completion, deferring cancellation of the caller.
+
+    Loop + shield, not a single shield: a lone ``await asyncio.shield(...)``
+    returns immediately on RE-cancellation, so a second cancel would let the
+    caller escape while the work is still running. Same shape and same reason as
+    ``_KeyedLockContext.__aexit__`` in ``lightrag/kg/shared_storage.py``.
+
+    Returns the cancellation to re-raise once every step is done (the first one
+    seen, if any), STAMPED with :data:`_DEFERRED_PAST_CANCEL_ATTR` **when this
+    future completed successfully**, so the caller that re-raises it -- and
+    anything upstream that rewrites it into an error of its own -- can tell it
+    apart both from a cancellation delivered at an ordinary await and from one
+    withheld across work that FAILED. That distinction is not cosmetic: this
+    function's whole purpose is to let a write finish after the cancel was
+    requested, so the operation reporting failure may have committed; but a
+    write that raised committed nothing, and ``_bounded_submit_impl`` gives the
+    cancellation precedence over that failure, so without this the two are
+    indistinguishable downstream.
+
+    An incoming stamp is never cleared. The second call in
+    ``_bounded_submit_impl`` passes the same instance for the commit hook: the
+    write already succeeded and IS durable, so a failing hook must not retract
+    that -- and when the cancel arrived only during that failing hook, so that
+    no call here ever saw a successful future, ``_bounded_submit_impl`` stamps
+    it itself. This function judges the future it was given; only the caller
+    knows what the operation as a whole committed. Cancelling ``future`` ITSELF
+    still propagates immediately: it did not run to completion and we must not
+    pretend it did.
+    """
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError as exc:
+            if future.cancelled():
+                raise
+            pending_cancel = pending_cancel or exc
+        except BaseException:
+            # The awaited work failed. Do NOT let that exception out from here: a
+            # cancellation recorded on an earlier round has to take precedence,
+            # and deciding that is the caller's job. The exception stays on
+            # ``future`` for the caller to re-raise or log. Anything raised while
+            # the future is still pending came from elsewhere and propagates.
+            if not future.done():
+                raise
+            break
+    if pending_cancel is not None and _completed_successfully(future):
+        # Stamp the very instance the caller is about to re-raise. The exception
+        # object is the natural carrier: it is what travelled through the region,
+        # nothing between here and the caller replaces it (the admin flows catch
+        # ``Exception``, not ``BaseException``), and it needs neither a contextvar
+        # nor a shared counter to reach whoever ends up reporting the failure.
+        #
+        # Gated on success: see the docstring. Never cleared, so a stamp an
+        # earlier round put on this instance survives a later step that fails.
+        setattr(pending_cancel, _DEFERRED_PAST_CANCEL_ATTR, True)
+    return pending_cancel
+
+
+def _completed_successfully(future: "asyncio.Future") -> bool:
+    """Whether ``future`` finished with a result rather than an error.
+
+    Reads the future without raising: a cancelled or still-pending one is not a
+    success, and ``exception()`` would raise on the former.
+    """
+    if not future.done() or future.cancelled():
+        return False
+    return future.exception() is None
+
+
+async def _bounded_submit_impl(
     executor: ThreadPoolExecutor,
     semaphore: asyncio.Semaphore,
     fn: Callable[..., Any],
-    /,
-    *args: Any,
-    **kwargs: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    wait_for_completion: bool,
+    on_committed: Optional[Callable[[], Awaitable[Any]]] = None,
 ) -> Any:
-    """Run ``fn`` in ``executor`` under a permit owned by the executor future.
+    """Shared body of :func:`bounded_submit` and :func:`run_in_storage_io`.
 
-    Args:
-        executor: destination pool.
-        semaphore: submission ceiling for this pool, from :func:`get_loop_semaphore`.
-        fn: synchronous callable to run in the pool.
-        *args, **kwargs: forwarded to ``fn``.
+    Private, and takes ``args`` / ``kwargs`` as explicit containers rather than
+    ``*args, **kwargs``, so the control flag can never collide with an argument
+    meant for ``fn``. ``bounded_submit`` forwards its ``**kwargs`` verbatim, so
+    putting ``wait_for_completion`` on its own signature would either make it
+    positional-only (before the ``/``, where passing it by keyword would silently
+    forward it to ``fn`` instead of setting it) or steal a legitimate argument of
+    ``fn`` (after ``*args``).
 
-    Returns:
-        Whatever ``fn`` returns.
+    ``wait_for_completion`` selects what happens AFTER the work is submitted:
 
-    Cancelling the caller does not cancel the thread: the work runs to completion
-    and only then is the permit returned. That is deliberate — see the module
-    comment above.
+    * ``False`` — cancelling the caller returns immediately. The thread still
+      runs to completion and still owns the permit; the caller just stops
+      waiting for it.
+    * ``True`` — the caller refuses to return until the worker is done, because
+      the worker may be halfway through mutating state the caller's lock is
+      protecting (see :func:`run_in_storage_io`).
+
+    Either way the permit wait itself stays cancellable: nothing has been
+    submitted at that point, so a cancelled caller leaves no work in flight and
+    can release whatever lock it holds immediately.
+
+    ``on_committed`` (requires ``wait_for_completion``) is the bookkeeping that
+    must not be separated from a write that already landed — flipping other
+    processes' reload flags, retiring a redo log. It runs inside the SAME
+    uncancellable region as the write, and only when the write actually
+    succeeded:
+
+    * write succeeded → ``on_committed`` runs to completion, and only then is a
+      deferred cancellation re-raised;
+    * ``fn`` raised → ``on_committed`` does NOT run and the exception
+      propagates; the write did not land, so its bookkeeping must not either;
+    * cancelled while waiting for a permit → ``on_committed`` does NOT run,
+      because nothing was ever submitted. That is load-bearing, not tidiness:
+      Nano's bookkeeping retires the redo log, and running it without a write
+      would discard rows that were never persisted.
+    * ``on_committed`` raised → the write is already durable, so the failure is
+      re-raised as :class:`CommitBookkeepingError`, which says exactly that. The
+      hook's own exception must NOT reach the caller unwrapped: it is then
+      indistinguishable from a write that never landed, and every call site's
+      ``except Exception`` handles it by reasoning that only holds for that case.
     """
     await semaphore.acquire()
     try:
@@ -2683,7 +3112,101 @@ async def bounded_submit(
 
     async_future = asyncio.wrap_future(concurrent_future)
     async_future.add_done_callback(_consume_future_exception)
-    return await asyncio.shield(async_future)
+
+    if not wait_for_completion:
+        if on_committed is not None:
+            raise ValueError("on_committed requires wait_for_completion")
+        return await asyncio.shield(async_future)
+
+    pending_cancel = await _wait_deferring_cancellation(async_future, None)
+
+    write_exc = None if async_future.cancelled() else async_future.exception()
+
+    commit_exc: Optional[BaseException] = None
+    if write_exc is None and on_committed is not None:
+        # The write landed, so its bookkeeping is no longer optional: a cancel
+        # here would leave the file published with the other processes never told
+        # to reload it. Deferred through this step too — without the second wait
+        # the gap simply moves one layer down, onto whatever this awaits.
+        commit_future = asyncio.ensure_future(on_committed())
+        commit_future.add_done_callback(_consume_future_exception)
+        pending_cancel = await _wait_deferring_cancellation(
+            commit_future, pending_cancel
+        )
+        if not commit_future.cancelled():
+            commit_exc = commit_future.exception()
+
+    if pending_cancel is not None and _completed_successfully(async_future):
+        # The stamp describes the OPERATION's durability, not one future's
+        # outcome. ``_wait_deferring_cancellation`` can only see the future it
+        # was handed, so the case "the write landed, the cancel arrived during
+        # the commit hook, and the HOOK failed" would leave the cancellation
+        # unstamped -- and every reader of the stamp (the ceiling's message,
+        # ``NetworkXStorage.index_done_callback``) would then treat a durable
+        # write as one that never happened, which is what the stamp exists to
+        # prevent. The write succeeded here, so say so; the hook's failure is
+        # logged just below.
+        setattr(pending_cancel, _DEFERRED_PAST_CANCEL_ATTR, True)
+
+    if pending_cancel is not None:
+        # The caller gets CancelledError, so nobody will ever see these.
+        # ``_consume_future_exception`` already marked them retrieved (no
+        # "exception was never retrieved" noise at GC time); log them so the
+        # failure is not lost entirely.
+        for label, exc in (("Offloaded work", write_exc), ("Commit hook", commit_exc)):
+            if exc is not None:
+                logger.error(f"{label} failed while its caller was cancelled: {exc}")
+        raise pending_cancel
+    if commit_exc is not None:
+        if isinstance(commit_exc, Exception):
+            # Typed, because the two failures this function can report want
+            # opposite handling and used to look identical: ``fn`` raising means
+            # nothing was persisted, while reaching HERE means the write is on
+            # disk and only its publication failed. A caller that cannot tell
+            # them apart rolls back in-memory state the file already has, and
+            # reports a durable mutation as one that never happened.
+            raise CommitBookkeepingError(
+                f"The offloaded write landed, but its commit bookkeeping "
+                f"failed: {commit_exc}",
+                result=async_future.result(),
+            ) from commit_exc
+        # A BaseException that is not an Exception (SystemExit, KeyboardInterrupt)
+        # is interpreter-level control flow, not a bookkeeping failure, and
+        # wrapping it would demote a shutdown request into a storage error. A
+        # cancelled hook never arrives here — ``commit_future.cancelled()`` is
+        # tested above, and that case is the caller's cancellation path.
+        raise commit_exc
+    return async_future.result()
+
+
+async def bounded_submit(
+    executor: ThreadPoolExecutor,
+    semaphore: asyncio.Semaphore,
+    fn: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run ``fn`` in ``executor`` under a permit owned by the executor future.
+
+    Args:
+        executor: destination pool.
+        semaphore: submission ceiling for this pool, from :func:`get_loop_semaphore`.
+        fn: synchronous callable to run in the pool.
+        *args, **kwargs: forwarded to ``fn`` verbatim. This function declares no
+            keyword arguments of its own, so ``fn`` may use any parameter name.
+
+    Returns:
+        Whatever ``fn`` returns.
+
+    Cancelling the caller does not cancel the thread: the work runs to completion
+    and only then is the permit returned. That is deliberate — see the module
+    comment above. Callers that must not RETURN before the thread finishes use
+    :func:`run_in_storage_io` instead.
+    """
+    return await _bounded_submit_impl(
+        executor, semaphore, fn, args, kwargs, wait_for_completion=False
+    )
 
 
 # Semaphores are per event loop, executors are per process. ``asyncio.Semaphore``
@@ -2799,6 +3322,155 @@ async def run_in_chunking_executor(fn: Callable[..., Any], *args: Any, **kwargs)
     )
 
 
+# ---------------------------------------------------------------------------
+# File-backend persistence off the event loop
+# ---------------------------------------------------------------------------
+#
+# The file backends rewrite their whole file on every commit, synchronously, on
+# the event loop: ``write_json`` for the JSON KV / doc-status stores,
+# ``nx.write_graphml`` for NetworkX, ``NanoVectorDB.save`` for nano. A single
+# ``_insert_done`` flushes every storage, and a document purge issues several of
+# them, so on a large corpus the loop stops serving HTTP for seconds at a time —
+# the same failure mode as GHSA-26pm-px5v-8c4w, in a different place.
+#
+# One worker. Those commits are ALREADY serialized today: ``_flush_storages``
+# gathers them, but each synchronous write runs to completion without yielding,
+# so they happen one after another anyway. A single worker preserves that
+# concurrency exactly while freeing the loop. More workers would only make the
+# pure-Python encoders (``json.dump`` with ``indent``, GraphML's per-element
+# loop) contend for the GIL with each other AND with the loop — turning "the
+# loop is blocked for N seconds" into "the loop is starved for N seconds",
+# which is worse.
+#
+# Not the default executor: that one is shared with
+# ``UnifiedLock._acquire_mp_lock_in_executor``, password hashing and ``stat``
+# calls, and parking it behind a multi-second file write would delay work that
+# has to run promptly.
+#
+# Invariants for anything submitted here:
+#   * no nested submission to this pool — one worker plus a held permit
+#     deadlocks;
+#   * no calling back into the storage layer (``_get_client`` / ``_get_graph``):
+#     they take ``NamespaceLock``, which the caller already holds and which is
+#     not reentrant;
+#   * therefore the pool holds no locks, so it cannot take part in a cycle.
+
+_STORAGE_IO_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_STORAGE_IO_EXECUTOR_GUARD = threading.Lock()
+
+
+def get_storage_io_executor() -> ThreadPoolExecutor:
+    """The process-wide single-worker pool used for file-backend persistence."""
+    global _STORAGE_IO_EXECUTOR
+    if _STORAGE_IO_EXECUTOR is None:
+        with _STORAGE_IO_EXECUTOR_GUARD:
+            if _STORAGE_IO_EXECUTOR is None:
+                _STORAGE_IO_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="lightrag-storage-io"
+                )
+    return _STORAGE_IO_EXECUTOR
+
+
+async def run_in_storage_io(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run a synchronous storage-persistence callable off the event loop.
+
+    Uncancellable once submitted, unlike :func:`bounded_submit`. Callers hold
+    their storage lock across this call and the worker may be halfway through
+    mutating shared state — ``NanoVectorDBStorage`` points its client's
+    ``storage_file`` at the temporary sibling for the duration of the save.
+    Returning early would release the lock with that state still swapped, a
+    window the synchronous write being replaced here did not have, because it
+    could not be cancelled at all.
+
+    The wait for a submission permit stays cancellable: at that point nothing has
+    been submitted, so a cancelled caller leaves no half-written file behind and
+    releases its lock immediately.
+    """
+    from lightrag.constants import STORAGE_IO_SUBMIT_LIMIT
+
+    semaphore = get_loop_semaphore("storage_io", STORAGE_IO_SUBMIT_LIMIT)
+    return await _bounded_submit_impl(
+        get_storage_io_executor(),
+        semaphore,
+        fn,
+        args,
+        kwargs,
+        wait_for_completion=True,
+    )
+
+
+def log_without_raising(emit: Callable[[str], Any], message: str) -> None:
+    """Emit a log line that must never propagate a sink failure to its caller.
+
+    For code past a point of no return, where the caller's status no longer has
+    the right to change. The file backends' ``drop`` commit hooks are the
+    motivating case: once the file is gone the destruction happened, and a
+    broken handler, formatter or output target must not turn it into
+    ``{"status": "error"}`` — the exact misreport those hooks exist to prevent.
+    Their outer ``except`` needs it for the mirror reason: a sink failure there
+    must not swallow the ``"error"`` a real destructive failure has to report.
+
+    Pass the log method itself (``log_without_raising(logger.info, msg)``)
+    rather than wrapping the call in a lambda: an ``except X as e`` name is
+    unbound at the end of its block, so a closure over it reads as undefined to
+    static analysis even though it resolves at call time.
+
+    The failure is deliberately **swallowed, not re-reported**: any report would
+    travel the same broken sink. This is the narrow exception to *fail loud* —
+    it applies to logging alone, never to the work being logged about.
+    """
+    try:
+        emit(message)
+    except Exception:
+        pass
+
+
+async def commit_in_storage_io(
+    fn: Callable[[], Any],
+    on_committed: Callable[[], Awaitable[Any]],
+) -> Any:
+    """``run_in_storage_io`` for a write whose bookkeeping must not be orphaned.
+
+    Backends that publish a file and then tell the other processes to reload it
+    (``set_all_update_flags``) have two steps that must not come apart. A cancel
+    landing between them leaves the file published while every other worker keeps
+    reading the previous snapshot, until some later commit happens to fix it.
+
+    The synchronous writes this replaces had the same gap — with the loop frozen
+    for the whole write, cancellation could only be delivered at the first
+    suspension point after it, which in multiprocess mode is the lock acquire
+    inside ``set_all_update_flags``, before any flag is flipped. Freeing the
+    event loop makes the window far easier to hit, so it is closed here rather
+    than left to grow.
+
+    ``fn`` takes no arguments (wrap it in a lambda or ``partial``), which keeps
+    this signature clear of the keyword-forwarding hazard ``run_in_storage_io``
+    has to live with. ``on_committed`` runs ONLY if ``fn`` succeeded — see
+    ``_bounded_submit_impl`` for why running it otherwise would lose data.
+
+    Raises:
+        CommitBookkeepingError: ``fn`` succeeded and ``on_committed`` did not.
+            The write is DURABLE; only its publication failed. Every call site
+            must handle this separately from a write failure and report the
+            commit as landed — see the exception's own docstring for the
+            contract, and ``NetworkXStorage.index_done_callback`` for the
+            reference handler.
+        Exception: whatever ``fn`` raised. Nothing was persisted.
+    """
+    from lightrag.constants import STORAGE_IO_SUBMIT_LIMIT
+
+    semaphore = get_loop_semaphore("storage_io", STORAGE_IO_SUBMIT_LIMIT)
+    return await _bounded_submit_impl(
+        get_storage_io_executor(),
+        semaphore,
+        fn,
+        (),
+        {},
+        wait_for_completion=True,
+        on_committed=on_committed,
+    )
+
+
 class Tokenizer:
     """
     A wrapper around a tokenizer to provide a consistent interface for encoding and decoding.
@@ -2902,6 +3574,211 @@ class Tokenizer:
         """
         return self.tokenizer.decode(tokens)
 
+    # -----------------------------------------------------------------------
+    # Safe split/truncate contract
+    # -----------------------------------------------------------------------
+    #
+    # These default implementations rely ONLY on ``encode()`` — never on
+    # ``decode()`` — because ``decode(tokens[:k])`` is not guaranteed to be a
+    # character-exact prefix of the original string for an arbitrary
+    # third-party tokenizer (only tiktoken's ``decode_with_offsets`` gives a
+    # reliable token-to-character mapping; see ``TiktokenTokenizer`` below for
+    # the optimized override). Every candidate here is instead a literal
+    # character-offset slice of the input, so there is no alignment risk, at
+    # the cost of a handful of extra ``encode()`` calls per span compared to
+    # the tiktoken fast path.
+    #
+    # BPE token count is not monotonic in character-prefix length, so no
+    # candidate is ever trusted without encoding it. The search brackets the
+    # answer between a length verified to fit and one verified to overflow --
+    # reached by doubling or halving from the ratio estimate -- and then
+    # bisects that bracket. The bracket only ever narrows, which rules out
+    # oscillation, and both phases are logarithmic in the remaining character
+    # count, so the number of re-encodes stays bounded however wrong the
+    # initial char/token ratio estimate is for a given region of text.
+    #
+    # Bracketing is an assumption about the sampled lengths, not a proof about
+    # every length between them: the span returned is always verified to fit,
+    # but under a sufficiently non-monotonic tokenizer a longer one may exist
+    # that the bisection never sampled.
+    #
+    # No cross-call state: nothing here is written back onto ``self``. An
+    # injected tokenizer must remain safe under concurrent calls from
+    # multiple threads and under ``copy.deepcopy`` (see the class docstring),
+    # and any mutable "observed retreat" state would violate both.
+
+    def _bounded_prefix_span(
+        self, content: str, start: int, max_tokens: int, chars_per_token: float
+    ) -> TokenSpan:
+        """Find a safe ``TokenSpan`` starting at character offset ``start``.
+
+        ``chars_per_token`` is a rough estimate (chars per token, from a prior
+        whole-content encode) used only to pick a starting candidate length;
+        the result is always independently verified by encoding the exact
+        candidate substring.
+
+        That estimate is a whole-content average, so wherever token density
+        varies it is wrong in one of two directions at ``start``: a region
+        sparser than the average makes the seed too short, a denser one makes
+        it too long. Accepting the first candidate that happens to fit leaves
+        most of the budget unspent in the first case; stepping down from an
+        over-long seed by exponentially growing amounts overshoots the whole
+        remainder in the second, which is why that step-down had to clamp at
+        one character. Both are avoided by bracketing the answer between a
+        length verified to fit and one verified to overflow, then bisecting.
+        """
+        remaining_len = len(content) - start
+        seed = min(remaining_len, max(1, int(max_tokens * chars_per_token)))
+
+        # ``good`` is the longest length verified to fit, ``bad`` the shortest
+        # verified not to; ``bad`` starts one past the end as a sentinel for
+        # "nothing has overflowed yet".
+        good, good_count = 0, 0
+        bad = remaining_len + 1
+
+        count = len(self.encode(content[start : start + seed]))
+        if count <= max_tokens:
+            good, good_count = seed, count
+            if seed == remaining_len:
+                return TokenSpan(start, start + good, good_count)
+            candidate = seed
+            while True:  # double until a candidate overflows
+                candidate = min(remaining_len, candidate * 2)
+                probe_count = len(self.encode(content[start : start + candidate]))
+                if probe_count > max_tokens:
+                    bad = candidate
+                    break
+                good, good_count = candidate, probe_count
+                if candidate == remaining_len:
+                    return TokenSpan(start, start + good, good_count)
+        else:
+            bad = seed
+            candidate = seed
+            while candidate > 1:  # halve until a candidate fits
+                candidate //= 2
+                probe_count = len(self.encode(content[start : start + candidate]))
+                if probe_count <= max_tokens:
+                    good, good_count = candidate, probe_count
+                    break
+                bad = candidate
+
+        while bad - good > 1:  # bisect the bracket
+            midpoint = (good + bad) // 2
+            probe_count = len(self.encode(content[start : start + midpoint]))
+            if probe_count <= max_tokens:
+                good, good_count = midpoint, probe_count
+            else:
+                bad = midpoint
+
+        if good > 0:
+            return TokenSpan(start, start + good, good_count)
+
+        first_cp = content[start : start + 1]
+        first_cp_tokens = len(self.encode(first_cp))
+        if first_cp_tokens > max_tokens:
+            raise TokenBudgetError(
+                max_tokens, first_cp_tokens, content[start : start + 80]
+            )
+        return TokenSpan(start, start + 1, first_cp_tokens)
+
+    def truncate_by_token_limit(self, content: str, max_tokens: int) -> TokenSpan:
+        """Return a verified safe prefix of ``content`` that fits ``max_tokens``.
+
+        The result always starts at character offset 0. If the whole string
+        already fits, the returned span covers it entirely. Otherwise the
+        bracketed search aims to use the available budget efficiently, but a
+        non-monotonic tokenizer may have a longer fitting prefix that was not
+        sampled. Raises ``ValueError`` for a non-positive budget, and
+        ``TokenBudgetError`` if not even the first complete Unicode code point
+        fits.
+        """
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+        if not content:
+            return TokenSpan(0, 0, 0)
+
+        full_tokens = len(self.encode(content))
+        if full_tokens <= max_tokens:
+            return TokenSpan(0, len(content), full_tokens)
+
+        chars_per_token = len(content) / full_tokens
+        return self._bounded_prefix_span(content, 0, max_tokens, chars_per_token)
+
+    def split_by_token_limit(
+        self, content: str, max_tokens: int, overlap_tokens: int = 0
+    ) -> List[TokenSpan]:
+        """Split ``content`` into safe, contiguous, optionally-overlapping spans.
+
+        Covers the whole string with no gaps and real forward progress: every
+        non-final span strictly extends the covered range (see the module
+        contract notes above the class). ``overlap_tokens`` is a best-effort
+        target, not a guarantee of the mathematically closest boundary — BPE
+        token count is not monotonic in character length, so this generic
+        implementation only guarantees a safe, progress-making boundary near
+        the target, retreating the target itself (by the same exponential
+        steps) whenever the estimated overlap would fail to make progress.
+        """
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+        if overlap_tokens < 0:
+            raise ValueError(
+                f"overlap_tokens must be non-negative, got {overlap_tokens}"
+            )
+        if not content:
+            return []
+
+        total_tokens = len(self.encode(content))
+        if total_tokens <= max_tokens:
+            return [TokenSpan(0, len(content), total_tokens)]
+
+        # One global char/token ratio estimate, reused as a local performance
+        # hint for every window and overlap guess in this call only — never
+        # persisted on `self` (see the note above).
+        chars_per_token = len(content) / total_tokens
+
+        spans: List[TokenSpan] = []
+        covered_end = 0
+        total_len = len(content)
+
+        while covered_end < total_len:
+            if covered_end > 0:
+                # Clamp to what the previous window can actually lend before
+                # even trying: an overlap target that dwarfs the previous
+                # window's own token count would otherwise retreat from that
+                # huge starting point step by step, wasting retries on values
+                # that could never have worked.
+                target_overlap = min(overlap_tokens, max(0, spans[-1].token_count - 1))
+            else:
+                target_overlap = 0
+            step = 1
+            span: Optional[TokenSpan] = None
+            while True:
+                overlap_chars = (
+                    int(round(target_overlap * chars_per_token))
+                    if target_overlap > 0
+                    else 0
+                )
+                start = max(0, covered_end - overlap_chars)
+                try:
+                    candidate_span = self._bounded_prefix_span(
+                        content, start, max_tokens, chars_per_token
+                    )
+                except TokenBudgetError:
+                    if target_overlap == 0:
+                        raise
+                    candidate_span = None
+                if candidate_span is not None and (
+                    candidate_span.end > covered_end or target_overlap == 0
+                ):
+                    span = candidate_span
+                    break
+                target_overlap = max(0, target_overlap - step)
+                step *= 2
+            spans.append(span)
+            covered_end = span.end
+
+        return spans
+
 
 class TiktokenTokenizer(Tokenizer):
     """
@@ -2923,7 +3800,7 @@ class TiktokenTokenizer(Tokenizer):
             import tiktoken
         except ImportError:
             raise ImportError(
-                "tiktoken is not installed. Please install it with `pip install tiktoken` or define custom `tokenizer_func`."
+                "tiktoken is not installed. Please install it with `pip install tiktoken` or pass a custom `tokenizer`."
             )
 
         try:
@@ -2931,6 +3808,183 @@ class TiktokenTokenizer(Tokenizer):
             super().__init__(model_name=model_name, tokenizer=tokenizer)
         except KeyError:
             raise ValueError(f"Invalid model_name: {model_name}.")
+
+    # -----------------------------------------------------------------------
+    # Optimized split/truncate: decode_with_offsets fast path
+    # -----------------------------------------------------------------------
+    #
+    # `tiktoken.Encoding.decode_with_offsets` (available since the repo's
+    # declared `tiktoken>=0.7.0` floor) maps each token index to the character
+    # offset where it starts, so a candidate "keep the first k tokens" prefix
+    # can be located in O(1) instead of guessing a char/token ratio. The
+    # candidate substring is still always independently re-encoded via
+    # `self.encode` (never `self.tokenizer.encode` directly, to preserve the
+    # base class's disallowed_special=() fallback) before being trusted,
+    # because BPE re-tokenization of a truncated substring is not guaranteed
+    # to reproduce the same token count.
+    #
+    # Retreat here happens in TOKEN space (1, 2, 4, 8, ... tokens) rather than
+    # character space, which is both more precise and, since consecutive token
+    # counts can map to the same character offset when a multi-byte UTF-8
+    # character's bytes are split across tokens, deduplicated so the same
+    # substring is never re-encoded twice in a row.
+
+    def _prefix_span_via_boundary(
+        self,
+        content: str,
+        start_char: int,
+        start_token: int,
+        max_tokens: int,
+        total_tokens: int,
+        boundary: Callable[[int], int],
+    ) -> tuple[TokenSpan, int]:
+        """Find a safe span starting at ``start_char``/``start_token``.
+
+        ``boundary(k)`` returns the character offset where absolute token
+        index ``k`` starts (``boundary(total_tokens)`` is ``len(content)``).
+        Returns ``(span, end_token)`` — the absolute token index the span's
+        ``end`` corresponds to, so callers can resume from it without
+        re-deriving it via a char-offset search.
+        """
+        remaining_tokens = total_tokens - start_token
+        k = min(remaining_tokens, max_tokens)
+        step = 1
+        last_end: Optional[int] = None
+        while True:
+            end = boundary(start_token + k)
+            if end != last_end:
+                # A token boundary can coincide with start_char (a
+                # continuation-byte-only token reports no character advance —
+                # see decode_with_offsets' docstring); an empty candidate
+                # would trivially satisfy count <= max_tokens without
+                # covering anything, so it must never be accepted here.
+                if end > start_char:
+                    candidate = content[start_char:end]
+                    count = len(self.encode(candidate))
+                    if count <= max_tokens:
+                        return TokenSpan(start_char, end, count), start_token + k
+                last_end = end
+            if k <= 1:
+                break
+            k = max(1, k - step)
+            step *= 2
+
+        # Floor: fall back to a direct check of the first complete Unicode
+        # code point, bypassing token-boundary ambiguity entirely (a single
+        # code point's bytes can themselves be split across tokens).
+        end_char = start_char + 1
+        first_cp = content[start_char:end_char]
+        first_cp_tokens = len(self.encode(first_cp))
+        if first_cp_tokens > max_tokens:
+            raise TokenBudgetError(
+                max_tokens, first_cp_tokens, content[start_char : start_char + 80]
+            )
+        end_token = start_token
+        while end_token < total_tokens and boundary(end_token) < end_char:
+            end_token += 1
+        return TokenSpan(start_char, end_char, first_cp_tokens), end_token
+
+    def truncate_by_token_limit(self, content: str, max_tokens: int) -> TokenSpan:
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+        if not content:
+            return TokenSpan(0, 0, 0)
+
+        tokens = self.encode(content)
+        total_tokens = len(tokens)
+        if total_tokens <= max_tokens:
+            return TokenSpan(0, len(content), total_tokens)
+
+        try:
+            decoded_text, offsets = self.tokenizer.decode_with_offsets(tokens)
+        except Exception:
+            return super().truncate_by_token_limit(content, max_tokens)
+        if decoded_text != content:
+            # Lossy roundtrip (shouldn't normally happen once special tokens
+            # are handled via self.encode's fallback) — fall back to the
+            # generic, alignment-safe implementation rather than risk an
+            # off-by-however-many char offset.
+            return super().truncate_by_token_limit(content, max_tokens)
+
+        def boundary(k: int) -> int:
+            return offsets[k] if k < total_tokens else len(content)
+
+        span, _ = self._prefix_span_via_boundary(
+            content, 0, 0, max_tokens, total_tokens, boundary
+        )
+        return span
+
+    def split_by_token_limit(
+        self, content: str, max_tokens: int, overlap_tokens: int = 0
+    ) -> List[TokenSpan]:
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+        if overlap_tokens < 0:
+            raise ValueError(
+                f"overlap_tokens must be non-negative, got {overlap_tokens}"
+            )
+        if not content:
+            return []
+
+        tokens = self.encode(content)
+        total_tokens = len(tokens)
+        if total_tokens <= max_tokens:
+            return [TokenSpan(0, len(content), total_tokens)]
+
+        try:
+            decoded_text, offsets = self.tokenizer.decode_with_offsets(tokens)
+        except Exception:
+            return super().split_by_token_limit(content, max_tokens, overlap_tokens)
+        if decoded_text != content:
+            return super().split_by_token_limit(content, max_tokens, overlap_tokens)
+
+        def boundary(k: int) -> int:
+            return offsets[k] if k < total_tokens else len(content)
+
+        spans: List[TokenSpan] = []
+        covered_end_char = 0
+        covered_end_token = 0
+        total_len = len(content)
+
+        while covered_end_char < total_len:
+            if covered_end_token > 0:
+                # Clamp before trying: an overlap target that dwarfs the
+                # previous window's own token count would otherwise retreat
+                # from that huge starting point step by step, wasting
+                # retries on values that could never have worked.
+                target_overlap = min(overlap_tokens, max(0, spans[-1].token_count - 1))
+            else:
+                target_overlap = 0
+            step = 1
+            accepted: Optional[tuple[TokenSpan, int]] = None
+            while True:
+                start_token = max(0, covered_end_token - target_overlap)
+                start_char = boundary(start_token)
+                try:
+                    candidate = self._prefix_span_via_boundary(
+                        content,
+                        start_char,
+                        start_token,
+                        max_tokens,
+                        total_tokens,
+                        boundary,
+                    )
+                except TokenBudgetError:
+                    if target_overlap == 0:
+                        raise
+                    candidate = None
+                if candidate is not None and (
+                    candidate[0].end > covered_end_char or target_overlap == 0
+                ):
+                    accepted = candidate
+                    break
+                target_overlap = max(0, target_overlap - step)
+                step *= 2
+            span, covered_end_token = accepted
+            spans.append(span)
+            covered_end_char = span.end
+
+        return spans
 
 
 def pack_user_ass_to_openai_messages(*args: str):
@@ -3012,26 +4066,67 @@ def _count_tokens_sync(tokenizer: Tokenizer, content: str) -> int:
     return len(tokenizer.encode(content))
 
 
+def _rendered_prefix_item_count(
+    rendered: list[str], separator: str, safe_end: int
+) -> int:
+    """Largest ``k`` such that ``separator.join(rendered[:k])`` fits in ``safe_end`` chars."""
+    cumulative = 0
+    sep_len = len(separator)
+    for i, text in enumerate(rendered):
+        cumulative += (sep_len if i > 0 else 0) + len(text)
+        if cumulative > safe_end:
+            return i
+    return len(rendered)
+
+
 def truncate_list_by_token_size(
     list_data: list[Any],
     key: Callable[[Any], str],
+    separator: str,
     max_token_size: int,
     tokenizer: Tokenizer,
 ) -> list[Any]:
-    """Truncate a list of data by token size."""
-    if max_token_size <= 0:
+    """Truncate a list of data by token size, keeping only whole items.
+
+    Counts the real serialized text — every item's ``key(item)`` joined by
+    ``separator`` — so the separator's own tokens are part of the budget
+    (the previous per-item-only count silently missed them).
+    Never partially truncates an item: the result is always "keep the first
+    K complete items, drop the rest", never a half-rendered item.
+
+    ``key``/``separator`` must match exactly what the caller will actually
+    render downstream — a mismatch (e.g. truncating on a fuller dict than the
+    one that ends up serialized) reintroduces the same class of undercount.
+    """
+    if max_token_size <= 0 or not list_data:
         return []
-    tokens = 0
-    for i, data in enumerate(list_data):
-        tokens += len(tokenizer.encode(key(data)))
-        if tokens > max_token_size:
-            return list_data[:i]
-    return list_data
+
+    rendered = [key(data) for data in list_data]
+    full_text = separator.join(rendered)
+    try:
+        safe_span = tokenizer.truncate_by_token_limit(full_text, max_token_size)
+    except TokenBudgetError:
+        return []
+
+    k = _rendered_prefix_item_count(rendered, separator, safe_span.end)
+
+    # BPE token count is not monotonic in text length, so the safe prefix
+    # above is not proof that the first k items' OWN serialization (which is
+    # shorter, since it excludes whatever partial item/separator was cut off)
+    # is itself safe — independently re-verify and shrink k if needed.
+    while k > 0:
+        candidate_text = separator.join(rendered[:k])
+        if len(tokenizer.encode(candidate_text)) <= max_token_size:
+            break
+        k -= 1
+
+    return list_data[:k]
 
 
 async def atruncate_list_by_token_size(
     list_data: list[Any],
     key: Callable[[Any], str],
+    separator: str,
     max_token_size: int,
     tokenizer: Tokenizer,
 ) -> list[Any]:
@@ -3044,7 +4139,12 @@ async def atruncate_list_by_token_size(
     the largest single block of synchronous tokenizing on the query path.
     """
     return await run_in_tokenizer_executor(
-        truncate_list_by_token_size, list_data, key, max_token_size, tokenizer
+        truncate_list_by_token_size,
+        list_data,
+        key,
+        separator,
+        max_token_size,
+        tokenizer,
     )
 
 
@@ -3070,173 +4170,149 @@ def normalize_string_list(raw_values: Any, context: str = "") -> list[str]:
     return result
 
 
-def split_text_units_for_hard_fallback(text: str) -> list[str]:
-    """Split text into sentence/paragraph-like units for fallback chunking."""
-    if not text:
-        return []
-    units: list[str] = []
-    for para in text.split("\n\n"):
-        p = para.strip()
-        if not p:
-            continue
-        for sentence in re.split(r"(?<=[。！？；.!?])", p):
-            s = sentence.strip()
-            if s:
-                units.append(s)
-    return units if units else [text]
-
-
 def split_text_by_token_limit(
     text: str, tokenizer: Tokenizer, max_tokens: int
 ) -> list[str]:
-    """Split text by token limit with sentence-first, token-window fallback."""
-    if not text:
+    """Deprecated: use ``tokenizer.split_by_token_limit`` directly instead.
+
+    Thin compatibility wrapper around the safe ``TokenSpan``-based split
+    contract (zero overlap, no sentence-boundary preservation — overlap is
+    what now carries the "don't lose context at a cut" job the old
+    sentence-first packer used to do; see
+    ``enforce_chunk_token_limit_before_embedding`` for the overlap-bearing
+    caller). Stays permissive on a non-positive ``max_tokens`` (returns ``[]``
+    rather than raising) to match this function's pre-existing contract for
+    any remaining direct callers.
+    """
+    if not text or max_tokens <= 0:
         return []
-    # Match truncate_list_by_token_size: non-positive budget cannot form a window.
-    if max_tokens <= 0:
-        return []
+    spans = tokenizer.split_by_token_limit(text, max_tokens, overlap_tokens=0)
+    return [text[span.start : span.end] for span in spans]
 
-    try:
-        total_tokens = len(tokenizer.encode(text))
-    except Exception:
-        total_tokens = 0
 
-    if total_tokens > 0 and total_tokens <= max_tokens:
-        return [text]
+def _parent_to_source_projection(
+    source_content: str, parent_start: int, parent_end: int, parent_content: str
+) -> list[int] | None:
+    """Monotonic char-offset map from ``parent_content`` positions to ``source_content``.
 
-    units = split_text_units_for_hard_fallback(text)
-    out: list[str] = []
-    cur_parts: list[str] = []
-    cur_tokens = 0
+    Built once per parent chunk and reused for every hard-split child it
+    produces (an ``O(parent length)`` build shared across ``N`` children,
+    instead of redone per child). ``proj[i]`` for ``0 <= i <= len(parent_content)``
+    is the absolute ``source_content`` offset corresponding to position ``i``
+    in ``parent_content``.
 
-    for unit in units:
-        try:
-            unit_tokens = len(tokenizer.encode(unit))
-        except Exception:
-            unit_tokens = 0
+    Needed because a parent's own ``content`` is not always a byte-verbatim
+    slice of the document text it was extracted from — e.g. the V strategy's
+    ``SemanticChunker`` rejoins sentences with a single space, which can
+    differ from the original whitespace run by more or fewer characters.
+    Returns ``None`` if the two cannot be reconciled even after removing all
+    whitespace (content diverged for some other reason, e.g. a summarizing
+    rewrite) — the caller must not guess in that case.
+    """
+    source_slice = source_content[parent_start:parent_end]
+    if source_slice == parent_content:
+        return list(range(parent_start, parent_end + 1))
 
-        # Sentence itself is oversize: token-window split directly.
-        if unit_tokens > max_tokens:
-            if cur_parts:
-                out.append("\n\n".join(cur_parts))
-                cur_parts = []
-                cur_tokens = 0
+    src_non_ws_positions = [i for i, ch in enumerate(source_slice) if not ch.isspace()]
+    parent_non_ws_positions = [
+        i for i, ch in enumerate(parent_content) if not ch.isspace()
+    ]
+    if len(src_non_ws_positions) != len(parent_non_ws_positions) or [
+        source_slice[i] for i in src_non_ws_positions
+    ] != [parent_content[i] for i in parent_non_ws_positions]:
+        return None
 
-            token_ids = tokenizer.encode(unit)
-            for start in range(0, len(token_ids), max_tokens):
-                piece = tokenizer.decode(token_ids[start : start + max_tokens]).strip()
-                if piece:
-                    out.append(piece)
-            continue
+    proj: list[Optional[int]] = [None] * (len(parent_content) + 1)
+    for p_idx, s_idx in zip(parent_non_ws_positions, src_non_ws_positions):
+        proj[p_idx] = parent_start + s_idx
 
-        if cur_parts and cur_tokens + unit_tokens > max_tokens:
-            out.append("\n\n".join(cur_parts))
-            cur_parts = [unit]
-            cur_tokens = unit_tokens
+    # Whitespace runs (and the trailing end position) inherit the offset of
+    # the next known non-whitespace position, so every index resolves to a
+    # definite, still-monotonic offset.
+    next_val = parent_end
+    for i in range(len(proj) - 1, -1, -1):
+        if proj[i] is None:
+            proj[i] = next_val
         else:
-            cur_parts.append(unit)
-            cur_tokens += unit_tokens
-
-    if cur_parts:
-        out.append("\n\n".join(cur_parts))
-
-    return [x for x in out if x.strip()]
+            next_val = proj[i]
+    return proj  # type: ignore[return-value]
 
 
-def _normalized_child_offsets(
-    parent_content: str,
-    piece: str,
-    search_from: int,
-) -> tuple[int, int] | None:
-    """Locate ``piece`` in ``parent_content`` ignoring all whitespace.
+def _map_child_span(
+    local_start: int,
+    local_end: int,
+    parent_start: int,
+    parent_end: int,
+    projection: list[int] | None,
+) -> dict[str, int] | None:
+    """Map a child's ``[local_start, local_end)`` offset within the parent's own
+    ``content`` to an absolute ``{start, end}`` span into the document text.
 
-    Returns ``(start, end)`` char offsets into ``parent_content`` for the first
-    whitespace-stripped occurrence at/after ``search_from``, or ``None`` if absent.
-    Removing every whitespace char (not collapsing runs) keeps the match exact even
-    when the two sides space the same characters differently — the same monotonic
-    projection :mod:`lightrag.sidecar.backfill` uses.
+    ``projection`` is ``None`` for the direct-arithmetic fast path (parent
+    ``content`` is a verbatim slice of the document, so ``parent_start +``
+    is exact); otherwise it is the per-parent map from
+    :func:`_parent_to_source_projection`.
     """
-    norm_piece = "".join(piece.split())
-    if not norm_piece:
-        return None
-    norm_chars: list[str] = []
-    norm_to_orig: list[int] = []
-    for idx, ch in enumerate(parent_content):
-        if ch.isspace():
-            continue
-        norm_chars.append(ch)
-        norm_to_orig.append(idx)
-    norm_parent = "".join(norm_chars)
-    # First normalized index whose source offset is >= search_from (norm_to_orig is
-    # strictly increasing), so repeated pieces resolve forward in order.
-    norm_start = bisect.bisect_left(norm_to_orig, search_from)
-    pos = norm_parent.find(norm_piece, norm_start)
-    if pos < 0:
-        return None
-    o_start = norm_to_orig[pos]
-    o_end = norm_to_orig[pos + len(norm_piece) - 1] + 1
-    return o_start, o_end
-
-
-def _child_source_span(
-    parent_content: str,
-    parent_span: Any,
-    piece: str,
-    search_from: int,
-) -> tuple[dict[str, int] | None, int]:
-    """Locate a hard-split child ``piece`` inside its parent's source span.
-
-    Pieces are usually verbatim substrings of ``parent_content`` (token-window
-    slices), so an exact forward ``find`` resolves them precisely. But
-    :func:`split_text_by_token_limit` rejoins multiple sentence units with
-    ``"\\n\\n"``, so a multi-unit piece is *not* byte-verbatim when the source
-    separated those sentences with a single space/newline. In that case we fall
-    back to a whitespace-stripped match (the same projection sidecar backfill uses),
-    which stays exact because whitespace removal is monotonic. Without this fallback
-    the child would lose its span and sidecar backfill would wrongly FAIL the
-    document.
-
-    Returns ``(span | None, next_search_from)`` where ``next_search_from`` is a
-    ``parent_content`` offset threaded forward by the caller so repeated pieces
-    resolve in order.
-    """
-    if not isinstance(parent_span, dict):
-        return None, search_from
-    try:
-        parent_start = int(parent_span["start"])
-        parent_end = int(parent_span["end"])
-    except (KeyError, TypeError, ValueError):
-        return None, search_from
-    if parent_start < 0 or parent_end < parent_start:
-        return None, search_from
-
-    search_from = max(0, search_from)
-
-    # Exact: verbatim token-window pieces.
-    local_start = parent_content.find(piece, search_from)
-    if local_start >= 0:
-        local_end = local_start + len(piece)
+    if projection is None:
+        abs_start, abs_end = parent_start + local_start, parent_start + local_end
     else:
-        # Whitespace-normalized fallback: multi-unit pieces rejoined with "\n\n".
-        offsets = _normalized_child_offsets(parent_content, piece, search_from)
-        if offsets is None:
-            return None, search_from
-        local_start, local_end = offsets
-
-    if parent_start + local_end > parent_end:
-        return None, search_from
-    return (
-        {"start": parent_start + local_start, "end": parent_start + local_end},
-        local_end,
-    )
+        abs_start, abs_end = projection[local_start], projection[local_end]
+    if abs_start < parent_start or abs_end > parent_end or abs_end <= abs_start:
+        return None
+    return {"start": abs_start, "end": abs_end}
 
 
 def enforce_chunk_token_limit_before_embedding(
     chunking_result: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     tokenizer: Tokenizer,
     max_tokens: int,
+    overlap_tokens: int = 0,
+    source_content: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Hard fallback split before embedding while preserving heading hierarchy."""
+    """Hard fallback split before embedding while preserving heading hierarchy.
+
+    Splits any chunk still over ``max_tokens`` via the safe
+    ``Tokenizer.split_by_token_limit`` contract (see ``lightrag.utils.Tokenizer``),
+    carrying ``overlap_tokens`` of context between consecutive pieces. This no
+    longer preserves sentence/paragraph boundaries — overlap is what now
+    carries the "don't lose context at a cut" job that used to be the
+    sentence-first packer's.
+
+    ``source_content`` is the merged document text the chunker itself
+    received (the same string :mod:`lightrag.sidecar.backfill` reconstructs
+    from ``blocks.jsonl``) — needed to correctly relocate a hard-split
+    child's ``_source_span`` when a parent chunk's ``content`` is not a
+    byte-verbatim slice of it (see :func:`_parent_to_source_projection`).
+    Pass ``None`` only when the caller genuinely has no such text (e.g.
+    ``ainsert_custom_chunks``); a parent that would need the projection in
+    that case just loses its children's ``_source_span`` instead of raising,
+    matching this function's pre-existing behavior for callers with no
+    provenance concept at all. When ``source_content`` IS supplied but a
+    parent's content has diverged from it beyond whitespace, the projection
+    cannot be trusted at all, and this raises ``ChunkBlockMatchError`` rather
+    than silently emitting a wrong span — the same failure sidecar backfill
+    itself would eventually surface, just earlier and with better context.
+
+    Known limitation -- ``sidecar`` is not re-scoped for pre-sidecar chunks:
+    this function runs BEFORE :func:`lightrag.sidecar.backfill.backfill_chunk_sidecars`
+    in the pipeline (see ``pipeline.py``'s call order around the "Final hard
+    guard before embedding" comment). For the F/R/V strategies that is exactly
+    right: at this point they carry only ``_source_span`` (no ``sidecar`` yet),
+    this function recomputes a correctly-shrunk ``_source_span`` per child, and
+    backfill then derives each child's own ``sidecar`` from that shrunk span
+    afterward. But the P (paragraph_semantic) strategy attaches its ``sidecar``
+    field during chunking itself, upstream of this function, and does not
+    route through backfill at all. If a P chunk is large enough to still need
+    a hard split here, every resulting child is a shallow copy of the parent
+    (see the loop below) and so inherits the *exact same* ``sidecar`` value
+    unmodified -- all children end up pointing at the whole parent's block
+    range instead of each getting a sidecar scoped to its own, smaller slice.
+    ``_source_span`` itself never reaches storage either way (stripped in
+    ``build_chunks_dict_from_chunking_result``); this note is only about the
+    accuracy of the ``sidecar`` field that IS persisted to ``text_chunks``.
+    Follow-up if this needs fixing: shrink/re-derive ``sidecar`` per child for
+    the P case too, analogous to what backfill already does for F/R/V.
+    """
     if max_tokens <= 0:
         return list(chunking_result)
 
@@ -3250,47 +4326,97 @@ def enforce_chunk_token_limit_before_embedding(
         if not isinstance(content, str) or not content.strip():
             continue
 
-        try:
-            token_count = len(tokenizer.encode(content))
-        except Exception:
-            token_count = (
-                dp.get("tokens", 0) if isinstance(dp.get("tokens"), int) else 0
+        # A single call does both the "is this already within budget" check
+        # AND the split: split_by_token_limit's own fast path returns one
+        # span covering the whole content when it already fits, so there is
+        # no separate pre-check encode here to duplicate the full-content
+        # encode it does internally regardless. TokenBudgetError (content
+        # cannot be safely split at all — not even its first Unicode code
+        # point fits max_tokens) is intentionally NOT caught: swallowing it
+        # here would mean silently re-emitting the original, still-oversized
+        # chunk instead of failing the document — exactly the unsafe
+        # fallback this contract exists to remove.
+        spans = tokenizer.split_by_token_limit(
+            content, max_tokens, overlap_tokens=overlap_tokens
+        )
+
+        if len(spans) == 1:
+            ndp = dict(dp)
+            ndp["tokens"] = spans[0].token_count
+            normalized.append(ndp)
+            continue
+
+        if overlap_tokens > 0 and any(
+            spans[i].start >= spans[i - 1].end for i in range(1, len(spans))
+        ):
+            logger.warning(
+                "Requested embedding_chunk_overlap_token_size=%d could not be "
+                "honored for at least one window of chunk %r (retreated to 0 "
+                "to preserve forward progress)",
+                overlap_tokens,
+                dp.get("chunk_id", dp.get("chunk_order_index")),
             )
-
-        if token_count <= max_tokens:
-            ndp = dict(dp)
-            ndp["tokens"] = token_count if token_count > 0 else ndp.get("tokens", 0)
-            normalized.append(ndp)
-            continue
-
-        pieces = split_text_by_token_limit(content, tokenizer, max_tokens)
-        if not pieces:
-            ndp = dict(dp)
-            ndp["tokens"] = token_count
-            normalized.append(ndp)
-            continue
 
         base_chunk_id = dp.get("chunk_id")
         parent_span = dp.get("_source_span")
-        span_search_from = 0
-        total_parts = len(pieces)
-        for i, piece in enumerate(pieces, 1):
+
+        # Built once per parent, reused for every child below — never redone
+        # per child (that would be O(children x parent length) instead of
+        # O(parent length)).
+        projection: list[int] | None = None
+        parent_start = parent_end = None
+        if isinstance(parent_span, dict):
+            try:
+                parent_start = int(parent_span["start"])
+                parent_end = int(parent_span["end"])
+            except (KeyError, TypeError, ValueError):
+                parent_start = parent_end = None
+            if parent_start is not None and (
+                parent_start < 0 or parent_end < parent_start
+            ):
+                parent_start = parent_end = None
+
+            if parent_start is not None and parent_end - parent_start != len(content):
+                if source_content:
+                    projection = _parent_to_source_projection(
+                        source_content, parent_start, parent_end, content
+                    )
+                    if projection is None:
+                        raise ChunkBlockMatchError(
+                            chunk_order_index=int(dp.get("chunk_order_index", -1)),
+                            chunk_preview=content,
+                            blocks_path=None,
+                        )
+                else:
+                    # No provenance text available: children below fall back
+                    # to dropping _source_span rather than emit a naive,
+                    # possibly-wrong offset (parent_start is cleared so
+                    # _map_child_span is never reached with an untrustworthy
+                    # direct-arithmetic assumption).
+                    parent_start = parent_end = None
+
+        total_parts = len(spans)
+        for i, span in enumerate(spans, 1):
+            piece = content[span.start : span.end]
             new_dp = dict(dp)
             new_dp["content"] = piece
-            try:
-                new_dp["tokens"] = len(tokenizer.encode(piece))
-            except Exception:
-                new_dp["tokens"] = max(1, int(len(piece) * 0.5))
+            new_dp["tokens"] = span.token_count
 
             # Shallow-copy preserves the nested heading dict and sidecar
             # block from the source chunk; only the payload (content/tokens
-            # /chunk_id) is rewritten per split slice.
+            # /chunk_id) is rewritten per split slice. For a P-strategy
+            # parent that already carries a "sidecar" field, this means
+            # every child gets an unmodified copy of the PARENT's sidecar,
+            # not one re-scoped to its own smaller slice -- see the "Known
+            # limitation" paragraph in this function's docstring.
             if isinstance(base_chunk_id, str) and base_chunk_id.strip():
                 new_dp["chunk_id"] = f"{base_chunk_id}-s{i:02d}"
 
-            child_span, span_search_from = _child_source_span(
-                content, parent_span, piece, span_search_from
-            )
+            child_span = None
+            if parent_start is not None:
+                child_span = _map_child_span(
+                    span.start, span.end, parent_start, parent_end, projection
+                )
             if child_span is not None:
                 new_dp["_source_span"] = child_span
             elif "_source_span" in new_dp:
@@ -3313,8 +4439,8 @@ def cosine_similarity(v1, v2):
     norm1 = np.linalg.norm(v1)
     norm2 = np.linalg.norm(v2)
     denom = norm1 * norm2
-    # Zero vectors are orthogonal to everything in ranking use; avoid NaN.
-    if denom == 0:
+    # Zero or non-finite vectors are orthogonal to everything in ranking use; avoid NaN/Inf.
+    if denom == 0 or not np.isfinite(denom) or not np.isfinite(dot_product):
         return 0.0
     return float(dot_product / denom)
 
@@ -3463,7 +4589,7 @@ async def wait_tasks_with_drain(
     Concurrent multi-store writers (entity/relation merge, rebuild) must never
     leave a sibling task writing in the background after a failure — a failed
     ``gather``/``wait`` does not by itself imply the other write tasks stopped
-    (issue #3400, "incomplete async failure coordination").
+    ("incomplete async failure coordination").
 
     Behavior:
       - All tasks succeed: returns their results (completion order).
@@ -3676,13 +4802,76 @@ async def aexport_data(
                 relations_data.append(relation_row)
 
     # --- Relationships (from VectorDB) ---
-    all_relationships = await relationships_vdb.client_storage
-    for rel in all_relationships["data"]:
-        relationships_data.append(
-            {
-                "relationship_id": rel["__id__"],
-                "data": str(rel),  # Convert to string for compatibility
-            }
+    # ``client_storage`` is a debug/snapshot escape hatch, not part of the
+    # BaseVectorStorage contract: only NanoVectorDBStorage (async property)
+    # and FaissVectorDBStorage (sync property) implement it. Every other
+    # backend (Milvus, Qdrant, Postgres, Redis, MongoDB, OpenSearch) has no
+    # such attribute at all. This section is a supplementary raw-record
+    # dump; the entity/relation data above already carries the authoritative
+    # graph content, so skip it rather than fail the whole export on a
+    # backend that doesn't support it.
+    #
+    # Check the class, not the instance, for attribute presence:
+    # ``hasattr(relationships_vdb, ...)`` would call the getter to answer
+    # the question, and for NanoVectorDB's *async* property that getter
+    # returns a coroutine that ``hasattr`` immediately discards --
+    # "coroutine was never awaited" plus doing the (wasted) work twice.
+    # Attribute access on the class itself returns the property descriptor
+    # without invoking it.
+    if hasattr(type(relationships_vdb), "client_storage"):
+        # The two implementations disagree on sync vs. async (NanoVectorDB's
+        # is async, Faiss's is a plain sync property), so the value itself
+        # decides whether to await -- a fixed isinstance/backend-name check
+        # would silently break the moment either changes.
+        client_storage = relationships_vdb.client_storage
+        if inspect.isawaitable(client_storage):
+            # Freshness-aware shape (NanoVectorDBStorage): awaiting the
+            # property funnels through the backend's reload-if-stale path,
+            # so the snapshot picks up whatever another process committed.
+            client_storage = await client_storage
+        else:
+            # Synchronous shape (FaissVectorDBStorage), which is documented
+            # as deliberately NOT going through `_get_index`: in a reader
+            # process it can hand back a snapshot older than the latest
+            # committed one until some other call triggers a reload. That
+            # is fine in the single-process case a local file-backed store
+            # usually runs in, and this section is a supplementary raw dump
+            # -- the authoritative entity/relation content above comes from
+            # the graph storage -- so the export proceeds. But it must not
+            # pass silently: exports get used for backups, and a section
+            # that quietly omits recent records is worse than one whose
+            # limits are stated.
+            logger.warning(
+                f"{type(relationships_vdb).__name__}.client_storage is a "
+                "synchronous snapshot that does not check for a newer "
+                "on-disk commit; in a multi-process deployment the raw "
+                "VectorDB relationships section of this export may lag "
+                "records committed by another process."
+            )
+        for rel in client_storage["data"]:
+            # Faiss materializes the embedding INTO its metadata rows -- at
+            # flush time, and again by reconstruction when loading a
+            # persisted index -- so a raw `str(rel)` would carry the full
+            # vector even for the default vector-free export, inflating the
+            # file by orders of magnitude and emitting embeddings the caller
+            # asked to leave out. Faiss's own read paths filter the key for
+            # exactly this reason. NanoVectorDB is unaffected either way: it
+            # keeps vectors in a separate `matrix`, not in these rows.
+            #
+            # Build a new dict rather than popping: these rows are live
+            # references into the backend's own metadata store.
+            if not include_vector_data:
+                rel = {k: v for k, v in rel.items() if k != "__vector__"}
+            relationships_data.append(
+                {
+                    "relationship_id": rel["__id__"],
+                    "data": str(rel),  # Convert to string for compatibility
+                }
+            )
+    else:
+        logger.debug(
+            f"{type(relationships_vdb).__name__} does not expose client_storage; "
+            "skipping the raw VectorDB relationships dump in the export."
         )
 
     # Export based on format
@@ -3949,7 +5138,7 @@ async def update_chunk_cache_list(
     text_chunks_storage: "BaseKVStorage",
     cache_keys: list[str],
     cache_scenario: str = "batch_update",
-) -> None:
+) -> bool:
     """Update chunk's llm_cache_list with the given cache keys
 
     Args:
@@ -3957,33 +5146,55 @@ async def update_chunk_cache_list(
         text_chunks_storage: Text chunks storage instance
         cache_keys: List of cache keys to add to the list
         cache_scenario: Description of the cache scenario for logging
+
+    Returns:
+        True when the keys are recorded on the chunk row, were already there,
+        or there was nothing to record. False when they could not be recorded
+        -- the chunk row is missing, or the read/write failed. True means
+        RECORDED, not yet durable: on a deferred KV backend the upsert reaches
+        shared memory only, and the commit order is what makes the ordering
+        durable.
+
+        Never raises. A caller that must not create an unreachable cache row
+        checks this BEFORE writing the row -- see *LLM extraction cache
+        reachability* in the contract doc,
+        ``docs/design/PurgeRecoveryContract.md``.
     """
     if not cache_keys:
-        return
+        return True
 
     try:
         chunk_data = await text_chunks_storage.get_by_id(chunk_id)
-        if chunk_data:
-            # Ensure llm_cache_list exists
-            if "llm_cache_list" not in chunk_data:
-                chunk_data["llm_cache_list"] = []
+        if not chunk_data:
+            # Not a silent no-op: the caller may be about to write a cache row
+            # whose only reachable reference would have been this one.
+            logger.warning(
+                f"Cannot record cache references on missing chunk {chunk_id} ({cache_scenario})"
+            )
+            return False
 
-            # Add cache keys to the list if not already present
-            existing_keys = set(chunk_data["llm_cache_list"])
-            new_keys = [key for key in cache_keys if key not in existing_keys]
+        # Ensure llm_cache_list exists
+        if "llm_cache_list" not in chunk_data:
+            chunk_data["llm_cache_list"] = []
 
-            if new_keys:
-                chunk_data["llm_cache_list"].extend(new_keys)
+        # Add cache keys to the list if not already present
+        existing_keys = set(chunk_data["llm_cache_list"])
+        new_keys = [key for key in cache_keys if key not in existing_keys]
 
-                # Update the chunk in storage
-                await text_chunks_storage.upsert({chunk_id: chunk_data})
-                logger.debug(
-                    f"Updated chunk {chunk_id} with {len(new_keys)} cache keys ({cache_scenario})"
-                )
+        if new_keys:
+            chunk_data["llm_cache_list"].extend(new_keys)
+
+            # Update the chunk in storage
+            await text_chunks_storage.upsert({chunk_id: chunk_data})
+            logger.debug(
+                f"Updated chunk {chunk_id} with {len(new_keys)} cache keys ({cache_scenario})"
+            )
+        return True
     except Exception as e:
         logger.warning(
             f"Failed to update chunk {chunk_id} with cache references on {cache_scenario}: {e}"
         )
+        return False
 
 
 class TruncatedResponse(str):
@@ -4012,20 +5223,293 @@ def is_truncated_response(value: Any) -> bool:
     return isinstance(value, TruncatedResponse)
 
 
+def format_response_diagnostics(**fields: Any) -> str:
+    """Render provider response diagnostics as ``key=value`` pairs.
+
+    ``None`` becomes ``n/a`` so a field the provider did not report is visibly
+    absent rather than looking like a zero.
+    """
+    return ", ".join(
+        f"{key}={'n/a' if value is None else value}" for key, value in fields.items()
+    )
+
+
+def empty_length_truncated_hint(
+    budget_hint: str, *, reasoning_consumed_budget: bool = False
+) -> str:
+    """Explain an EMPTY response whose finish reason is the output token limit.
+
+    Shared by every binding so the four providers describe the same failure
+    identically. This is the structurally-broken case, not "ran a bit long":
+    generation stopped before producing a single content token, so there is
+    nothing to salvage and nothing to cache — the caller raises rather than
+    returning "" and letting the document be indexed as an empty graph.
+
+    ``budget_hint`` names the provider's own output-budget knob, since that is
+    the actionable part and only the binding knows it.
+    """
+    cause = "generation hit the token limit before emitting any content"
+    if reasoning_consumed_budget:
+        cause += " (budget consumed by reasoning)"
+    return f"{cause}; {budget_hint}"
+
+
+# doc_status.metadata key holding the per-document truncation summary.
+LLM_TRUNCATION_METADATA_KEY = "llm_truncation"
+
+# Cap on the number of affected subjects (chunk ids / entity names) echoed into
+# that metadata entry. The doc_status row is serialized into every documents
+# listing response, so the summary must stay O(1) in document size; the exact
+# per-chunk detail lives in the server log, which is unbounded by design.
+TRUNCATION_METADATA_SAMPLE_LIMIT = 10
+
+
+class TokenLimitTruncationTally:
+    """Accumulator for token-limit truncation events over one scope.
+
+    A document whose output budget is too small does not truncate once, it
+    truncates on EVERY chunk: publishing one ``pipeline_status`` line per event
+    would push the rest of the run out of the bounded ``history_messages`` ring
+    and still leave the operator counting lines. So each producer stage keeps a
+    tally, publishes its FIRST event immediately (the condition must not stay
+    hidden until a long run ends) plus ONE aggregated line when it finishes,
+    and folds its counts into the document-scoped tally the pipeline stamps
+    into ``doc_status.metadata`` — the durable, machine-readable record that
+    outlives the status ring and reaches the API.
+
+    Not thread-safe, and does not need to be: every mutation is a plain,
+    await-free update made from tasks on a single event loop.
+    """
+
+    __slots__ = ("_events", "_stages", "_subjects")
+
+    def __init__(self) -> None:
+        self._events = 0
+        self._stages: dict[str, int] = {}
+        # Ordered set: preserves first-seen order for the metadata sample while
+        # de-duplicating a subject that truncated at more than one stage.
+        self._subjects: dict[str, None] = {}
+
+    def __bool__(self) -> bool:
+        return self._events > 0
+
+    @property
+    def events(self) -> int:
+        """Total truncated responses, counting a subject once per stage."""
+        return self._events
+
+    @property
+    def affected(self) -> int:
+        """Distinct subjects (chunk ids / entity names) with >= 1 truncation."""
+        return len(self._subjects)
+
+    def record(self, stage: str, subject: str) -> bool:
+        """Record one truncated response; True when it is this tally's first."""
+        first = self._events == 0
+        self._events += 1
+        self._stages[stage] = self._stages.get(stage, 0) + 1
+        if subject:
+            self._subjects.setdefault(subject, None)
+        return first
+
+    def absorb(self, other: "TokenLimitTruncationTally | None") -> None:
+        """Fold a stage-scoped tally into this (document-scoped) one."""
+        if not other:
+            return
+        self._events += other._events
+        for stage, count in other._stages.items():
+            self._stages[stage] = self._stages.get(stage, 0) + count
+        for subject in other._subjects:
+            self._subjects.setdefault(subject, None)
+
+    def stage_breakdown(self) -> str:
+        """Human-readable per-stage counts, e.g. ``initial: 12, gleaning: 3``."""
+        return ", ".join(f"{stage}: {count}" for stage, count in self._stages.items())
+
+    def as_metadata(self) -> dict[str, Any] | None:
+        """Summary payload for ``doc_status.metadata``; None when nothing hit."""
+        if not self._events:
+            return None
+        subjects = list(self._subjects)
+        payload: dict[str, Any] = {
+            "events": self._events,
+            "affected": len(subjects),
+            "stages": dict(self._stages),
+            "samples": subjects[:TRUNCATION_METADATA_SAMPLE_LIMIT],
+        }
+        omitted = len(subjects) - TRUNCATION_METADATA_SAMPLE_LIMIT
+        if omitted > 0:
+            payload["samples_omitted"] = omitted
+        return payload
+
+    def as_metadata_extra(self) -> dict[str, Any]:
+        """``metadata_extra`` fragment for a doc_status transition upsert.
+
+        Empty on a clean run, so the key is simply absent rather than persisting
+        a zeroed record. Because ``LLM_TRUNCATION_METADATA_KEY`` is deliberately
+        NOT in ``_DOC_STATUS_METADATA_CARRY_OVER_KEYS``, that absence also
+        CLEARS a previous attempt's summary instead of resurrecting it — a
+        re-run with a larger token budget must not keep reporting the old
+        truncation.
+        """
+        payload = self.as_metadata()
+        return {LLM_TRUNCATION_METADATA_KEY: payload} if payload else {}
+
+
+def merge_truncation_metadata(
+    base: dict[str, Any] | None, extra: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Combine two persisted ``llm_truncation`` payloads into one.
+
+    Exists for paths that ADD to a surviving record instead of replacing it:
+    the custom-chunk patch (its truncations must not overwrite the base run's
+    record, nor a truncated base be blanked by a clean patch), the same
+    operation's resumed attempts (a failed attempt's partial graph writes stay,
+    so its record must survive a clean resume), and the analyze→process
+    hand-off. The pipeline's whole-document reprocess never needs this —
+    there replace-or-clear is the correct semantics.
+
+    Merging live tallies would be exact, but only the persisted payloads
+    survive (the base run's tally object is long gone), and those are lossy:
+    ``samples`` is capped at :data:`TRUNCATION_METADATA_SAMPLE_LIMIT`, so
+    subjects beyond the cap cannot be de-duplicated. ``events`` and ``stages``
+    are exact sums regardless. ``affected`` is exact whenever both sample
+    lists are complete (no ``samples_omitted``); otherwise it deduplicates
+    what the samples do show and over-counts a subject that truncated on both
+    sides but is visible in neither. Base-vs-patch merges rarely collide
+    (different chunk id schemes; only repeat ``summary`` subjects overlap),
+    but attempt-over-attempt merges re-run the SAME chunk ids, so collision is
+    the normal case there — still exact up to the sample cap, over-counted
+    past it.
+    """
+    if not base:
+        return dict(extra) if extra else None
+    if not extra:
+        return dict(base)
+
+    base_samples = [s for s in (base.get("samples") or []) if isinstance(s, str)]
+    extra_samples = [s for s in (extra.get("samples") or []) if isinstance(s, str)]
+    # Ordered union, base first — mirrors the tally's first-seen ordering.
+    union_samples = list(dict.fromkeys(base_samples + extra_samples))
+
+    both_complete = not base.get("samples_omitted") and not extra.get("samples_omitted")
+    if both_complete:
+        affected = len(union_samples)
+    else:
+        overlap = len(set(base_samples) & set(extra_samples))
+        affected = int(base.get("affected") or 0) + int(extra.get("affected") or 0)
+        affected -= overlap
+
+    stages: dict[str, int] = dict(base.get("stages") or {})
+    for stage, count in (extra.get("stages") or {}).items():
+        stages[stage] = stages.get(stage, 0) + int(count)
+
+    merged: dict[str, Any] = {
+        "events": int(base.get("events") or 0) + int(extra.get("events") or 0),
+        "affected": affected,
+        "stages": stages,
+        "samples": union_samples[:TRUNCATION_METADATA_SAMPLE_LIMIT],
+    }
+    omitted = affected - len(merged["samples"])
+    if omitted > 0:
+        merged["samples_omitted"] = omitted
+    return merged
+
+
 def remove_think_tags(text: str) -> str:
     """Remove <think>...</think> tags and their content from the text.
+
+    Preserves the :class:`TruncatedResponse` marker so downstream consumers
+    can still distinguish partial model output after sanitization.
 
     Handles two cases:
     1. Complete <think>...</think> blocks anywhere in the text.
     2. Orphaned </think> at the very start (e.g., from streaming that begins
        mid-think-block), removing everything before and including it.
     """
+    was_truncated = is_truncated_response(text)
+
     # First, remove orphaned </think> prefix (content before first </think>
     # when there is no preceding <think> tag)
     text = re.sub(r"^((?!<think>).)*?</think>", "", text, flags=re.DOTALL)
     # Then remove all complete <think>...</think> blocks
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    return text.strip()
+    cleaned = text.strip()
+    return TruncatedResponse(cleaned) if was_truncated else cleaned
+
+
+def _reject_empty_truncated_response(
+    cleaned: str, *, raw_len: int, cache_type: str, chunk_id: str | None
+) -> None:
+    """Fail a truncated response that think-tag removal left with nothing.
+
+    The provider bindings each escalate their own empty + token-limit response,
+    but they cannot see this one: ``<think>reasoning</think>`` with no answer
+    after it is a NON-empty payload, so it passes every binding's check and
+    only becomes visibly empty here. This function is the shared throat that
+    every KG-building LLM call passes through, so the rule lands once for all
+    four providers.
+
+    Parse-stage callers (``cache_type="smartheading"``) already treat an empty
+    answer as an error — ``_parse_llm_json`` raises ``TitleBlockLLMError`` on
+    it — so this only replaces "answer carries no JSON object" with the actual
+    cause and its remedy.
+    """
+    if not is_truncated_response(cleaned) or cleaned.strip():
+        return
+    diagnostics = format_response_diagnostics(
+        chunk_id=chunk_id,
+        # Everything the model produced was reasoning, by construction: the
+        # payload was non-empty before think-tag removal and empty after.
+        reasoning_content_len=raw_len,
+    )
+    hint = empty_length_truncated_hint(
+        "consider raising the LLM's output token limit or disabling thinking "
+        "mode for this role",
+        reasoning_consumed_budget=True,
+    )
+    message = (
+        f"Received empty {cache_type} content after think-tag removal "
+        f"({diagnostics}): {hint}"
+    )
+    logger.error(message)
+    raise EmptyTruncatedResponseError(message)
+
+
+def get_extract_cache_fence(text_chunks_storage) -> asyncio.Lock:
+    """Mutual exclusion between an extract cache attach+write and its commit.
+
+    Hold it around the ``update_chunk_cache_list`` / ``save_to_cache`` pair, and
+    around the chained ``text_chunks`` -> ``llm_response_cache`` commit in
+    ``LightRAG._flush_storages``. Without it the commit pair can straddle a
+    writer's pair on a backend that publishes a snapshot taken at commit time,
+    so the cache snapshot carries a row whose reference postdates the chunk
+    snapshot.
+
+    A plain ``asyncio.Lock``, NOT a cross-process one, and that is load-bearing:
+    extract cache rows are written only by the ingestion pipeline, which runs in
+    exactly one process per workspace (the ``busy`` reservation in *Pipeline
+    concurrency contract*, ``docs/design/PipelineConcurrencyContract.md``).
+    Other processes write only query-cache rows, which name no owning chunk and
+    need no reference. Relaxing that exclusivity silently un-fences this.
+
+    Lives on the storage instance rather than in a module registry so its
+    lifetime is the storage's, and so both sides reach the same object without
+    agreeing on a key. Created lazily with no await in between, so two
+    coroutines cannot build two locks.
+
+    That placement carries a second precondition, alongside the one above:
+    **one ``LightRAG`` instance per workspace per process.** Two instances on
+    one workspace hold two storage objects over the same shared data, so they
+    would build two locks and fence nothing. Constructing them is neither
+    supported nor necessary — see *Writers are fenced out of the commit pair*
+    in ``docs/design/PurgeRecoveryContract.md``.
+    """
+    fence = getattr(text_chunks_storage, "_extract_cache_fence", None)
+    if fence is None:
+        fence = asyncio.Lock()
+        text_chunks_storage._extract_cache_fence = fence
+    return fence
 
 
 async def use_llm_func_with_cache(
@@ -4041,6 +5525,8 @@ async def use_llm_func_with_cache(
     response_format: Any | None = None,
     entity_extraction: bool = False,
     llm_cache_identity: Any | None = None,
+    text_chunks_storage: "BaseKVStorage | None" = None,
+    on_cache_skipped: Callable[[str], None] | None = None,
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
 
@@ -4050,14 +5536,14 @@ async def use_llm_func_with_cache(
     This function applies text sanitization to prevent UTF-8 encoding errors for all LLM providers.
 
     Args:
-        input_text: Input text to send to LLM
+        user_prompt: Input text to send to LLM
         use_llm_func: LLM function with higher priority
         llm_response_cache: Cache storage instance
         max_tokens: Maximum tokens for generation
         history_messages: History messages list
         cache_type: Type of cache
         chunk_id: Chunk identifier to store in cache
-        text_chunks_storage: Text chunks storage to update llm_cache_list
+        system_prompt: Optional system prompt sent alongside the user prompt
         cache_keys_collector: Optional list to collect cache keys for batch processing
         response_format: Structured output control forwarded to the LLM provider.
             Providers translate this to their native structured-output surface
@@ -4071,6 +5557,22 @@ async def use_llm_func_with_cache(
             ``response_format`` directly.
         llm_cache_identity: Non-secret model/provider identity used to partition
             cache entries across role model, binding, or host changes.
+        text_chunks_storage: Storage holding the owning chunk. When given
+            together with ``chunk_id``, the cache key is attached to that chunk
+            BEFORE the cache row is written, so the row is never ordered ahead
+            of the only reference that reaches it, and the write is skipped
+            when the reference cannot be recorded -- see *LLM extraction cache
+            reachability* in the contract doc,
+            ``docs/design/PurgeRecoveryContract.md``. Omit it -- as the parse
+            stage and the summary path do, having no owning chunk -- to keep the
+            legacy order and the ``cache_keys_collector`` batch instead.
+        on_cache_skipped: Called with ``cache_type`` when the cache write was
+            skipped because the reference could not be recorded, i.e. caching is
+            effectively off for this call. Lets the caller surface that to the
+            operator instead of leaving it in the server log. Must be
+            synchronous and must not raise: the extraction path publishes its
+            summary from an await-free ``finally`` that also runs during a
+            cancellation unwind.
 
     Returns:
         tuple[str, int]: (LLM response text, timestamp)
@@ -4127,6 +5629,22 @@ async def use_llm_func_with_cache(
         # Generate cache key for this LLM call
         cache_key = generate_cache_key("default", cache_type, arg_hash)
 
+        async def _record_reference(scenario: str) -> bool:
+            """Record this chunk's reference to ``cache_key``.
+
+            Returns True when the caller may write the row: either the
+            reference is recorded, or the caller opted out of the invariant by
+            not naming an owning chunk (parse stage, summaries).
+            """
+            if chunk_id is None or text_chunks_storage is None:
+                return True
+            return await update_chunk_cache_list(
+                chunk_id,
+                text_chunks_storage,
+                [cache_key],
+                scenario,
+            )
+
         cached_result = await handle_cache(
             llm_response_cache,
             arg_hash,
@@ -4138,6 +5656,13 @@ async def use_llm_func_with_cache(
             content, timestamp = cached_result
             logger.debug(f"Found cache for {arg_hash}")
             statistic_data["llm_cache"] += 1
+
+            # Re-attach on a hit. The row predates this call, so ordering is
+            # moot here; this is the reprocess self-heal that re-points a
+            # rewritten chunk row at rows the purge orphaned. A failure is
+            # logged, not fatal: it fails to repair an orphan rather than
+            # creating one.
+            await _record_reference(f"{cache_type}_cache_hit")
 
             # Add cache key to collector if provided
             if cache_keys_collector is not None:
@@ -4159,24 +5684,53 @@ async def use_llm_func_with_cache(
             safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
         )
 
-        # Capture the token-limit truncation flag before remove_think_tags
-        # rebuilds a plain str and drops the TruncatedResponse marker.
-        res_truncated = is_truncated_response(res)
-
+        # ``remove_think_tags`` re-wraps its result, so the marker survives
+        # sanitization and both this cache guard and the caller (which reports
+        # the truncation to pipeline status) read the same flag off ``res``.
+        raw_len = len(res)
         res = remove_think_tags(res)
+        _reject_empty_truncated_response(
+            res, raw_len=raw_len, cache_type=cache_type, chunk_id=chunk_id
+        )
+        res_truncated = is_truncated_response(res)
 
         # Generate timestamp for cache miss (LLM call completion time)
         current_timestamp = int(time.time())
 
-        if llm_response_cache.global_config.get("enable_llm_cache_for_entity_extract"):
+        # An extract cache row is reachable only through the owning chunk's
+        # llm_cache_list, so the reference is recorded BEFORE the row is
+        # written: attaching first can lose the reference, which every reader
+        # tolerates, while writing first lost the row itself. On a deferred KV
+        # backend this only orders the two writes in memory -- the commit order
+        # that makes it durable is the failure epilogue's, not this function's.
+        # The residues, both layers and what this ordering does not close are in
+        # *LLM extraction cache reachability* in the contract doc.
+        async def _attach_then_write() -> None:
             if res_truncated:
                 # Do not persist truncated extraction output: a cached partial
                 # payload would be replayed on every later run, even when a
                 # larger token budget would have completed the extraction.
+                # Nothing is attached either, so no reference is left dangling.
                 logger.warning(
                     f"Skipping LLM cache write for truncated {cache_type} response "
                     f"(finish_reason=length, chunk_id={chunk_id})"
                 )
+            # Attach BEFORE the write, never after -- the ordering rule above.
+            # ``save_to_cache`` is a no-op on falsy content, so attaching for an
+            # empty response would leave a reference to a row that is never
+            # written. Its other two no-ops cannot happen here: hashing_kv is
+            # non-None inside this branch, and a streaming response would
+            # already have failed the ``len(res)`` above.
+            elif res and not await _record_reference(f"{cache_type}_cache_write"):
+                logger.warning(
+                    f"Skipping LLM cache write for {cache_type} response: could not "
+                    f"record its reference on chunk {chunk_id}. The result is "
+                    "returned; it will be recomputed on the next run."
+                )
+                # Caching is effectively off for this call. Hand that to the
+                # caller so it reaches the operator, not just the server log.
+                if on_cache_skipped is not None:
+                    on_cache_skipped(cache_type)
             else:
                 await save_to_cache(
                     llm_response_cache,
@@ -4192,6 +5746,17 @@ async def use_llm_func_with_cache(
                 # Add cache key to collector if provided
                 if cache_keys_collector is not None:
                     cache_keys_collector.append(cache_key)
+
+        if llm_response_cache.global_config.get("enable_llm_cache_for_entity_extract"):
+            if chunk_id is not None and text_chunks_storage is not None:
+                # Fence the pair against the commit that publishes both
+                # namespaces; see ``get_extract_cache_fence``. Callers that
+                # name no owning chunk need no reference, so they need no
+                # fence either.
+                async with get_extract_cache_fence(text_chunks_storage):
+                    await _attach_then_write()
+            else:
+                await _attach_then_write()
 
         return res, current_timestamp
 
@@ -4216,7 +5781,12 @@ async def use_llm_func_with_cache(
 
     # Generate timestamp for non-cached LLM call
     current_timestamp = int(time.time())
-    return remove_think_tags(res), current_timestamp
+    raw_len = len(res)
+    cleaned = remove_think_tags(res)
+    _reject_empty_truncated_response(
+        cleaned, raw_len=raw_len, cache_type=cache_type, chunk_id=chunk_id
+    )
+    return cleaned, current_timestamp
 
 
 def get_content_summary(content: str, max_length: int = 250) -> str:
@@ -4238,13 +5808,18 @@ def get_content_summary(content: str, max_length: int = 250) -> str:
 def sanitize_and_normalize_extracted_text(
     input_text: str, remove_inner_quotes=False
 ) -> str:
-    """Santitize and normalize extracted text
+    """Sanitize and normalize extracted text
+
     Args:
         input_text: text string to be processed
-        is_name: whether the input text is a entity or relation name
+        remove_inner_quotes: whether to remove Chinese quotation marks and
+            English quotation marks adjacent to Chinese characters, and to
+            normalize non-breaking spaces. Matching outer quotation marks are
+            removed independently of this option only when the enclosed text
+            contains no corresponding quote characters.
 
     Returns:
-        Santitized and normalized text string
+        Sanitized and normalized text string
     """
     safe_input_text = sanitize_text_for_encoding(input_text)
     if safe_input_text:
@@ -4253,6 +5828,11 @@ def sanitize_and_normalize_extracted_text(
         )
         return normalized_text
     return ""
+
+
+def normalize_entity_name(input_text: str) -> str:
+    """Normalize an entity identifier using the extraction naming contract."""
+    return sanitize_and_normalize_extracted_text(input_text, remove_inner_quotes=True)
 
 
 def normalize_extracted_info(name: str, remove_inner_quotes=False) -> str:
@@ -4264,19 +5844,21 @@ def normalize_extracted_info(name: str, remove_inner_quotes=False) -> str:
     - Preserve spaces within English text and numbers
     - Replace Chinese parentheses with English parentheses
     - Replace Chinese dash with English dash
-    - Remove English quotation marks from the beginning and end of the text
-    - Remove English quotation marks in and around chinese
-    - Remove Chinese quotation marks
+    - Remove a matching outer English/Chinese quote or book title mark pair only
+      when the enclosed text contains no corresponding mark characters
     - Filter out short numeric-only text (length < 3 and only digits/dots)
     - remove_inner_quotes = True
-        remove Chinese quotes
-        remove English quotes in and around chinese
-        Convert non-breaking spaces to regular spaces
-        Convert narrow non-breaking spaces after non-digits to regular spaces
+        - Remove Chinese quotation marks
+        - Remove English quotation marks adjacent to Chinese characters
+        - Convert non-breaking spaces to regular spaces
+        - Convert narrow non-breaking spaces after non-digits to regular spaces
 
     Args:
         name: Entity name to normalize
-        is_entity: Whether this is an entity name (affects quote handling)
+        remove_inner_quotes: whether to apply the optional quote and
+            non-breaking-space rules above. Matching outer quotation marks are
+            removed independently of this option only when the enclosed text
+            contains no corresponding quote characters.
 
     Returns:
         Normalized entity name
@@ -4388,7 +5970,9 @@ def normalize_extracted_info(name: str, remove_inner_quotes=False) -> str:
     return name
 
 
-def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
+def sanitize_text_for_encoding(
+    text: str, replacement_char: str = "", *, strip: bool = True
+) -> str:
     """Sanitize text to ensure safe UTF-8 encoding by removing or replacing problematic characters.
 
     This function handles:
@@ -4397,11 +5981,19 @@ def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
     - Control characters that might cause issues
     - Unescape HTML escapes
     - Remove control characters
-    - Whitespace trimming
+    - Whitespace trimming (see ``strip``)
 
     Args:
         text: Input text to sanitize
         replacement_char: Character to use for replacing invalid sequences
+        strip: Trim leading/trailing whitespace. Default ``True``, which is
+            what every caller sanitizing a whole payload wants. Pass ``False``
+            when the text is a FRAGMENT that will sit inside a larger
+            sanitized string: its boundary whitespace is interior to that
+            string and survives there, so trimming the fragment in isolation
+            would produce something the consumer of the larger string never
+            saw. ``kg_extraction_validator`` is the case in point — the chunk
+            sits inside a fenced ``---Input Text---`` section of the prompt.
 
     Returns:
         Sanitized text that can be safely encoded as UTF-8
@@ -4410,7 +6002,8 @@ def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
         return text
 
     # First, strip whitespace
-    text = text.strip()
+    if strip:
+        text = text.strip()
 
     # Early return if text is empty after basic cleaning
     if not text:
@@ -4426,7 +6019,7 @@ def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
     # 3. Remove control characters but preserve common whitespace (\t, \n, \r)
     text = _CONTROL_CHAR_PATTERN_ALL.sub(replacement_char, text)
 
-    return text.strip()
+    return text.strip() if strip else text
 
 
 def strip_control_characters(text: str, replacement_char: str = "") -> str:
@@ -4456,19 +6049,309 @@ def strip_control_characters(text: str, replacement_char: str = "") -> str:
 # destroyed. Form feed (\x0c) and backspace (\x08) followed by a letter have
 # no legitimate use in LLM-generated prose, so restoring the backslash is
 # unconditionally safe. The other three decodable escapes (\t, \n, \r) map to
-# legitimate whitespace and cannot be restored without guessing; they are only
-# *detected* (see _WS_LATEX_SUSPECT_PATTERN) so real-world frequency can be
-# observed before deciding on heuristic restoration.
+# legitimate whitespace and cannot be restored globally without guessing. They
+# are repaired only inside paired dollar-math spans and merely detected
+# elsewhere (see _WS_LATEX_SUSPECT_PATTERN).
 _FORMFEED_LATEX_PATTERN = re.compile(r"\x0c(?=[A-Za-z])")
 _BACKSPACE_LATEX_PATTERN = re.compile(r"\x08(?=[A-Za-z])")
-# Whitespace + residue spelling that completes a common LaTeX command whose
-# remainder collides with no English word ("eq"/"o"/"exists" are deliberately
-# absent: "eq." abbreviations, the word "o"/"exists" would false-positive).
-_WS_LATEX_SUSPECT_PATTERN = re.compile(
-    r"\t(?=(?:au|heta|imes|ext|ilde|herefore|riangle)\b)"
-    r"|\r(?=(?:ho|ight|angle|ceil)\b)"
-    r"|\n(?=(?:abla|otin)\b)"
+# Whitespace + residue spelling that completes a common LaTeX command. Two
+# variants of one whitelist: _WS_LATEX_SUSPECT_PATTERN (a word boundary OR a
+# following non-ASCII character) only warns, about prose;
+# _WS_LATEX_MATH_PATTERN ((?![A-Za-z])) is the one that rewrites, and only
+# inside a confirmed math span. Never swap their guards -- see *Residue
+# whitelist and its two boundaries* in the contract doc,
+# docs/design/LatexEscapeRepairContract.md.
+# ``__END__`` is substituted with the trailing guard; a plain placeholder
+# rather than ``str.format`` so that adding a ``{n}`` quantifier to the
+# residue alternation below cannot break the substitution.
+_WS_LATEX_RESIDUES = (
+    r"\t(?=(?:au|heta|imes|ext|ilde|herefore|riangle)__END__)"
+    r"|\r(?=(?:ho|ight|angle|ceil)__END__)"
+    r"|\n(?=(?:abla|otin)__END__)"
 )
+# A bare ``\b`` reports nothing when a word character follows, and Python's
+# ``re`` counts a CJK ideograph as a word character -- so a damaged command
+# sitting in Chinese prose with no dollar math around it was neither repaired
+# nor warned about. Hence the second alternative: a Latin fragment pressed
+# against a non-ASCII character with no space between them is essentially only
+# produced by this damage. ASCII word characters stay excluded -- in
+# tab-separated data ``col<tab>ext_id`` and ``<tab>au2`` are plausible values,
+# and the log noise is not worth them.
+_WS_LATEX_SUSPECT_PATTERN = re.compile(
+    _WS_LATEX_RESIDUES.replace("__END__", r"(?:\b|(?=[^\x00-\x7F]))")
+)
+_WS_LATEX_MATH_PATTERN = re.compile(
+    _WS_LATEX_RESIDUES.replace("__END__", r"(?![A-Za-z])")
+)
+
+
+# Markdown regions whose content is verbatim: a fenced block (closed, or
+# running to the end of the text when the model never closed it) and a closed
+# inline code span. An unclosed single backtick matches nothing, so it cannot
+# suppress repairs in the rest of the text -- the same reading CommonMark
+# gives it.
+#
+# Fences and inline spans are matched in SEPARATE passes, fences first, because
+# CommonMark settles block structure before it looks for inline spans: an
+# inline span can never cross a fence boundary. One alternation cannot express
+# that -- the inline branch wins by POSITION, not by branch order, so a stray
+# backtick anywhere earlier in the text pairs with one inside the block, eats
+# the opening fence, and leaves the rest of the code exposed to the scanner.
+_MD_FENCE_REGION_PATTERN = re.compile(
+    # One branch per fence character because their info strings differ: a
+    # backtick fence may not carry a backtick in its info string (CommonMark,
+    # to keep it unambiguous with an inline span), a tilde fence may. Closing
+    # fence: only whitespace may follow, and it may be longer than the opener
+    # -- accepting a trailing info string on the closer lets a fence-like line
+    # INSIDE the block end the region early. The optional \r keeps CRLF text
+    # working: MULTILINE "$" matches before the \n, with the \r still ahead of
+    # it. Fence indentation is SPACES only -- a leading tab advances to the
+    # fourth column and is code content, so accepting one lets a tab-indented
+    # fence-like line close a real block early.
+    r"^ {0,3}(?P<bfence>`{3,})[^\n`]*$[\s\S]*?"
+    r"(?:^ {0,3}(?P=bfence)`*[ \t]*\r?$|\Z)"
+    r"|^ {0,3}(?P<tfence>~{3,})[^\n]*$[\s\S]*?"
+    r"(?:^ {0,3}(?P=tfence)~*[ \t]*\r?$|\Z)",
+    re.MULTILINE,
+)
+# A blank line ends a paragraph, and a code span is an inline inside ONE leaf
+# block, so backtick runs in two different paragraphs cannot pair. The blank
+# line must tolerate a \r or CRLF text keeps the exposure -- the same trap a
+# closing fence fell into.
+_MD_BLANK_LINE_PATTERN = re.compile(r"\n[ \t\r]*\n")
+# Inline span, searched only within one paragraph of one gap between fences.
+# Opening and closing
+# runs must be the same length, so BOTH are bounded on BOTH sides: without a
+# left guard the regex restarts inside a longer run -- as an opener, swallowing
+# the text after an unmatched run; as a closer, ending the span early.
+#
+# The opener also honours backslash escapes, by parity: ``\` `` is a literal
+# backtick and opens nothing, ``\\` `` is a literal backslash followed by a
+# real opener. The leading backslashes fall inside the region, which is
+# harmless. The CLOSER deliberately does NOT honour them -- CommonMark gives
+# backslash escapes no effect inside a code span, so ``\` `` closes it. Adding
+# parity there would leave such a span unclosed, and an unclosed run protects
+# nothing: its code would be handed straight to the scanner.
+_MD_INLINE_CODE_PATTERN = re.compile(
+    r"(?<![\\`])(?:\\\\)*(?P<ticks>`+)(?!`)[\s\S]*?(?<!`)(?P=ticks)(?!`)"
+)
+
+
+def _iter_inline_code_regions(
+    text: str, start: int, end: int
+) -> Iterator[tuple[int, int]]:
+    """Yield inline code spans in ``text[start:end]``, one paragraph at a time.
+
+    Searched in place rather than on a sliced copy so the opener's lookbehind
+    still sees the character before each range.
+    """
+    cursor = start
+    for blank in _MD_BLANK_LINE_PATTERN.finditer(text, start, end):
+        yield from (
+            span.span()
+            for span in _MD_INLINE_CODE_PATTERN.finditer(text, cursor, blank.start())
+        )
+        cursor = blank.end()
+    yield from (
+        span.span() for span in _MD_INLINE_CODE_PATTERN.finditer(text, cursor, end)
+    )
+
+
+def _iter_md_code_regions(text: str) -> Iterator[tuple[int, int]]:
+    """Yield (start, end) of every Markdown code region, left to right.
+
+    Block structure first: fences, then inline spans within each paragraph of
+    the text the fences leave behind. Both boundaries are there for the same
+    reason -- an inline span cannot cross either, and letting one cross lets a
+    stray backtick eat a real span's opener and expose that span's own code.
+    """
+    cursor = 0
+    for fence in _MD_FENCE_REGION_PATTERN.finditer(text):
+        yield from _iter_inline_code_regions(text, cursor, fence.start())
+        yield fence.span()
+        cursor = fence.end()
+    yield from _iter_inline_code_regions(text, cursor, len(text))
+
+
+# A span whose body carries these is code, not math: a double quote or a
+# backtick is ordinary in shell and ~absent from LaTeX math. Together with the
+# inline-only newline and length limits below, this is the general defense
+# against dollars that pair for some reason other than math -- it does not
+# grow with Markdown's grammar the way a list of code constructs does.
+_CODE_MARKS_IN_MATH_SPAN = ('"', "`")
+# No formula in a VLM description runs this long on one line; a shell command
+# between two "$VAR" expansions frequently does. Display math is exempt --
+# "$$...$$" is routinely long and multi-line.
+_MAX_INLINE_MATH_CHARS = 200
+# How much of a rewritten span reaches the log. A count alone tells an
+# operator that text changed but not what changed, which is no way to spot
+# a wrong rewrite in a real corpus.
+_LOGGED_SPAN_CHARS = 80
+
+
+def _span_is_plausibly_math(span: str, delimiter: str) -> bool:
+    """Content gate: pairing says *where* a span is, this says whether it is math.
+
+    See *Content gate* in the contract doc,
+    docs/design/LatexEscapeRepairContract.md, for what it costs.
+    """
+    body = span[len(delimiter) : -len(delimiter)]
+    if any(mark in body for mark in _CODE_MARKS_IN_MATH_SPAN):
+        return False
+    if delimiter != "$":
+        return True
+    if len(body) > _MAX_INLINE_MATH_CHARS:
+        return False
+    # Line breaks are rejected by CHARACTER CLASS, not by example: any CR or
+    # LF, whichever line ending the text uses. The exemption is equally
+    # general -- a decoded "\nabla" / "\rho" IS a line break followed by its
+    # residue, so a break the residue pattern matches is damage, not a break.
+    return all(
+        _WS_LATEX_MATH_PATTERN.match(body, offset) is not None
+        for offset, char in enumerate(body)
+        if char in "\r\n"
+    )
+
+
+def _scan_dollar_spans(text: str) -> tuple[str, int, list[str]]:
+    """Restore whitespace-class LaTeX escapes inside paired dollar math.
+
+    Tab, CR and LF are legitimate whitespace outside an explicit ``$...$`` /
+    ``$$...$$`` span, so they are restored only inside one. Callers get back
+    the repaired text and the number of replacements; damage this function
+    declines to repair is reported by ``repair_vlm_json_escape_damage``
+    through the prose detector instead.
+
+    Rules a change here must keep:
+
+    - **Never rewrite text a Pandoc-style parser would not call math.**
+      Dollar delimiters are ambiguous, so this is a one-sided bias: a missed
+      repair leaves damage that was already there, a wrong one corrupts prose
+      on its way to storage.
+    - An inline ``$`` opens only before a non-whitespace character, EXCEPT
+      when the damage itself sits there. Removing that exception rejects
+      ``"$<tab>au$"`` -- the shape this function exists to repair.
+    - Only the very next unescaped delimiter may close a span, and a
+      delimiter that cannot pair is skipped as an ordinary character (a
+      failed ``$$`` whole, not one dollar at a time) rather than ending the
+      scan.
+    - The function operates on already-decoded strings, so a correct LaTeX
+      command still contains a real backslash and cannot match the damage
+      pattern. Repairing twice equals repairing once.
+
+    The mechanism, the accepted misses and two already-rejected pairing
+    designs are in docs/design/LatexEscapeRepairContract.md -- read
+    *Delimiter policy* and *Rejected alternatives* in the contract doc before
+    changing how spans pair.
+    """
+
+    def _is_escaped(index: int) -> bool:
+        backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and text[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        return backslashes % 2 == 1
+
+    def _opens_inline_math(index: int) -> bool:
+        """Non-whitespace after the opener, or the damage itself there."""
+        if index + 1 >= len(text):
+            return False
+        return (
+            not text[index + 1].isspace()
+            or _WS_LATEX_MATH_PATTERN.match(text, index + 1) is not None
+        )
+
+    def _closes_inline_math(index: int) -> bool:
+        """Pandoc's closer rule: no whitespace before, no digit after."""
+        if index == 0 or text[index - 1].isspace():
+            return False
+        return not (index + 1 < len(text) and text[index + 1].isdigit())
+
+    def _next_delimiter(start: int, delimiter: str) -> int:
+        cursor = start
+        while cursor < len(text):
+            if text.startswith(delimiter, cursor) and not _is_escaped(cursor):
+                return cursor
+            cursor += 1
+        return -1
+
+    def _restore(match: re.Match[str]) -> str:
+        return {"\t": r"\t", "\r": r"\r", "\n": r"\n"}[match.group(0)]
+
+    pieces: list[str] = []
+    repaired_spans: list[str] = []
+    replacements = 0
+    cursor = 0
+    while cursor < len(text):
+        if text[cursor] != "$" or _is_escaped(cursor):
+            pieces.append(text[cursor])
+            cursor += 1
+            continue
+
+        delimiter = "$$" if text.startswith("$$", cursor) else "$"
+        close = -1
+        if delimiter == "$$" or _opens_inline_math(cursor):
+            # Only the very next unescaped delimiter may close: a span that
+            # has to reach over another dollar is not one span but a stray
+            # dollar plus a real span, and consuming it swallows the prose
+            # (and the real span's opener) in between.
+            close = _next_delimiter(cursor + len(delimiter), delimiter)
+            if delimiter == "$" and close >= 0 and not _closes_inline_math(close):
+                close = -1
+        if close < 0:
+            # Not a usable delimiter here: emit it and keep scanning, so a
+            # later well-formed span is still reached. A failed "$$" is
+            # skipped whole -- letting its second dollar open an inline span
+            # pairs it with the next single "$" and rewrites the prose in
+            # between.
+            pieces.append(delimiter)
+            cursor += len(delimiter)
+            continue
+
+        span_end = close + len(delimiter)
+        math_span = text[cursor:span_end]
+        if _span_is_plausibly_math(math_span, delimiter):
+            repaired_span, count = _WS_LATEX_MATH_PATTERN.subn(_restore, math_span)
+        else:
+            repaired_span, count = math_span, 0
+        pieces.append(repaired_span)
+        if count:
+            replacements += count
+            repaired_spans.append(repaired_span[:_LOGGED_SPAN_CHARS])
+        cursor = span_end
+
+    return "".join(pieces), replacements, repaired_spans
+
+
+def _repair_ws_latex_in_dollar_math(text: str) -> tuple[str, int, list[str]]:
+    """Repair dollar math outside Markdown code, which is read verbatim.
+
+    Code quotes dollars for its own reasons -- ``echo "$HOME" ... "$PATH"``
+    pairs as neatly as a formula does -- so a fenced block or an inline code
+    span is copied through untouched and no span may cross one. Callers get
+    back the repaired text and the number of replacements.
+
+    See docs/design/LatexEscapeRepairContract.md for what this does and does
+    not cover; code written without Markdown markers is indistinguishable
+    from prose here and is listed there among the accepted misses.
+    """
+    pieces: list[str] = []
+    spans: list[str] = []
+    replacements = 0
+    last = 0
+    for start, end in _iter_md_code_regions(text):
+        repaired, count, repaired_spans = _scan_dollar_spans(text[last:start])
+        pieces.append(repaired)
+        replacements += count
+        spans.extend(repaired_spans)
+        pieces.append(text[start:end])
+        last = end
+    repaired, count, repaired_spans = _scan_dollar_spans(text[last:])
+    pieces.append(repaired)
+    replacements += count
+    spans.extend(repaired_spans)
+    return "".join(pieces), replacements, spans
 
 
 def repair_vlm_json_escape_damage(text: str, *, context: str = "") -> str:
@@ -4483,8 +6366,9 @@ def repair_vlm_json_escape_damage(text: str, *, context: str = "") -> str:
 
     Isolated control characters (not followed by a letter) are left alone for
     downstream sanitization to drop. Whitespace-class damage (``\\tau`` ->
-    tab + ``au`` etc.) is ambiguous with legitimate whitespace and is only
-    logged at WARNING level, never rewritten.
+    tab + ``au`` etc.) is repaired only inside paired dollar-math spans.
+    Outside explicit math it remains ambiguous with legitimate whitespace and
+    is only logged, never rewritten.
 
     Args:
         text: Parsed string value to repair.
@@ -4500,6 +6384,19 @@ def repair_vlm_json_escape_damage(text: str, *, context: str = "") -> str:
         logger.warning(
             "Repaired LaTeX escape damage (\\f/\\b decoded by JSON parser)%s",
             f" in {context}" if context else "",
+        )
+
+    repaired, ws_repair_count, ws_repaired_spans = _repair_ws_latex_in_dollar_math(
+        repaired
+    )
+    if ws_repair_count:
+        logger.warning(
+            "Repaired whitespace-class LaTeX escape damage inside dollar math%s "
+            "(%d occurrence%s): %s",
+            f" in {context}" if context else "",
+            ws_repair_count,
+            "" if ws_repair_count == 1 else "s",
+            " | ".join(repr(span) for span in ws_repaired_spans),
         )
 
     suspect = _WS_LATEX_SUSPECT_PATTERN.search(repaired)
@@ -4857,11 +6754,12 @@ async def pick_by_vector_similarity(
     if not entity_info or num_of_chunks <= 0:
         return []
 
-    # Collect all unique chunk IDs from entity info
-    all_chunk_ids = set()
-    for i, entity in enumerate(entity_info):
-        chunk_ids = entity.get("sorted_chunks", [])
-        all_chunk_ids.update(chunk_ids)
+    # Preserve first occurrence order for similarity ties and fallback selection.
+    all_chunk_ids = dict.fromkeys(
+        chunk_id
+        for entity in entity_info
+        for chunk_id in entity.get("sorted_chunks", [])
+    )
 
     if not all_chunk_ids:
         logger.warning(
@@ -5076,19 +6974,34 @@ async def apply_rerank_if_enabled(
 
         # Process rerank results based on return format
         if rerank_results and len(rerank_results) > 0:
+            first_object = next(
+                (result for result in rerank_results if isinstance(result, dict)),
+                None,
+            )
             # Check if results are in the new index-based format
-            if isinstance(rerank_results[0], dict) and "index" in rerank_results[0]:
+            if first_object is not None and "index" in first_object:
                 # New format: [{"index": 0, "relevance_score": 0.85}, ...]
                 reranked_docs = []
                 for result in rerank_results:
-                    index = result["index"]
-                    relevance_score = result["relevance_score"]
+                    normalized_result, _ = normalize_rerank_result(
+                        result, len(retrieved_docs)
+                    )
+                    if normalized_result is None:
+                        continue
+
+                    index = normalized_result["index"]
+                    relevance_score = normalized_result["relevance_score"]
 
                     # Get original document and add rerank score
-                    if 0 <= index < len(retrieved_docs):
-                        doc = retrieved_docs[index].copy()
-                        doc["rerank_score"] = relevance_score
-                        reranked_docs.append(doc)
+                    doc = retrieved_docs[index].copy()
+                    doc["rerank_score"] = relevance_score
+                    reranked_docs.append(doc)
+
+                if not reranked_docs:
+                    logger.warning(
+                        "Rerank returned no usable results, using original chunks"
+                    )
+                    return retrieved_docs
 
                 logger.info(
                     f"Successfully reranked: {len(reranked_docs)} chunks from {len(retrieved_docs)} original chunks"
@@ -5107,6 +7020,38 @@ async def apply_rerank_if_enabled(
         return retrieved_docs
 
 
+def normalize_rerank_result(
+    result: Any, max_index: int
+) -> tuple[dict[str, int | float] | None, str | None]:
+    """Validate one provider result and return the public rerank shape.
+
+    Providers, compatible proxies, and custom rerank functions can return mixed
+    result lists. Centralizing validation keeps provider adapters, chunk score
+    aggregation, and the final query boundary consistent.
+    """
+    if not isinstance(result, dict):
+        return None, "not an object"
+
+    index = result.get("index")
+    if isinstance(index, bool) or not isinstance(index, int):
+        return None, "invalid index"
+    if not 0 <= index < max_index:
+        return None, "index out of range"
+
+    score_value = result.get("relevance_score")
+    if isinstance(score_value, bool):
+        return None, "invalid relevance score"
+
+    try:
+        score = float(score_value)
+    except (TypeError, ValueError, OverflowError):
+        return None, "invalid relevance score"
+    if not math.isfinite(score):
+        return None, "non-finite relevance score"
+
+    return {"index": index, "relevance_score": score}, None
+
+
 async def process_chunks_unified(
     query: str,
     unique_chunks: list[dict],
@@ -5121,7 +7066,7 @@ async def process_chunks_unified(
 
     Args:
         query: Search query for reranking
-        chunks: List of text chunks to process
+        unique_chunks: List of deduplicated text chunks to process
         query_param: Query parameters containing configuration
         global_config: Global configuration dictionary
         source_type: Source type for logging ("vector", "entity", "relationship", "mixed")
@@ -5195,13 +7140,11 @@ async def process_chunks_unified(
 
         original_count = len(unique_chunks)
 
-        unique_chunks = await atruncate_list_by_token_size(
+        unique_chunks = await run_in_tokenizer_executor(
+            _truncate_chunks_for_unified_context,
             unique_chunks,
-            key=lambda x: "\n".join(
-                json.dumps(item, ensure_ascii=False) for item in [x]
-            ),
-            max_token_size=chunk_token_limit,
-            tokenizer=tokenizer,
+            chunk_token_limit,
+            tokenizer,
         )
 
         logger.debug(
@@ -5240,7 +7183,30 @@ def normalize_source_ids_limit_method(method: str | None) -> str:
 def merge_source_ids(
     existing_ids: Iterable[str] | None, new_ids: Iterable[str] | None
 ) -> list[str]:
-    """Merge two iterables of source IDs while preserving order and removing duplicates."""
+    """Merge two iterables of source IDs into one flat, ordered, deduplicated list.
+
+    Every element is split on ``GRAPH_FIELD_SEP``, stripped, and deduplicated by
+    first-seen order. The split is what makes this the normalization boundary
+    for chunk-id lists: an element that is itself a joined string
+    (``"chunk-a<SEP>chunk-b"``) would otherwise be stored as a single id, and
+    such an id matches no key in ``text_chunks``. It would then corrupt the
+    ``chunk_ids``/``count`` rows of ``entity_chunks_storage`` /
+    ``relation_chunks_storage``, miscount ``apply_source_ids_limit``'s
+    truncation (two chunks counted as one), and miss every downstream
+    ``get_by_ids`` lookup.
+
+    No in-tree producer passes a joined element today — every caller splits its
+    graph ``source_id`` first, and extraction emits one ``chunk_key`` per record
+    — so the split is a guard against a future upstream regression rather than a
+    fix for a live path. A joined element arriving here therefore means an
+    upstream bug and is logged at debug level so the silent repair does not hide
+    the root cause.
+
+    Despite the name, this also merges the sibling union fields that share the
+    same ``GRAPH_FIELD_SEP`` encoding: ``file_path`` and ``description`` in the
+    edge-dedup merges of ``mongo_impl`` / ``opensearch_impl``. Stripping applies
+    to those fragments too, so ``" foo"`` and ``"foo"`` collapse into one entry.
+    """
 
     merged: list[str] = []
     seen: set[str] = set()
@@ -5251,9 +7217,26 @@ def merge_source_ids(
         for source_id in sequence:
             if not source_id:
                 continue
-            if source_id not in seen:
-                seen.add(source_id)
-                merged.append(source_id)
+            if not isinstance(source_id, str):
+                # Coerce rather than skip: dropping the value would silently
+                # lose provenance, which is the failure mode this function
+                # exists to prevent. The warning surfaces the type bug.
+                logger.warning(
+                    f"merge_source_ids received a non-string id "
+                    f"{source_id!r} ({type(source_id).__name__}); coercing to str"
+                )
+                source_id = str(source_id)
+            if GRAPH_FIELD_SEP in source_id:
+                logger.debug(
+                    f"merge_source_ids splitting a GRAPH_FIELD_SEP-joined value "
+                    f"{source_id!r}; callers are expected to pass individual ids"
+                )
+            # split_string_by_multi_markers already strips each fragment and
+            # drops the empty ones, so a whitespace-only element yields nothing.
+            for sid in split_string_by_multi_markers(source_id, [GRAPH_FIELD_SEP]):
+                if sid not in seen:
+                    seen.add(sid)
+                    merged.append(sid)
 
     return merged
 
@@ -5303,7 +7286,26 @@ def compute_incremental_chunk_ids(
 
     This function applies delta changes (additions and removals) to an existing
     list of chunk IDs while maintaining order and ensuring deduplication.
-    Delta additions from new_chunk_ids are placed at the end.
+    Delta additions from new_chunk_ids are placed at the end. Empty IDs are
+    dropped from both inputs.
+
+    Authority model:
+        ``existing_full_chunk_ids`` — the entity/relation chunk-tracking row — is
+        AUTHORITATIVE. A graph node's ``source_id`` is only a truncated view of it
+        (see ``apply_source_ids_limit``), and it may legitimately retain STALE chunk
+        IDs that tracking has already pruned: the purge path reads tracking first and
+        falls back to ``source_id`` only when the tracking row is absent, and its
+        ``graph_references_deleted_chunks`` branch exists precisely to handle a graph
+        that still references chunks tracking has dropped.
+
+        Consequently an ID present in BOTH ``old_chunk_ids`` and ``new_chunk_ids`` but
+        absent from ``existing_full_chunk_ids`` is treated as intentionally pruned and
+        is NOT restored — only genuine additions (``new - old``) are appended. Widening
+        Step 2 to append every entry of ``new_chunk_ids`` would resurrect stale
+        attribution into the authoritative store, which a later purge would then use to
+        rebuild or retain KG objects sourced from chunks that no longer exist.
+        Repairing genuinely missing attribution is the job of
+        ``audit_kg_integrity(..., apply=True)``, never of this function.
 
     Args:
         existing_full_chunk_ids: Complete list of existing chunk IDs from storage
@@ -5318,22 +7320,25 @@ def compute_incremental_chunk_ids(
         >>> old = ['chunk-1', 'chunk-2']
         >>> new = ['chunk-2', 'chunk-4']
         >>> compute_incremental_chunk_ids(existing, old, new)
-        ['chunk-3', 'chunk-2', 'chunk-4']
+        ['chunk-2', 'chunk-3', 'chunk-4']
     """
     # Calculate changes
     chunks_to_remove = set(old_chunk_ids) - set(new_chunk_ids)
     chunks_to_add = set(new_chunk_ids) - set(old_chunk_ids)
 
-    # Apply changes to full chunk_ids
     # Step 1: Remove chunks that are no longer needed
     updated_chunk_ids = [
-        cid for cid in existing_full_chunk_ids if cid not in chunks_to_remove
+        cid for cid in existing_full_chunk_ids if cid and cid not in chunks_to_remove
     ]
+    seen = set(updated_chunk_ids)
 
-    # Step 2: Add new chunks (preserving order from new_chunk_ids)
-    # Note: 'cid not in updated_chunk_ids' check ensures deduplication
+    # Step 2: Append genuine additions only (preserving order from new_chunk_ids).
+    # The `seen` check is not redundant with `chunks_to_add`: tracking may already
+    # hold an ID that is in new_chunk_ids but not in old_chunk_ids, because
+    # source_id is a truncated view of the tracking row.
     for cid in new_chunk_ids:
-        if cid in chunks_to_add and cid not in updated_chunk_ids:
+        if cid and cid in chunks_to_add and cid not in seen:
+            seen.add(cid)
             updated_chunk_ids.append(cid)
 
     return updated_chunk_ids
@@ -5354,6 +7359,25 @@ def subtract_source_ids(
         for source_id in source_ids
         if source_id and source_id not in removal_set
     ]
+
+
+def has_chunk_tracking_row(stored_data: Any) -> bool:
+    """Return True when a chunk-tracking KV row is present and structurally usable.
+
+    Presence is defined by schema — a dict carrying a ``chunk_ids`` list — never
+    by list truthiness. A persisted row of ``{"chunk_ids": [], "count": 0}`` is
+    authoritative ("this object tracks no chunks") and must be distinguished
+    from an absent row or a legacy/partial shape (``{}``, ``{"count": 0}``,
+    ``{"chunk_ids": null}``), which mean UNKNOWN. Only in the UNKNOWN case may a
+    caller fall back to the graph object's ``source_id`` — a truncated view that
+    can still name chunks a previous purge already pruned (see
+    ``compute_incremental_chunk_ids``); reseeding a present-but-empty row from
+    it resurrects stale attribution.
+    """
+
+    return isinstance(stored_data, dict) and isinstance(
+        stored_data.get("chunk_ids"), list
+    )
 
 
 def make_relation_chunk_key(src: str, tgt: str) -> str:
@@ -5518,7 +7542,7 @@ def fix_tuple_delimiter_corruption(
         record,
     )
 
-    # Fix: <|#|>| -> <|#|>  ( this is a fix for: <|#|| -> <|#|> )
+    # Fix: <|#|>| -> <|#|>  (this is a fix for: <|#|| -> <|#|>)
     record = re.sub(
         rf"<\|{escaped_delimiter_core}\|>\|",
         tuple_delimiter,
@@ -5584,6 +7608,60 @@ def create_prefixed_exception(original_exception: Exception, prefix: str) -> Exc
         )
 
 
+_PAPER_SHA256_RE = re.compile(r"(sha256_[0-9a-f]{7,})")
+PAPER_LIB_HTML_URL_TEMPLATE = "https://paper-lib.huamedicine.com/papers/{paper_id}.html"
+
+# Uploaded filenames carry a TRUNCATED sha256 marker ("sha256_" + 13 hex
+# chars), but paper-lib URLs require the full 64-hex paper_id. An optional
+# short-id -> full-id lookup (loaded from paper_id_map.json in the working
+# dir, see register_paper_id_lookup) expands the marker when available.
+_paper_id_lookup: dict[str, str] = {}
+
+
+def register_paper_id_lookup(mapping: dict[str, str]) -> None:
+    """Register a truncated-sha256 -> full paper_id mapping.
+
+    Called once at server startup; derive_paper_html_url consults it to turn
+    short filename markers into valid full-length paper-lib URLs.
+    """
+    _paper_id_lookup.clear()
+    _paper_id_lookup.update(mapping)
+
+
+def derive_paper_html_url(file_path: str) -> str:
+    """Derive the paper-lib HTML URL from a sha256_ marker in a file path.
+
+    Files are named like "Title_sha256_abcdef1234.md"; every chunk/entity/
+    relation carrying such a file_path can link back to the original paper.
+    Returns "" when no marker is present.
+    """
+    if not file_path:
+        return ""
+    m = _PAPER_SHA256_RE.search(file_path)
+    if not m:
+        return ""
+    paper_id = _paper_id_lookup.get(m.group(1), m.group(1))
+    return PAPER_LIB_HTML_URL_TEMPLATE.format(paper_id=paper_id)
+
+
+def normalize_paper_html_url(url: str) -> str:
+    """Expand a truncated paper_id in an already-stored html_url via the lookup.
+
+    Chunks ingested before the lookup existed store short-form (broken) URLs;
+    this repairs them at query time without rewriting storage. URLs without a
+    marker, or with a full/unknown id, pass through unchanged.
+    """
+    if not url or not _paper_id_lookup:
+        return url
+    m = _PAPER_SHA256_RE.search(url)
+    if not m:
+        return url
+    full = _paper_id_lookup.get(m.group(1))
+    if not full or full == m.group(1):
+        return url
+    return url[: m.start()] + full + url[m.end() :]
+
+
 def convert_to_user_format(
     entities_context: list[dict],
     relations_context: list[dict],
@@ -5614,6 +7692,12 @@ def convert_to_user_format(
                     "description": original_entity.get("description", ""),
                     "source_id": original_entity.get("source_id", ""),
                     "file_path": original_entity.get("file_path", "unknown_source"),
+                    "html_url": normalize_paper_html_url(
+                        original_entity.get("html_url", "")
+                    )
+                    or derive_paper_html_url(
+                        original_entity.get("file_path", "")
+                    ),
                     "created_at": original_entity.get("created_at", ""),
                 }
             )
@@ -5626,6 +7710,8 @@ def convert_to_user_format(
                     "description": entity.get("description", ""),
                     "source_id": entity.get("source_id", ""),
                     "file_path": entity.get("file_path", "unknown_source"),
+                    "html_url": normalize_paper_html_url(entity.get("html_url", ""))
+                    or derive_paper_html_url(entity.get("file_path", "")),
                     "created_at": entity.get("created_at", ""),
                 }
             )
@@ -5653,6 +7739,12 @@ def convert_to_user_format(
                     "weight": original_relation.get("weight", 1.0),
                     "source_id": original_relation.get("source_id", ""),
                     "file_path": original_relation.get("file_path", "unknown_source"),
+                    "html_url": normalize_paper_html_url(
+                        original_relation.get("html_url", "")
+                    )
+                    or derive_paper_html_url(
+                        original_relation.get("file_path", "")
+                    ),
                     "created_at": original_relation.get("created_at", ""),
                 }
             )
@@ -5667,6 +7759,8 @@ def convert_to_user_format(
                     "weight": relation.get("weight", 1.0),
                     "source_id": relation.get("source_id", ""),
                     "file_path": relation.get("file_path", "unknown_source"),
+                    "html_url": normalize_paper_html_url(relation.get("html_url", ""))
+                    or derive_paper_html_url(relation.get("file_path", "")),
                     "created_at": relation.get("created_at", ""),
                 }
             )
@@ -5678,6 +7772,8 @@ def convert_to_user_format(
             "reference_id": chunk.get("reference_id", ""),
             "content": chunk.get("content", ""),
             "file_path": chunk.get("file_path", "unknown_source"),
+            "html_url": normalize_paper_html_url(chunk.get("html_url", ""))
+            or derive_paper_html_url(chunk.get("file_path", "")),
             "chunk_id": chunk.get("chunk_id", ""),
         }
         formatted_chunks.append(chunk_data)
@@ -5774,6 +7870,82 @@ def generate_reference_list_from_chunks(
     return reference_list, updated_chunks
 
 
+def render_chunks_context_text(chunks_with_reference_ids: list[dict]) -> str:
+    """Render the exact chunk-context text sent to the LLM.
+
+    ``chunks_with_reference_ids`` must already carry ``reference_id`` — the
+    second return value of :func:`generate_reference_list_from_chunks`. This
+    is the single place that projects a chunk down to
+    ``{reference_id, content, content_headings?}`` and serializes it, one JSON
+    object per line, so that any token-budget check done against this exact
+    call sequence matches what callers go on to send downstream verbatim.
+    """
+    chunks_context = []
+    for chunk in chunks_with_reference_ids:
+        entry = {
+            "reference_id": chunk["reference_id"],
+            "content": chunk["content"],
+        }
+        if chunk.get("content_headings"):
+            entry["content_headings"] = chunk["content_headings"]
+        chunks_context.append(entry)
+    return "\n".join(
+        json.dumps(text_unit, ensure_ascii=False) for text_unit in chunks_context
+    )
+
+
+def _truncate_chunks_for_unified_context(
+    chunks: list[dict], max_token_size: int, tokenizer: "Tokenizer"
+) -> list[dict]:
+    """Two-stage truncation used by :func:`process_chunks_unified`.
+
+    Counting a chunk list's tokens against the chunk dicts themselves (as the
+    single-stage version used to) undercounts: what actually reaches the LLM
+    is the ``{reference_id, content, content_headings?}`` projection built by
+    :func:`generate_reference_list_from_chunks` /
+    :func:`render_chunks_context_text`, and ``reference_id`` itself is
+    recomputed from each survivor's ``file_path`` frequency — which changes
+    with the exact set of chunks kept, not just by a token or two.
+
+    Stage 1 approximates a safe count K from ``{content, content_headings}``
+    alone (``reference_id`` isn't assigned yet, and can't be until the
+    survivor set is known — a chicken-and-egg the real renderer resolves by
+    running after truncation, not before). Stage 2 re-renders that exact
+    candidate list through the real renderer and independently re-verifies
+    (shrinking K if needed), so the K this function returns is guaranteed safe
+    under the SAME rendering the caller will perform afterward on the same
+    list. Both stages run in this one synchronous call — it must always be
+    submitted as a single ``run_in_tokenizer_executor`` job, never split
+    across two round-trips through the event loop.
+    """
+    if max_token_size <= 0 or not chunks:
+        return []
+
+    def _approx_key(chunk: dict) -> str:
+        payload = {"content": chunk.get("content")}
+        if chunk.get("content_headings"):
+            payload["content_headings"] = chunk["content_headings"]
+        return json.dumps(payload, ensure_ascii=False)
+
+    approx = truncate_list_by_token_size(
+        chunks,
+        key=_approx_key,
+        separator="\n",
+        max_token_size=max_token_size,
+        tokenizer=tokenizer,
+    )
+
+    k = len(approx)
+    while k > 0:
+        _, rendered_chunks = generate_reference_list_from_chunks(approx[:k])
+        text = render_chunks_context_text(rendered_chunks)
+        if len(tokenizer.encode(text)) <= max_token_size:
+            break
+        k -= 1
+
+    return approx[:k]
+
+
 def validate_workspace(workspace: str) -> str:
     """Validate a workspace name used to build per-workspace directories.
 
@@ -5813,3 +7985,381 @@ def validate_workspace(workspace: str) -> str:
             "separators ('/', '\\') or be a relative path reference ('.', '..')"
         )
     return workspace
+
+
+# Complement of the XML 1.0 ``Char`` production. GraphML is XML, so a string
+# holding any other code point cannot be serialized at all -- tab, newline and
+# carriage return are the only C0 controls XML admits, and descriptions
+# legitimately carry those.
+_XML_INCOMPATIBLE_CHAR_PATTERN = re.compile(
+    r"[^\u0009\u000a\u000d\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]"
+)
+
+# Attribute names a backend would read as something other than a name. Kept to
+# exactly that: MongoGraphStorage passes names straight into a ``$set``
+# document, where a dot is a *path* separator (``source_ids.0`` rewrites an
+# element of the chunk-attribution array rather than creating a field) and a
+# leading ``$`` is an update operator.
+#
+# Deliberately NOT "must be an identifier". Names like ``display-name`` or
+# ``has space`` carry no interpretation hazard on any backend, and the manual
+# edit API accepted them before the field allowlist landed -- so the document
+# backends that persisted them hold such names today. Refusing them here would
+# make those entities unmodifiable, because every rewrite path (entity edit,
+# rename, merge, extraction rebuild) spreads the *stored* attributes back into
+# the upsert payload.
+_GRAPH_ATTRIBUTE_NAME_DISALLOWED_SUBSTRING = "."
+_GRAPH_ATTRIBUTE_NAME_DISALLOWED_PREFIX = "$"
+
+# Integer attributes must fit in a signed 64-bit integer. Verified against the
+# installed driver rather than assumed: neo4j's packstream Packer raises
+# ``OverflowError("Integer ... out of range")`` outside ``[-2**63, 2**63)``
+# (``neo4j/_codec/packstream/v1/__init__.py``), and GraphML declares an int
+# attribute as ``attr.type="long"``, which is ``xsd:long`` -- also int64. So a
+# larger int is outside the intersection this module defines, even though
+# networkx will happily write it and PostgreSQL's arbitrary-precision ``jsonb``
+# numeric will happily store it.
+_GRAPH_ATTRIBUTE_INT_MIN = -(2**63)
+_GRAPH_ATTRIBUTE_INT_MAX = 2**63 - 1
+
+
+def _graphml_encodable_types() -> frozenset[type]:
+    """The exact types networkx's GraphML writer knows how to encode.
+
+    Asked of networkx rather than enumerated here, because ``add_data`` resolves
+    a value by looking its type up in ``self.xml_type`` -- so that table *is* the
+    definition, and reproducing it by hand would drift. Sourcing it also makes
+    the guard's justification true by construction: every type this module
+    refuses is a type the write would have failed on.
+
+    An ``isinstance`` shortcut over ``np.integer`` / ``np.floating`` would be
+    wrong, not merely loose: ``np.longdouble`` is an ``np.floating`` and is *not*
+    in the table, so it would be accepted here and rejected at write time --
+    the poisoning this exists to prevent.
+
+    The four builtins are unioned in as a floor, and a failure to read the table
+    degrades to exactly that floor. ``networkx`` carries no version bound in
+    pyproject.toml, so its internals could move; degrading to the floor is
+    stricter, never looser, so it cannot open the hole it guards.
+    """
+    builtin_scalars = frozenset({str, int, float, bool})
+    try:
+        from networkx.readwrite.graphml import GraphML
+
+        probe = GraphML()
+        probe.construct_types()
+        return frozenset(probe.xml_type) | builtin_scalars
+    except Exception:  # networkx internals moved: fall back to the strict floor
+        return builtin_scalars
+
+
+_GRAPHML_ENCODABLE_TYPES = _graphml_encodable_types()
+
+# The intersection every registered backend can carry. Narrower than
+# ``_GRAPHML_ENCODABLE_TYPES``, which also holds the numpy scalar types GraphML
+# writes: those are not portable, and not marginally so -- ``json.dumps``
+# (PGTableGraphStorage's jsonb column) and ``bson`` (MongoGraphStorage) both
+# refuse ``np.float32`` / ``np.int64`` / ``np.uint32`` / ``np.bool_`` outright.
+_PORTABLE_SCALAR_TYPES = frozenset({str, int, float, bool})
+
+
+def xml_attribute_name_rejection(name: Any) -> str | None:
+    """Explain why *name* cannot be used as an XML-serialized attribute name.
+
+    GraphML writes attribute names into the XML ``attr.name`` field, so a name is
+    subject to the same character rule as a value -- a claim checked against
+    networkx rather than assumed: a name holding a control character, a lone
+    surrogate or U+FFFE makes ``write_graphml`` raise, which on
+    ``NetworkXStorage`` is the instance-wide persistence outage the storage guard
+    exists to prevent.
+
+    Everything else is allowed, including names a *portable* rule would refuse
+    (``a.b``, ``$set``, ``display-name``, ``has space``, ``""``). Two reasons:
+    GraphML round-trips all of those, and -- the load-bearing one -- a name this
+    function rejects can never have been persisted in an existing GraphML file,
+    because the write that would have stored it failed. That is what makes the
+    check safe to apply to a rewrite payload, which spreads a fetched object's
+    stored names back in.
+
+    Args:
+        name: Candidate attribute name.
+
+    Returns:
+        A reason fragment, or ``None`` when XML can carry the name.
+    """
+    if not isinstance(name, str):
+        # networkx raises TypeError("keywords must be strings") before mutating,
+        # so this cannot poison the graph -- it is folded in so the caller gets a
+        # validation error rather than an unhandled TypeError.
+        return f"must be a string, got {type(name).__name__}"
+    match = _XML_INCOMPATIBLE_CHAR_PATTERN.search(name)
+    if match:
+        return (
+            "must not contain the character "
+            f"U+{ord(match.group()):04X}, which XML cannot encode"
+        )
+    return None
+
+
+def xml_attribute_value_rejection(value: Any) -> str | None:
+    """Explain why *value* cannot be encoded in XML at all.
+
+    The narrower of the two value rules, and the one a GraphML-backed store
+    should enforce: it rejects only what cannot be *serialized*, not what is
+    merely unportable. ``NaN``, ``inf`` and an integer past int64 all round-trip
+    through GraphML unchanged, so they are accepted here even though
+    ``graph_attribute_value_rejection`` refuses them.
+
+    "Serialized" is the operative word, and it is not the same as "is a scalar":
+    an integer with more digits than ``sys.get_int_max_str_digits()`` cannot be
+    rendered as text at all, so GraphML cannot hold it however ordinary it looks.
+
+    That difference is deliberate, and it is what keeps a backend guard from
+    stranding data. A workspace can already hold such a value -- the manual edit
+    API accepted anything before its field allowlist landed -- and every rewrite
+    path (entity edit, extraction rebuild) spreads a fetched object's stored
+    attributes back into the upsert payload. Enforcing the *portable* rule at the
+    storage layer would therefore make those objects unmodifiable, while
+    enforcing it where caller input enters costs nothing.
+
+    Args:
+        value: Candidate attribute value.
+
+    Returns:
+        A reason fragment suitable for appending to ``"attribute 'x' "``, or
+        ``None`` when XML can carry the value.
+    """
+    # Exact type, not ``isinstance``. networkx's GraphML writer resolves a value
+    # by looking its type up in a dict (``add_data``: ``if element_type not in
+    # self.xml_type``), so a *subclass* of a supported scalar is rejected at write
+    # time -- ``enum.StrEnum``, ``enum.IntEnum``, ``np.str_``, ``Decimal`` and any
+    # user ``class X(str)`` all satisfy ``isinstance`` and all make
+    # ``write_graphml`` raise. Read from the installed networkx, not assumed.
+    #
+    # The set comes from that same table (see ``_graphml_encodable_types``), so
+    # it includes the numpy scalar types GraphML writes -- and so that every type
+    # refused here is one the write would genuinely have failed on.
+    value_type = type(value)
+    if value_type not in _GRAPHML_ENCODABLE_TYPES:
+        if isinstance(value, (str, int, float, bool)):
+            # A subclass: worth saying so, because the caller reasonably expects
+            # a `str` subclass to be a string.
+            return (
+                f"must be a type GraphML can encode, got {value_type.__name__} "
+                "(GraphML resolves value types exactly, so a subclass of a "
+                "supported scalar is still refused)"
+            )
+        return f"must be a string, number or boolean, got {value_type.__name__}"
+    if value_type is not str and value_type is not int:
+        # bool, float and the numpy numeric scalars need nothing further: the
+        # only remaining checks are the digit limit (int) and the character rule
+        # (str). A numpy int is width-bounded, so it cannot hit the digit limit.
+        return None
+    if value_type is int:
+        # GraphML stores values as text, and networkx stringifies them on write.
+        # CPython refuses to stringify an integer with more digits than
+        # ``sys.get_int_max_str_digits()`` (4300 by default since 3.11, and
+        # settable at runtime), so a large enough int makes ``write_graphml``
+        # raise even though the int itself is a perfectly ordinary scalar.
+        # Attempt the same conversion the writer will make rather than comparing
+        # against the limit, so this cannot drift from it if the limit is changed.
+        try:
+            str(value)
+        except ValueError:
+            # `get_int_max_str_digits` arrived in 3.11 and was backported to
+            # 3.10.7, so it can be missing on the `requires-python = ">=3.10"`
+            # floor. It is unreachable here when missing -- no limit means
+            # `str()` cannot raise -- but read it defensively rather than relying
+            # on that.
+            read_limit = getattr(sys, "get_int_max_str_digits", None)
+            limit = f" (limit {read_limit()} digits)" if read_limit else ""
+            return f"has more digits than Python will render as text{limit}"
+        return None
+    match = _XML_INCOMPATIBLE_CHAR_PATTERN.search(value)
+    if match:
+        return (
+            "must not contain the character "
+            f"U+{ord(match.group()):04X}, which XML cannot encode"
+        )
+    return None
+
+
+def graph_attribute_value_rejection(value: Any) -> str | None:
+    """Explain why *value* cannot be stored as a graph node/edge attribute.
+
+    The wider of the two value rules: the intersection of what *every*
+    registered backend can carry, meant for the point where caller input enters
+    (see ``xml_attribute_value_rejection`` for the narrower serialization rule a
+    storage backend should enforce instead, and why the two differ).
+
+    The rules are the intersection of what the seven registered
+    ``GRAPH_STORAGE`` backends can carry, so the same payload behaves the same
+    way on all of them:
+
+    * ``bool`` -- accepted everywhere.
+    * ``int`` -- must fit in int64. A larger int is written happily by networkx
+      and stored happily by PostgreSQL's arbitrary-precision ``jsonb`` numeric,
+      but the Neo4j driver refuses to pack it and GraphML mislabels it as
+      ``xsd:long``. See ``_GRAPH_ATTRIBUTE_INT_MIN``.
+    * ``float`` -- must be finite. ``NaN`` / ``inf`` survive GraphML but
+      ``json.dumps`` renders them as bare ``NaN`` / ``Infinity``, which is not
+      valid JSON and is rejected by the ``jsonb`` column PGTableGraphStorage
+      writes to.
+    * ``str`` -- must be XML-compatible, because GraphML cannot encode the
+      other code points at all (see ``_XML_INCOMPATIBLE_CHAR_PATTERN``).
+    * anything else (``dict``, ``list``, ``None``, ``bytes``, ...) -- rejected.
+      ``None`` is called out because it is the one non-scalar that reads as
+      harmless: GraphML refuses it outright, while on the Cypher backends
+      ``SET n += {k: null}`` silently *deletes* the property.
+
+    Args:
+        value: Candidate attribute value.
+
+    Returns:
+        A reason fragment suitable for appending to ``"attribute 'x' "``, or
+        ``None`` when the value is storable.
+    """
+    rejection = xml_attribute_value_rejection(value)
+    if rejection is not None:
+        return rejection
+    # The XML rule accepts what GraphML can write, which includes numpy scalars;
+    # portability is narrower. ``json.dumps`` (PGTableGraphStorage's jsonb
+    # column) and ``bson`` (MongoGraphStorage) both refuse ``np.float32`` /
+    # ``np.int64`` / ``np.uint32`` / ``np.bool_``, so a numpy value that persists
+    # fine on NetworkX cannot cross to another backend.
+    value_type = type(value)
+    if value_type not in _PORTABLE_SCALAR_TYPES:
+        return (
+            f"must be a str, int, float or bool to be portable across graph "
+            f"backends, got {value_type.__name__}"
+        )
+    # The type is pinned exactly now, so ``is int`` rather than ``isinstance`` --
+    # a bool cannot reach the range check.
+    if value_type is int:
+        if not _GRAPH_ATTRIBUTE_INT_MIN <= value <= _GRAPH_ATTRIBUTE_INT_MAX:
+            return (
+                "must be a 64-bit integer "
+                f"({_GRAPH_ATTRIBUTE_INT_MIN} to {_GRAPH_ATTRIBUTE_INT_MAX})"
+            )
+        return None
+    if value_type is float and not math.isfinite(value):
+        return "must be a finite number"
+    return None
+
+
+def validate_graph_attributes(attributes: dict[str, Any], *, context: str) -> None:
+    """Reject a node/edge attribute mapping no graph backend could store.
+
+    Args:
+        attributes: Attribute mapping about to be written to graph storage.
+        context: Prefix identifying the object being written, used in the error
+            message (e.g. ``"entity 'Tesla'"``).
+
+    Raises:
+        ValueError: On the first unusable attribute name or value.
+    """
+    # The portable contract is the intersection, so it owns both name rules: a
+    # name XML cannot encode is unstorable on NetworkX, and a name MongoDB would
+    # read as a field path is unstorable there. Neither backend needs the other's
+    # rule (see each rejection helper), but caller input has to satisfy both.
+    validate_xml_attributes(attributes, context=context)
+    validate_interpreted_attribute_names(attributes, context=context)
+    validate_graph_attribute_values(attributes, context=context)
+
+
+def validate_interpreted_attribute_names(
+    attributes: dict[str, Any], *, context: str
+) -> None:
+    """Reject attribute names a backend would read as something other than a name.
+
+    The *interpretation* rule, not the serialization one: see
+    ``xml_attribute_name_rejection`` for the character rule a GraphML-backed
+    store needs. A backend should enforce the hazard it actually has, and the two
+    hazards live in different backends:
+
+    * Names are dangerous only where they are *interpreted*. MongoDB passes them
+      into a ``$set`` document, so a dot is a path (``source_ids.0`` rewrites an
+      element of the chunk-attribution array instead of creating a field) and a
+      leading ``$`` is an update operator.
+    * Names are inert in GraphML, which is why NetworkXStorage validates values
+      only. Enforcing names there would additionally reject re-ingesting a node
+      whose *stored* attributes predate this validation, which is a migration
+      failure with no safety benefit.
+
+    The rule is the interpretation hazard and nothing beyond it -- see
+    ``_GRAPH_ATTRIBUTE_NAME_DISALLOWED_SUBSTRING`` for why "must be an
+    identifier" would be the wrong rule. A name that a backend *stores* rather
+    than interprets is legal here even if it is unusual, because rewrite paths
+    feed stored attributes back into the upsert payload and a stricter rule
+    would strand existing data.
+
+    Args:
+        attributes: Attribute mapping about to be written to graph storage.
+        context: Prefix identifying the object being written.
+
+    Raises:
+        ValueError: On the first unusable attribute name.
+    """
+    for key in attributes:
+        if not isinstance(key, str) or not key:
+            raise ValueError(
+                f"{context}: invalid attribute name {key!r}: must be a non-empty string"
+            )
+        if _GRAPH_ATTRIBUTE_NAME_DISALLOWED_SUBSTRING in key:
+            raise ValueError(
+                f"{context}: invalid attribute name {key!r}: must not contain "
+                f"{_GRAPH_ATTRIBUTE_NAME_DISALLOWED_SUBSTRING!r}, which is read "
+                "as a field path rather than part of the name"
+            )
+        if key.startswith(_GRAPH_ATTRIBUTE_NAME_DISALLOWED_PREFIX):
+            raise ValueError(
+                f"{context}: invalid attribute name {key!r}: must not start with "
+                f"{_GRAPH_ATTRIBUTE_NAME_DISALLOWED_PREFIX!r}, which is read as "
+                "an update operator"
+            )
+
+
+def validate_xml_attributes(attributes: dict[str, Any], *, context: str) -> None:
+    """Reject attribute names or values XML cannot encode.
+
+    For a GraphML-backed store. Names are checked as well as values because
+    GraphML serializes them into the XML ``attr.name`` field, so an unencodable
+    name breaks the same write. See ``xml_attribute_name_rejection`` and
+    ``xml_attribute_value_rejection`` for why both rules are narrower than the
+    portable contract.
+
+    Args:
+        attributes: Attribute mapping about to be written to graph storage.
+        context: Prefix identifying the object being written.
+
+    Raises:
+        ValueError: On the first name or value XML cannot carry.
+    """
+    for key, value in attributes.items():
+        rejection = xml_attribute_name_rejection(key)
+        if rejection is not None:
+            raise ValueError(f"{context}: attribute name {key!r} {rejection}")
+        rejection = xml_attribute_value_rejection(value)
+        if rejection is not None:
+            raise ValueError(f"{context}: attribute {key!r} {rejection}")
+
+
+def validate_graph_attribute_values(
+    attributes: dict[str, Any], *, context: str
+) -> None:
+    """Reject attribute values no graph backend can store.
+
+    See ``graph_attribute_value_rejection`` for the rules and
+    ``validate_interpreted_attribute_names`` for why the halves are separate.
+
+    Args:
+        attributes: Attribute mapping about to be written to graph storage.
+        context: Prefix identifying the object being written.
+
+    Raises:
+        ValueError: On the first unstorable value.
+    """
+    for key, value in attributes.items():
+        rejection = graph_attribute_value_rejection(value)
+        if rejection is not None:
+            raise ValueError(f"{context}: attribute {key!r} {rejection}")

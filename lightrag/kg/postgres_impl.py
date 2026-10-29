@@ -53,12 +53,14 @@ from ..exceptions import (
     SourceConflictRepairCASError,
     StorageControlPlaneError,
     StorageRecordNotFoundError,
+    VectorSpaceMismatchError,
 )
 from ..namespace import NameSpace, is_namespace
 from ..utils import (
     logger,
     compute_mdhash_id,
     _cooperative_yield,
+    get_env_value,
     performance_timing_log,
     validate_workspace,
 )
@@ -68,12 +70,9 @@ import pipmaster as pm
 
 if not pm.is_installed("asyncpg"):
     pm.install("asyncpg")
-if not pm.is_installed("pgvector"):
-    pm.install("pgvector")
 
 import asyncpg  # type: ignore
 from asyncpg import Pool  # type: ignore
-from pgvector.asyncpg import register_vector  # type: ignore
 
 from dotenv import load_dotenv
 
@@ -99,6 +98,100 @@ PG_MAX_IDENTIFIER_LENGTH = 63
 DEFAULT_PG_UPSERT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024  # 16 MiB
 DEFAULT_PG_UPSERT_MAX_RECORDS_PER_BATCH = 200
 DEFAULT_PG_DELETE_MAX_RECORDS_PER_BATCH = 1000
+
+# Connection-level failures that are worth retrying rather than reporting. Module-level
+# so that code without a PostgreSQLDB instance in hand -- notably the static
+# configure_age_extension -- can tell "the connection blipped" from "the server answered
+# something we cannot use", and let the former reach _run_with_retry unwrapped.
+TRANSIENT_DB_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    TimeoutError,
+    ConnectionError,
+    OSError,
+    asyncpg.exceptions.InterfaceError,
+    asyncpg.exceptions.TooManyConnectionsError,
+    asyncpg.exceptions.CannotConnectNowError,
+    asyncpg.exceptions.PostgresConnectionError,
+    asyncpg.exceptions.ConnectionDoesNotExistError,
+    asyncpg.exceptions.ConnectionFailureError,
+)
+
+# First Apache AGE version whose graph queries can crash the PostgreSQL backend from
+# PGGraphStorage. Deliberately an upper bound rather than a blocklist of known-bad
+# points: a later AGE release is only safe once someone has verified it, and letting
+# unverified versions through would defeat the check. Raise this only with evidence.
+# See https://github.com/apache/age/issues/2500.
+AGE_FIRST_UNSUPPORTED_VERSION = (1, 8, 0)
+AGE_ALLOW_UNSUPPORTED_ENV = "POSTGRES_AGE_ALLOW_UNSUPPORTED_VERSION"
+
+# Both sources are consulted, because neither alone sees every affected deployment.
+# pg_extension.extversion is the version of the SQL script that was last run against
+# this database, so it does not move when the binaries are swapped underneath it:
+# starting 1.8.0 binaries over a data directory created under 1.7.0 leaves it at
+# '1.7.0' while the 1.8.0 age.so is what actually executes. default_version comes from
+# the on-disk age.control and therefore tracks the binaries.
+#
+# Two independent lookups rather than one join, because the two catalogs do not fail
+# alike. pg_extension is an ordinary catalog table. pg_available_extensions is a view
+# that parses every control file in the sharedir, so one malformed file belonging to an
+# unrelated extension makes the whole view raise -- and that says nothing about AGE, so
+# it must not be able to refuse startup on a server that has no AGE at all. Read apart,
+# each source can be missing or unreadable on its own, and "neither catalog names age"
+# -- the only state where there is genuinely nothing to gate -- means both lookups
+# returned None *and* both actually answered: a lookup that failed is not a lookup that
+# found nothing. default_version is itself NULLABLE, so the available lookup is read with
+# fetchrow rather than fetchval -- a row naming 'age' with a NULL version is an age.control
+# that is on disk, which is the opposite of the absence a bare None would suggest.
+# The asymmetry in how these two are read is load-bearing, not an oversight to tidy up:
+# the installed lookup may use fetchval only because pg_extension.extversion is
+# text NOT NULL, so "no row" and "NULL value" cannot both occur there. Giving the
+# available lookup the same treatment would reopen the bug the paragraph above describes.
+AGE_INSTALLED_SQL = "SELECT extversion FROM pg_extension WHERE extname = 'age'"
+AGE_AVAILABLE_SQL = (
+    "SELECT default_version FROM pg_available_extensions WHERE name = 'age'"
+)
+
+
+# Distinguishes "this source said nothing" from "this source said something we cannot
+# read". Both used to collapse to None, which let an unreadable source be ignored while
+# its sibling decided alone -- exactly the in-place-upgrade hole the second source exists
+# to close. A named type rather than a bare object() so that the return annotation below
+# stays narrower than `object`, and a type checker can still catch a caller that treats
+# the sentinel as a version.
+class _AgeVersionUnparseable:
+    """Singleton marker: the source is present but not a version we understand."""
+
+
+_AGE_VERSION_UNPARSEABLE = _AgeVersionUnparseable()
+
+# Exactly three ASCII numeric components. Signs, PEP-515 underscores and non-ASCII
+# digits are all accepted by int() but are not things AGE reports, and short forms are
+# deliberately no longer padded to three: a value we had to repair before comparing it
+# is not a value we read, and per AGE_FIRST_UNSUPPORTED_VERSION anything we have not
+# verified must not reach the safe side of the comparison.
+_AGE_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+
+
+def _parse_age_version(
+    raw: Any,
+) -> tuple[int, int, int] | _AgeVersionUnparseable | None:
+    """Parse an Apache AGE version string into a comparable tuple.
+
+    Returns None only if the source is absent (``raw is None``), so that a source this
+    deployment simply does not have cannot stop the other from deciding. Returns
+    ``_AGE_VERSION_UNPARSEABLE`` if the source is present but is not a version we
+    understand -- including present-but-blank: that is an *unverified* version, not a
+    silent one, and by the policy stated on AGE_FIRST_UNSUPPORTED_VERSION an unverified
+    version must not be let through. An unrecognised value is reported through that
+    return value rather than as an exception; the caller decides.
+    """
+    if raw is None:
+        return None
+    raw_str = str(raw)
+    if not _AGE_VERSION_RE.fullmatch(raw_str):
+        return _AGE_VERSION_UNPARSEABLE
+    major, minor, patch = (int(p) for p in raw_str.split("."))
+    return (major, minor, patch)
 
 
 def _estimate_record_bytes(record: tuple[Any, ...]) -> int:
@@ -231,6 +324,42 @@ def _resolve_pg_batch_limits() -> tuple[int, int, int]:
     return upsert_payload_bytes, upsert_records, delete_records
 
 
+# Transaction-local statement that lets a filtered ANN scan continue past
+# rejected candidates, per vector index type (pgvector >= 0.8). Must stay LOCAL;
+# see docs/design/PgVectorFilteredSearch.md.
+_ITERATIVE_SCAN_SQL: dict[str, str] = {
+    "HNSW": "SET LOCAL hnsw.iterative_scan = strict_order",
+    "HNSW_HALFVEC": "SET LOCAL hnsw.iterative_scan = strict_order",
+    "IVFFLAT": "SET LOCAL ivfflat.iterative_scan = relaxed_order",
+}
+
+_DISTANCE_COLUMN = "_distance"
+
+
+def _with_distance_resort(sql: str, vector_cast: str) -> str:
+    """Wrap an IVFFLAT vector query so its rows come back in distance order.
+
+    Required for ``ivfflat.iterative_scan = relaxed_order``, whose rows are not
+    ordered. The wrapper adds a ``_DISTANCE_COLUMN`` that the caller must remove
+    from every row. Why this form: docs/design/PgVectorFilteredSearch.md.
+    """
+    with_distance, replaced = re.subn(
+        r"\n(\s*)FROM ",
+        lambda m: (
+            f",\n{m.group(1)}content_vector <=> $4::{vector_cast} "
+            f"AS {_DISTANCE_COLUMN}\n{m.group(1)}FROM "
+        ),
+        sql.strip().rstrip(";"),
+        count=1,
+    )
+    if replaced != 1:
+        raise RuntimeError("vector query template has no top-level FROM line")
+    return (
+        f"WITH relaxed AS MATERIALIZED ({with_distance}) "
+        f"SELECT * FROM relaxed ORDER BY {_DISTANCE_COLUMN} + 0"
+    )
+
+
 # All known vector index suffixes, used to drop conflicting indexes when switching types
 _VECTOR_INDEX_SUFFIXES = [
     "hnsw_cosine",
@@ -318,6 +447,12 @@ def _dollar_quote(s: str, tag_prefix: str = "AGE") -> str:
             return f"{wrapper}{s}{wrapper}"
 
 
+# PostgreSQL's `name` type (NAMEDATALEN - 1). Graph and label names are stored
+# as `name`, so anything longer is clipped on the way in and lookups have to
+# clip the value they compare against.
+_PG_NAME_MAX_BYTES = 63
+
+
 class PostgreSQLDB:
     def __init__(self, config: dict[str, Any], **kwargs: Any):
         self.host = config["host"]
@@ -345,6 +480,10 @@ class PostgreSQLDB:
             else str(_ev).lower() in ("true", "1", "yes", "on")
         )  # True for backward compatibility, can be set to False to disable vector features
         self.vector_index_type = config.get("vector_index_type")
+        # None = not probed yet; False = pgvector < 0.8 (no iterative scan GUC).
+        # Probed once by configure_vector_extension, read per connection.
+        self.iterative_scan_supported: bool | None = None
+        self._iterative_scan_warned = False
         self.hnsw_m = config.get("hnsw_m")
         self.hnsw_ef = config.get("hnsw_ef")
         self.ivfflat_lists = config.get("ivfflat_lists")
@@ -364,18 +503,13 @@ class PostgreSQLDB:
         # Guard concurrent pool resets
         self._pool_reconnect_lock = asyncio.Lock()
 
-        self._transient_exceptions = (
-            asyncio.TimeoutError,
-            TimeoutError,
-            ConnectionError,
-            OSError,
-            asyncpg.exceptions.InterfaceError,
-            asyncpg.exceptions.TooManyConnectionsError,
-            asyncpg.exceptions.CannotConnectNowError,
-            asyncpg.exceptions.PostgresConnectionError,
-            asyncpg.exceptions.ConnectionDoesNotExistError,
-            asyncpg.exceptions.ConnectionFailureError,
-        )
+        # AGE graphs this process has already confirmed to exist.  Graph
+        # creation is one-time DDL, not connection session state, so it must
+        # not ride along on every AGE operation.
+        self._ensured_age_graphs: set[str] = set()
+        self._age_graph_ensure_lock = asyncio.Lock()
+
+        self._transient_exceptions = TRANSIENT_DB_EXCEPTIONS
 
         # Connection retry configuration
         self.connection_retry_attempts = config["connection_retry_attempts"]
@@ -532,6 +666,10 @@ class PostgreSQLDB:
             _reset_connection after each pool release.
             """
             if self.enable_vector:
+                if not pm.is_installed("pgvector"):
+                    pm.install("pgvector")
+                from pgvector.asyncpg import register_vector  # type: ignore
+
                 await register_vector(connection)
             if self.enable_vector and self.vector_index_type == "VCHORDRQ":
                 await self.configure_vchordrq(connection)
@@ -829,38 +967,478 @@ class PostgreSQLDB:
                     "or use a different index type (e.g. HNSW with embeddings <= 2000 dimensions)."
                 )
 
+        await self._probe_iterative_scan_support(connection)
+
+    async def _probe_iterative_scan_support(
+        self, connection: asyncpg.Connection
+    ) -> None:
+        """Record whether pgvector has iterative index scans (>= 0.8.0).
+
+        Never fatal. An unreadable version leaves the flag ``None``, and the
+        ``SET LOCAL`` is then still attempted. Why the version, not a failed
+        ``SET``, decides: docs/design/PgVectorFilteredSearch.md.
+        """
+        if getattr(self, "vector_index_type", None) not in _ITERATIVE_SCAN_SQL:
+            return
+        try:
+            row = await connection.fetchrow(
+                "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+            )
+            match = re.match(r"(\d+)\.(\d+)", str(row["extversion"])) if row else None
+        except Exception as exc:  # noqa: BLE001 - never fatal, see docstring
+            logger.debug(f"PostgreSQL, pgvector version probe skipped: {exc}")
+            return
+        if match is None:
+            return
+        supported = (int(match.group(1)), int(match.group(2))) >= (0, 8)
+        self.iterative_scan_supported = supported
+        if not supported:
+            logger.warning(
+                f"PostgreSQL, pgvector {row['extversion']} has no "
+                "iterative index scan (needs >= 0.8.0): a workspace holding a "
+                "minority of the rows in a shared vector table can get no "
+                "dense-search results. Upgrade pgvector."
+            )
+
     @staticmethod
     async def configure_age_extension(connection: asyncpg.Connection) -> None:
-        """Create AGE extension if it doesn't exist for graph operations."""
+        """Refuse AGE versions known to break PGGraphStorage, then create the extension.
+
+        AGE 1.8.0 changed Cypher ``id()`` to return ``graphid``. That breaks
+        ``get_knowledge_graph`` twice over: the labelled branch fails on the
+        ``graphid`` -> ``bigint`` column cast, and the wildcard branch segfaults the
+        backend, taking the whole instance through crash recovery. The wildcard is
+        what the WebUI issues by default, so this is refused at startup rather than
+        left to surface as an instance-wide crash on the first graph request.
+
+        See https://github.com/apache/age/issues/2500.
+        """
+        # Read before the catalog lookup, so that the override also covers a lookup that
+        # itself fails; otherwise that one path would be an unbypassable startup failure.
+        override_set = get_env_value(AGE_ALLOW_UNSUPPORTED_ENV, False, bool)
+
+        # Decide before creating. CREATE EXTENSION writes pg_extension.extversion, and
+        # AGE ships no downgrade script, so creating first would leave every refused
+        # startup with a version the operator cannot lower again -- see the stale-catalog
+        # paragraph below for what that state costs them.
+        installed_raw: Any = None
+        available_raw: Any = None
+        version_known = True
+        # Tracked separately from available_raw for the same reason _parse_age_version has
+        # a sentinel: "the view said nothing" and "the view could not be read" are
+        # different states, and collapsing them into None would let a failed lookup pass
+        # for evidence that AGE is absent.
+        available_unreadable = False
+        # Two states set available_unreadable -- the view raised, or it named 'age' with a
+        # NULL default_version -- and they are the same decision but not the same fact.
+        # Kept apart so the operator-facing text never reports an error that did not
+        # happen. Only read when available_unreadable is True.
+        #
+        # Deliberately initialised to None rather than to either state's wording: a default
+        # that reads as one of the two states would let a future third writer set the flag
+        # without setting these, and the operator would then be told about an error that
+        # did not happen -- the exact failure this pair exists to prevent. With None, every
+        # site that sets the flag must supply the value, so the omission cannot pass
+        # silently.
+        available_unreadable_reason: str | None = None
+        available_unreadable_display: str | None = None
+
+        try:
+            installed_raw = await connection.fetchval(AGE_INSTALLED_SQL)
+        except Exception as e:
+            if isinstance(e, TRANSIENT_DB_EXCEPTIONS):
+                # Checked before the override, because a connection blip is not a
+                # version-determination outcome at all: the server never got to answer.
+                # The override exists to tolerate an unsupported or undeterminable
+                # version, not to turn a blip into a silently skipped safety gate -- with
+                # the opposite order the blip would be swallowed and the retry below
+                # would never happen.
+                #
+                # Propagate it unwrapped so that the _run_with_retry wrapping this call
+                # can recognise and retry it -- wrapping it in RuntimeError would make a
+                # transient startup blip a permanent startup failure.
+                #
+                # A statement or lock timeout (QueryCanceledError) is not in that tuple,
+                # so it refuses instead of retrying. Deliberate: the tuple is what
+                # _run_with_retry uses everywhere else in this file, and this gate is not
+                # the place to redefine cluster-wide retry policy. The override covers the
+                # case, and the catalog read is a cheap unlocked lookup, so a timeout there
+                # means the server is in no state to be answering for the AGE version
+                # anyway.
+                raise
+            if override_set:
+                # Names the consequence rather than deferring to the generic
+                # could-not-determine wording: version_known = False skips the available
+                # lookup entirely, so unlike every other override state the gate ends up
+                # having seen nothing at all, and the CREATE EXTENSION below still runs.
+                # Says nothing about whether 'age' is registered here -- that is precisely
+                # what the failed lookup did not establish.
+                logger.warning(
+                    f"PostgreSQL, could not determine the Apache AGE version ({e}), but "
+                    f"{AGE_ALLOW_UNSUPPORTED_ENV} is set, so PGGraphStorage is starting "
+                    "anyway. The available-version lookup is skipped in this state, so "
+                    "nothing has inspected the Apache AGE that CREATE EXTENSION may be "
+                    "about to install. If that AGE is 1.8.0 or newer, a single "
+                    "get_knowledge_graph request may take the whole PostgreSQL instance "
+                    "through crash recovery."
+                )
+                version_known = False
+            else:
+                raise RuntimeError(
+                    f"Could not determine the Apache AGE version ({e}). PGGraphStorage "
+                    "needs it in order to reject versions that crash the PostgreSQL backend "
+                    "(https://github.com/apache/age/issues/2500). Set "
+                    f"{AGE_ALLOW_UNSUPPORTED_ENV}=true to start anyway, at your own risk."
+                ) from e
+
+        if version_known:
+            try:
+                # fetchrow, not fetchval: default_version is NULLABLE, so fetchval returns
+                # None both for "no row" and for "a row whose value is NULL". Those are
+                # opposite facts -- 'age' absent from the extension path, versus an
+                # age.control that is on disk (so age.so may be too) but names no version
+                # -- and collapsing them lets a present-but-unversioned AGE read as absent.
+                available_row = await connection.fetchrow(AGE_AVAILABLE_SQL)
+            except Exception as e:
+                if isinstance(e, TRANSIENT_DB_EXCEPTIONS):
+                    raise
+                # Anything else here is the sharedir view failing over a control file that
+                # need not be AGE's, which is no evidence about AGE either way -- but it
+                # is also no evidence that AGE is absent, and pg_extension cannot stand in
+                # for it because extversion does not move when the binaries are swapped.
+                # The flag below therefore does two things: it keeps this from being read
+                # as "AGE is absent", and it makes the version undeterminable rather than
+                # letting pg_extension decide alone.
+                logger.warning(
+                    "PostgreSQL, could not read the available Apache AGE version from "
+                    f"pg_available_extensions ({e}); the version cannot be confirmed from "
+                    "pg_extension alone, because it does not track the loaded binaries."
+                )
+                available_unreadable = True
+                available_unreadable_reason = (
+                    "pg_available_extensions could not be read"
+                )
+                available_unreadable_display = "<lookup failed>"
+            else:
+                if available_row is None:
+                    # No control file for 'age' anywhere on the extension path, so the
+                    # view genuinely has nothing to say: AGE is absent.
+                    available_raw = None
+                elif available_row["default_version"] is None:
+                    # age.control is on disk -- so age.so may well be too -- but the file
+                    # names no version. Present-and-unreadable, not absent: pg_extension
+                    # must not decide alone, because extversion cannot see a binary swap.
+                    available_unreadable = True
+                    available_unreadable_reason = "pg_available_extensions names 'age' but reports no version for it"
+                    available_unreadable_display = "<no version reported>"
+                else:
+                    available_raw = available_row["default_version"]
+
+        if installed_raw is None and available_unreadable:
+            # Not the nothing-to-gate state below: 'age' is merely absent from
+            # pg_extension, and the one source that could have reported an AGE sitting on
+            # disk gave no usable answer. Falling through would CREATE EXTENSION -- and
+            # register whatever version is there -- without the gate ever having seen it,
+            # which is precisely the crash this function exists to prevent.
+            if not override_set:
+                # Refusing outright would be wrong too: nothing here is evidence of an
+                # unsupported version. So neither create nor refuse; leave the database as
+                # it was found.
+                logger.warning(
+                    "PostgreSQL, the Apache AGE version could not be determined because "
+                    f"{available_unreadable_reason}, and 'age' is not registered "
+                    "in this database. Skipping CREATE EXTENSION so that the gate does not "
+                    "install an AGE version it never checked. Set "
+                    f"{AGE_ALLOW_UNSUPPORTED_ENV}=true to create it anyway, at your own risk."
+                )
+                return
+            # Named separately from the generic could-not-determine warning below, because
+            # the consequence is not the generic one: everywhere else the override starts a
+            # deployment against an AGE that is already there, while here CREATE EXTENSION
+            # is about to install one that nothing has looked at.
+            logger.warning(
+                "PostgreSQL, 'age' is not registered in this database and "
+                f"{available_unreadable_reason}, so the version of any Apache AGE on disk "
+                f"is unknown, but {AGE_ALLOW_UNSUPPORTED_ENV} is set, so CREATE EXTENSION "
+                "is installing it without the gate having seen it. If that AGE is 1.8.0 or "
+                "newer, a single get_knowledge_graph request may take the whole PostgreSQL "
+                "instance through crash recovery."
+            )
+            # This warning has already named the consequence for this state, so suppress
+            # the generic one: the branches below are all guarded on version_known.
+            version_known = False
+
+        if (
+            version_known
+            and installed_raw is None
+            and available_raw is None
+            and not available_unreadable
+        ):
+            # Neither catalog names 'age': the extension is not on disk and not registered
+            # in this database, so no ag_catalog functions exist to call, no age.so gets
+            # loaded, and there is nothing to gate.
+            # Logged at INFO, not DEBUG: this is the one state in which the gate proceeds
+            # without having checked anything, so it must be visible at the default level.
+            logger.info(
+                "PostgreSQL, no Apache AGE version check was performed: neither "
+                "pg_available_extensions nor pg_extension names 'age', so AGE is not "
+                "installed on this server and there is nothing to gate"
+            )
+        elif version_known:
+            # Rendered distinctly from `available=None`: an operator reading this needs to
+            # see that no version came back, not that the view answered "absent" -- and
+            # which of the two it was, since a lookup that raised and a control file that
+            # names no version call for different things to go and look at.
+            available_found = (
+                available_unreadable_display
+                if available_unreadable
+                else repr(available_raw)
+            )
+            found = f"installed={installed_raw!r} available={available_found}"
+            installed_parsed = _parse_age_version(installed_raw)
+            # A source that gave no usable answer -- the lookup raised, or the row named no
+            # version -- is not a source that said nothing, so it gets the same sentinel as
+            # a value we could not parse. pg_available_extensions is
+            # the source that tracks the binaries; pg_extension.extversion cannot see a
+            # binary swap, so letting it decide alone here would start a deployment whose
+            # loaded age.so was never checked. Fail closed instead -- the override still
+            # covers this state, as it does every other refusal.
+            available_parsed = (
+                _AGE_VERSION_UNPARSEABLE
+                if available_unreadable
+                else _parse_age_version(available_raw)
+            )
+            candidates = (installed_parsed, available_parsed)
+            parsed = [c for c in candidates if isinstance(c, tuple)]
+
+            # The higher of the two decides: a stale catalog must not mask newer binaries.
+            # An unreadable sibling source cannot make the situation safer, so a version we
+            # can read and know to be unsupported is reported as such before anything else.
+            if parsed and max(parsed) >= AGE_FIRST_UNSUPPORTED_VERSION:
+                raw_version = ".".join(str(p) for p in max(parsed))
+                unsupported = ".".join(str(p) for p in AGE_FIRST_UNSUPPORTED_VERSION)
+                if override_set:
+                    logger.warning(
+                        f"PostgreSQL, Apache AGE {raw_version} ({found}) is known to break "
+                        f"PGGraphStorage's graph queries, but {AGE_ALLOW_UNSUPPORTED_ENV} is set, "
+                        "so the check is being skipped. A single graph request may take the whole "
+                        "PostgreSQL instance through crash recovery."
+                    )
+                else:
+                    message = (
+                        f"Apache AGE {raw_version} is not supported by PGGraphStorage ({found}): from "
+                        f"{unsupported} onward, get_knowledge_graph fails, and a graph query can terminate "
+                        "the PostgreSQL backend with SIGSEGV and take the whole instance through crash "
+                        "recovery (https://github.com/apache/age/issues/2500). Verified good: AGE 1.7.0. "
+                    )
+                    if (
+                        isinstance(installed_parsed, tuple)
+                        and installed_parsed >= AGE_FIRST_UNSUPPORTED_VERSION
+                        and isinstance(available_parsed, tuple)
+                        and available_parsed < AGE_FIRST_UNSUPPORTED_VERSION
+                    ):
+                        # The generic remedies are assembled only in the other cells,
+                        # because neither one applies here: pinning is what produced this
+                        # state, and the override would start a deployment whose graph
+                        # reads all fail. Offering them and then withdrawing them, as the
+                        # text used to, reads as a contradiction to the operator.
+                        message += (
+                            "Here pg_extension records the newer AGE script while age.control "
+                            "reports the older one, so the older library is what loads: AGE is "
+                            "then non-functional rather than crash-prone. Writes still go through "
+                            "-- CREATE ... RETURN n succeeds -- but every MATCH fails with 'ag "
+                            "function does not exist' because the newer script declares functions "
+                            "the older library does not export, so nothing can be read back. "
+                            "ALTER EXTENSION age UPDATE cannot repair this -- AGE ships no "
+                            "downgrade script, so extversion cannot be lowered, and "
+                            f"{AGE_ALLOW_UNSUPPORTED_ENV}=true only starts a deployment in that "
+                            "same read-broken state. The ways out are to restore the newer "
+                            "binaries, which PGGraphStorage will then refuse as unsupported, to "
+                            "DROP EXTENSION age CASCADE and recreate the graph, or to switch "
+                            "LIGHTRAG_GRAPH_STORAGE to PGTableGraphStorage, which needs no "
+                            "PostgreSQL extension."
+                        )
+                    else:
+                        message += (
+                            "Pin AGE to a verified version, or switch LIGHTRAG_GRAPH_STORAGE to "
+                            "PGTableGraphStorage, which needs no PostgreSQL extension. If installed and "
+                            "available differ above, the binaries were swapped under an existing data "
+                            "directory without ALTER EXTENSION age UPDATE; the loaded binaries are what runs. "
+                            "AGE also reports its version per release rather than per commit, so a build that "
+                            f"fixes the crash may still report {raw_version}; set "
+                            f"{AGE_ALLOW_UNSUPPORTED_ENV}=true to run against such a build at your own risk."
+                        )
+                    raise RuntimeError(message)
+
+            # Either nothing parsed, or one source is present but unreadable. An unverified
+            # version is not a safe one, so fail closed even when the sibling looks fine.
+            elif any(c is _AGE_VERSION_UNPARSEABLE for c in candidates) or not parsed:
+                if override_set:
+                    logger.warning(
+                        f"PostgreSQL, could not determine the Apache AGE version ({found}), "
+                        f"but {AGE_ALLOW_UNSUPPORTED_ENV} is set, so PGGraphStorage is "
+                        "starting anyway."
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Could not determine the Apache AGE version ({found}). PGGraphStorage "
+                        "needs it in order to reject versions that crash the PostgreSQL backend "
+                        "(https://github.com/apache/age/issues/2500). Set "
+                        f"{AGE_ALLOW_UNSUPPORTED_ENV}=true to start anyway, at your own risk."
+                    )
+
         try:
             await connection.execute("CREATE EXTENSION IF NOT EXISTS AGE CASCADE")  # type: ignore
             logger.info("PostgreSQL, AGE extension enabled")
         except Exception as e:
+            # Non-fatal, as before: the system may run without AGE. On a server that has
+            # never had it this is where the pre-existing 'extension "age" is not
+            # available' lands, which is why the no-AGE path above falls through to here
+            # rather than returning.
             logger.warning(f"Could not create AGE extension: {e}")
-            # Don't raise - let the system continue without AGE extension
 
-    @staticmethod
-    async def configure_age(connection: asyncpg.Connection, graph_name: str) -> None:
-        """Set the Apache AGE environment and creates a graph if it does not exist.
+    async def configure_age(
+        self, connection: asyncpg.Connection, graph_name: str
+    ) -> None:
+        """Prepare a pooled connection for Apache AGE access.
 
-        This method:
-        - Sets the PostgreSQL `search_path` to include `ag_catalog`, ensuring that Apache AGE functions can be used without specifying the schema.
-        - Attempts to create a new graph with the provided `graph_name` if it does not already exist.
-        - Silently ignores errors related to the graph already existing.
+        Two very different things are needed before an AGE statement can run,
+        and they have very different lifetimes:
 
+        - ``SET search_path`` is genuine session state.  ``_reset_connection``
+          deliberately runs ``RESET ALL`` on every pool release so an AGE
+          search_path never leaks into a non-AGE checkout, which means it has
+          to be re-applied on every checkout.
+        - The graph itself is one-time DDL.  Creating it here unconditionally
+          made PostgreSQL log an ERROR/STATEMENT pair for *every* graph read
+          and write, because the server writes its log entry before the client
+          ever sees the error and can swallow it.  Graph
+          existence is now handled by :meth:`_ensure_age_graph`, which reaches
+          the database at most once per process.
         """
-        try:
-            await connection.execute(  # type: ignore
-                'SET search_path = ag_catalog, "$user", public'
+        await connection.execute(  # type: ignore
+            'SET search_path = ag_catalog, "$user", public'
+        )
+        await self._ensure_age_graph(connection, graph_name)
+
+    async def _ensure_age_graph(
+        self, connection: asyncpg.Connection, graph_name: str
+    ) -> None:
+        """Create the AGE graph if it does not exist, at most once per process.
+
+        Steady state is a set membership test and no SQL at all.  On a miss the
+        graph is looked up in ``ag_catalog.ag_graph`` and ``create_graph()`` is
+        only issued when it is genuinely absent, so a running server stops
+        producing "graph already exists" errors entirely.
+
+        Apache AGE takes no lock before its own existence check (see
+        ``create_graph_internal`` upstream), so concurrent first-time creation
+        can still race past the lookup.  Both known outcomes are tolerated:
+
+        - ``InvalidSchemaNameError`` (3F000) — AGE reports "graph already
+          exists" with ``ERRCODE_UNDEFINED_SCHEMA``.
+        - ``UniqueViolationError`` (23505) — the loser of the ``ag_graph``
+          name index race.
+
+        The graph is recorded as ensured only once it is known to exist.  A
+        transient failure must leave the cache untouched, otherwise a graph
+        that was never created would be assumed present for the lifetime of
+        the process and every later operation would fail with 3F000.
+        """
+        if graph_name in self._ensured_age_graphs:
+            return
+
+        async with self._age_graph_ensure_lock:
+            # A concurrent task may have ensured the graph while we waited.
+            if graph_name in self._ensured_age_graphs:
+                return
+
+            # The parameter has to be truncated the same way the stored value
+            # was.  PostgreSQL's `name` type holds 63 bytes, and create_graph()
+            # below passes the name as a literal, which PostgreSQL silently
+            # clips -- so a workspace long enough to overflow is stored clipped
+            # and would never match an untruncated comparison.  Casting the
+            # bind parameter straight to `name` is not an option: for a
+            # parameter (unlike a literal) PostgreSQL raises 42622
+            # "identifier too long" instead of clipping.  left() is safe
+            # because _get_workspace_graph_name() reduces the name to
+            # [A-Za-z0-9_], where one character is one byte.
+            exists = await connection.fetchval(  # type: ignore
+                "SELECT 1 FROM ag_catalog.ag_graph "
+                f"WHERE name = left($1, {_PG_NAME_MAX_BYTES})::name",
+                graph_name,
             )
-            await connection.execute(  # type: ignore
-                f"select create_graph('{graph_name}')"
-            )
-        except (
-            asyncpg.exceptions.InvalidSchemaNameError,
-            asyncpg.exceptions.UniqueViolationError,
-        ):
-            pass
+            if exists is None:
+                try:
+                    await connection.execute(  # type: ignore
+                        f"select create_graph('{graph_name}')"
+                    )
+                    logger.info(f"PostgreSQL, AGE graph created: {graph_name}")
+                except (
+                    asyncpg.exceptions.InvalidSchemaNameError,
+                    asyncpg.exceptions.UniqueViolationError,
+                ) as e:
+                    # Lost the creation race: the graph exists now, which is
+                    # all this method promises.
+                    logger.debug(
+                        "PostgreSQL, AGE graph %s concurrently created elsewhere: %r",
+                        graph_name,
+                        e,
+                    )
+
+            self._ensured_age_graphs.add(graph_name)
+
+    def iterative_scan_statement(self) -> str | None:
+        """Return the ``SET LOCAL`` that lets a filtered ANN scan keep going.
+
+        ``None`` means nothing to apply: an index type this does not cover
+        (VCHORDRQ), or pgvector < 0.8.
+
+        Rules:
+
+        * Apply it only through ``_fetch_with_iterative_scan``, in the query's
+          own transaction. Never as a session ``SET`` and never after a
+          ``LOAD 'vector'``.
+        * IVFFLAT yields ``relaxed_order`` rows: its query must go through
+          ``_with_distance_resort``.
+        * This is a mitigation, not a guarantee; the scan stays bounded.
+
+        Mechanism, measurements and residual cases:
+        docs/design/PgVectorFilteredSearch.md.
+        """
+        if getattr(self, "iterative_scan_supported", None) is False:
+            return None  # reported once at startup by the version probe
+        return _ITERATIVE_SCAN_SQL.get(getattr(self, "vector_index_type", None))
+
+    async def _fetch_with_iterative_scan(
+        self, connection: asyncpg.Connection, sql: str, params: tuple
+    ) -> list:
+        """Fetch ``sql`` in a transaction that first applies the scan setting.
+
+        Best-effort: a failing ``SET LOCAL`` (aborting only its own
+        transaction) is logged once and the query runs without it, as it did
+        before. A failure of the query itself is re-raised: this helper adds
+        no fallback and no retry of its own, so only the caller's normal
+        transient-error retry (``_run_with_retry``) can run it again.
+        """
+        statement = self.iterative_scan_statement()
+        if statement is not None:
+            applied = False
+            try:
+                async with connection.transaction():
+                    await connection.execute(statement)
+                    applied = True
+                    return await connection.fetch(sql, *params)
+            except Exception as exc:  # noqa: BLE001 - see docstring
+                if applied:
+                    raise
+                if not getattr(self, "_iterative_scan_warned", False):
+                    self._iterative_scan_warned = True
+                    logger.warning(
+                        f"PostgreSQL, iterative scan not applied ({exc}); "
+                        "filtered vector search may return fewer rows than exist"
+                    )
+        return await connection.fetch(sql, *params)
 
     async def configure_vchordrq(self, connection: asyncpg.Connection) -> None:
         """Configure VCHORDRQ extension for vector similarity search.
@@ -2270,11 +2848,16 @@ class PostgreSQLDB:
         with_age: bool = False,
         graph_name: str | None = None,
         timing_label: str | None = None,
+        iterative_scan: bool = False,
     ) -> dict[str, Any] | None | list[dict[str, Any]]:
         async def _operation(connection: asyncpg.Connection) -> Any:
             prepared_params = tuple(params) if params else ()
             fetch_start = time.perf_counter()
-            if prepared_params:
+            if iterative_scan:
+                rows = await self._fetch_with_iterative_scan(
+                    connection, sql, prepared_params
+                )
+            elif prepared_params:
                 rows = await connection.fetch(sql, *prepared_params)
             else:
                 rows = await connection.fetch(sql)
@@ -2482,10 +3065,20 @@ class ClientManager:
                 config.get("postgres", "ssl_crl", fallback=None),
             ),
             # Vector configuration: derived from the vector storage backend in use.
-            # PGVectorStorage requires pgvector; all other backends do not.
-            "enable_vector": vector_storage == "PGVectorStorage"
-            if vector_storage is not None
-            else True,
+            # PGVectorStorage requires pgvector; all other backends — and an
+            # unspecified one — do not.
+            #
+            # There is deliberately NO `None -> True` special case. That was the
+            # last surviving default of the removed POSTGRES_ENABLE_VECTOR env var
+            # (which defaulted to "true"), and it meant "I don't know which vector
+            # backend is in use" was answered with the most demanding option:
+            # require an extension nobody asked for. It cost two workarounds
+            # elsewhere in the tree — PGTableGraphStorage had to pass a sentinel
+            # backend name to avoid demanding pgvector on stock PostgreSQL, and
+            # tools/rebuild_vdb.py had to populate vector_storage defensively — so
+            # an unspecified backend now means no pgvector. A storage that does
+            # need it says so itself: see PGVectorStorage.initialize.
+            "enable_vector": vector_storage == "PGVectorStorage",
             "vector_index_type": os.environ.get(
                 "POSTGRES_VECTOR_INDEX_TYPE",
                 config.get("postgres", "vector_index_type", fallback="HNSW"),
@@ -3333,27 +3926,27 @@ class PGKVStorage(BaseKVStorage):
 
         delete_sql = f"DELETE FROM {table_name} WHERE workspace=$1 AND id = ANY($2)"
 
-        # Chunk the id list so each statement's ANY($2) array stays bounded
-        # (a non-positive cap disables chunking). All chunks run in ONE
-        # transaction so a mid-delete failure rolls every chunk back, preserving
+        # Batch the id list so each statement's ANY($2) array stays bounded
+        # (a non-positive cap disables batching). All batches run in ONE
+        # transaction so a mid-delete failure rolls every batch back, preserving
         # the original single-statement all-or-nothing behaviour; _run_with_retry
         # re-runs the whole closure on transient errors (DELETE is idempotent).
-        chunk = (
+        delete_batch_size = (
             self._max_delete_records_per_batch
             if self._max_delete_records_per_batch > 0
             else len(ids)
         )
-        if len(ids) > chunk:
+        if len(ids) > delete_batch_size:
             logger.info(
                 f"[{self.workspace}] {self.namespace} delete: {len(ids)} ids "
-                f"split into chunks (chunk={chunk})"
+                f"split into batches (batch_size={delete_batch_size})"
             )
 
         async def _batch_delete(connection: asyncpg.Connection) -> None:
             async with connection.transaction():
-                for i in range(0, len(ids), chunk):
+                for i in range(0, len(ids), delete_batch_size):
                     await connection.execute(
-                        delete_sql, self.workspace, ids[i : i + chunk]
+                        delete_sql, self.workspace, ids[i : i + delete_batch_size]
                     )
 
         try:
@@ -3675,6 +4268,24 @@ class PGVectorStorage(BaseVectorStorage):
         if not workspace:
             raise ValueError("workspace must be provided")
 
+        if embedding_dim is None:
+            # A dimension nobody declared is not an embedding-space change.
+            # `legacy_dim != None` in the compatibility check below would
+            # otherwise raise the typed refusal, and `lightrag-rebuild-vdb`
+            # answers that by DROPPING the container: this workspace's legacy
+            # rows would be deleted over a fact nobody reported, and the
+            # follow-up initialize() would then die on `VECTOR(None)` DDL, so
+            # the rebuild never happens either. Raised here rather than at the
+            # comparison because that check sits inside a `try` whose
+            # `except Exception` reframes everything it catches as
+            # DataMigrationError; out here it stays a plain, non-droppable
+            # schema error on every path through this function. See "Absent
+            # evidence never refuses" in docs/design/VectorSpaceProvenance.md.
+            raise ValueError(
+                f"embedding_dim must be provided to create or migrate "
+                f"'{table_name}': the configured embedding function declares none."
+            )
+
         new_table_exists = await db.check_table_exists(table_name)
         legacy_exists = legacy_table_name and await db.check_table_exists(
             legacy_table_name
@@ -3744,19 +4355,40 @@ class PGVectorStorage(BaseVectorStorage):
                                 vector_list = json.loads(vector_data)
                                 legacy_dim = len(vector_list)
 
+                        # Only the STORED side needs a presence check here:
+                        # `embedding_dim` is non-None by the guard at the top of
+                        # this function, so an undeclared dimension can never
+                        # reach the typed refusal below.
                         if legacy_dim and legacy_dim != embedding_dim:
                             logger.error(
                                 f"PostgreSQL: Dimension mismatch detected! "
                                 f"Legacy table '{legacy_table_name}' has {legacy_dim}d vectors, "
                                 f"but new embedding model expects {embedding_dim}d."
                             )
-                            raise DataMigrationError(
-                                f"Dimension mismatch between legacy table '{legacy_table_name}' "
-                                f"and new embedding model. Expected {embedding_dim}d but got {legacy_dim}d."
+                            # Typed refusal, not DataMigrationError: nothing is
+                            # being migrated, and `lightrag-rebuild-vdb` recovers
+                            # from exactly this condition by dropping the
+                            # container and rebuilding it from the graph. It can
+                            # only do that if the refusal is distinguishable from
+                            # a database outage. See
+                            # docs/design/VectorSpaceProvenance.md.
+                            raise VectorSpaceMismatchError(
+                                backend="PGVectorStorage",
+                                container=legacy_table_name,
+                                expected_dim=embedding_dim,
+                                stored_dim=legacy_dim,
+                                detail=(
+                                    f"Its {legacy_count} row(s) for workspace "
+                                    f"'{workspace}' would otherwise be migrated "
+                                    f"into '{table_name}'."
+                                ),
                             )
 
-                    except DataMigrationError:
-                        # Re-raise DataMigrationError as-is to preserve specific error messages
+                    except (DataMigrationError, VectorSpaceMismatchError):
+                        # Re-raise as-is to preserve specific error messages --
+                        # and, for the refusal, its type: reframing it as a
+                        # migration failure below would hide it from the only
+                        # tool that can clear it.
                         raise
                     except Exception as e:
                         raise DataMigrationError(
@@ -3885,8 +4517,23 @@ class PGVectorStorage(BaseVectorStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
+                # Declare this class's OWN requirement rather than asking
+                # global_config what the vector backend is. This storage IS the
+                # pgvector backend, so it always needs the extension and the
+                # asyncpg codec — even when constructed directly with a
+                # global_config that never named a vector backend. Reading the
+                # ambient value would resolve to None there and, since an
+                # unspecified backend no longer implies pgvector (see get_config),
+                # hand back a pool with no vector codec that only fails later.
+                #
+                # In every LightRAG-driven path the two are identical: this class
+                # is only instantiated because global_config["vector_storage"] is
+                # "PGVectorStorage". A caller that hand-builds this storage
+                # alongside another PG storage under a bare global_config now gets
+                # an explicit signature-mismatch RuntimeError instead, which is the
+                # correct answer for a config that never said it wanted pgvector.
                 self.db = await ClientManager.get_client(
-                    vector_storage=self.global_config.get("vector_storage")
+                    vector_storage="PGVectorStorage"
                 )
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
@@ -3903,6 +4550,19 @@ class PGVectorStorage(BaseVectorStorage):
                 # Use "default" for compatibility (lowest priority)
                 self.workspace = "default"
 
+            # Taken here, before anything that can refuse. setup_table() raises
+            # VectorSpaceMismatchError when the legacy table holds another
+            # embedding space, and a refused storage MUST still be able to serve
+            # drop(), which is how `lightrag-rebuild-vdb` clears that refusal.
+            # Assigning the lock after setup_table left it at None on the
+            # refusal path, so drop() then died on `async with None`. The
+            # workspace is final by this point, which is why this cannot move
+            # any earlier. See docs/design/VectorSpaceProvenance.md.
+            if self._flush_lock is None:
+                self._flush_lock = get_namespace_lock(
+                    self.namespace, workspace=self.workspace
+                )
+
             # Setup table (create if not exists and handle migration)
             await PGVectorStorage.setup_table(
                 self.db,
@@ -3911,11 +4571,6 @@ class PGVectorStorage(BaseVectorStorage):
                 embedding_dim=self.embedding_func.embedding_dim,
                 legacy_table_name=self.legacy_table_name,
                 base_table=self.legacy_table_name,  # base_table for DDL template lookup
-            )
-
-        if self._flush_lock is None:
-            self._flush_lock = get_namespace_lock(
-                self.namespace, workspace=self.workspace
             )
 
     async def finalize(self):
@@ -4304,15 +4959,15 @@ class PGVectorStorage(BaseVectorStorage):
             # (<= 0) and no pending deletes, the fallback would be 0 and the
             # range() step below would raise even though there is nothing to
             # delete. The empty-list loop then simply no-ops.
-            delete_chunk = (
+            delete_batch_size = (
                 self._max_delete_records_per_batch
                 if self._max_delete_records_per_batch > 0
                 else len(pending_delete_ids) or 1
             )
-            if pending_delete_ids and len(pending_delete_ids) > delete_chunk:
+            if pending_delete_ids and len(pending_delete_ids) > delete_batch_size:
                 logger.info(
                     f"{log_prefix} delete {len(pending_delete_ids)} ids split "
-                    f"into chunks (chunk={delete_chunk})"
+                    f"into batches (batch_size={delete_batch_size})"
                 )
             delete_sql = (
                 f"DELETE FROM {self.table_name} WHERE workspace=$1 AND id = ANY($2)"
@@ -4355,8 +5010,8 @@ class PGVectorStorage(BaseVectorStorage):
                         _flush_upsert, timing_label=timing_label
                     )
 
-                for i in range(0, len(pending_delete_ids), delete_chunk):
-                    id_slice = pending_delete_ids[i : i + delete_chunk]
+                for i in range(0, len(pending_delete_ids), delete_batch_size):
+                    id_slice = pending_delete_ids[i : i + delete_batch_size]
 
                     async def _flush_delete(
                         connection: asyncpg.Connection,
@@ -4411,13 +5066,28 @@ class PGVectorStorage(BaseVectorStorage):
         sql = SQL_TEMPLATES[self.namespace].format(
             table_name=self.table_name, vector_cast=vector_cast
         )
+        # IVFFLAT iterative scan is relaxed_order only: restore distance order.
+        resort = (
+            getattr(self.db, "vector_index_type", None) == "IVFFLAT"
+            and getattr(self.db, "iterative_scan_supported", None) is not False
+        )
+        if resort:
+            sql = _with_distance_resort(sql, vector_cast)
         params = {
             "workspace": self.workspace,
             "closer_than_threshold": 1 - self.cosine_better_than_threshold,
             "top_k": top_k,
             "embedding": embedding,
         }
-        results = await self.db.query(sql, params=list(params.values()), multirows=True)
+        results = await self.db.query(
+            sql,
+            params=list(params.values()),
+            multirows=True,
+            iterative_scan=True,
+        )
+        if resort and results:
+            for row in results:
+                row.pop(_DISTANCE_COLUMN, None)
         return results
 
     async def index_done_callback(self) -> None:
@@ -4859,6 +5529,11 @@ class PGVectorStorage(BaseVectorStorage):
         workspaces' legacy data and their pending one-time migration stay
         intact.
 
+        Callable on an instance whose ``initialize()`` refused with
+        ``VectorSpaceMismatchError``: that is the recovery
+        `lightrag-rebuild-vdb` performs, and it converges because the
+        legacy cleanup above removes the very rows the refusal was about.
+
         Concurrency contract:
             ``_flush_lock`` guards same-process flush / upsert / delete
             races only. Cross-worker buffered writes are NOT covered —
@@ -4885,10 +5560,17 @@ class PGVectorStorage(BaseVectorStorage):
             async with self._flush_lock:
                 self._pending_vector_docs.clear()
                 self._pending_vector_deletes.clear()
-                drop_sql = SQL_TEMPLATES["drop_specifiy_table_workspace"].format(
-                    table_name=self.table_name
-                )
-                await self.db.execute(drop_sql, {"workspace": self.workspace})
+                # The suffixed table may legitimately not exist: an
+                # initialize() that refused with VectorSpaceMismatchError raised
+                # BEFORE creating it, and that refusal is exactly what
+                # `lightrag-rebuild-vdb` calls this method to clear. Nothing to
+                # delete there is success, not an error -- the legacy cleanup
+                # below is the part that actually clears the refusal.
+                if await self.db.check_table_exists(self.table_name):
+                    drop_sql = SQL_TEMPLATES["drop_specifiy_table_workspace"].format(
+                        table_name=self.table_name
+                    )
+                    await self.db.execute(drop_sql, {"workspace": self.workspace})
 
                 # Also clear this workspace's rows from the kept legacy table so
                 # the next startup does not re-migrate the just-cleared data
@@ -5997,61 +6679,6 @@ class PGDocStatusStorage(DocStatusStorage):
             counts[doc["status"]] = doc["count"]
         return counts
 
-    async def get_docs_by_status(
-        self, status: DocStatus
-    ) -> dict[str, DocProcessingStatus]:
-        """all documents with a specific status"""
-        sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and status=$2"
-        params = {"workspace": self.workspace, "status": status.value}
-        result = await self.db.query(sql, list(params.values()), True)
-
-        docs_by_status = {}
-        for element in result:
-            # Parse chunks_list JSON string back to list
-            chunks_list = element.get("chunks_list", [])
-            if isinstance(chunks_list, str):
-                try:
-                    chunks_list = json.loads(chunks_list)
-                except json.JSONDecodeError:
-                    chunks_list = []
-
-            # Parse metadata JSON string back to dict
-            metadata = element.get("metadata", {})
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except json.JSONDecodeError:
-                    metadata = {}
-            # Ensure metadata is a dict
-            if not isinstance(metadata, dict):
-                metadata = {}
-
-            # Safe handling for file_path
-            file_path = element.get("file_path")
-            if file_path is None:
-                file_path = "no-file-path"
-
-            # Convert datetime objects to ISO format strings with timezone info
-            created_at = self._format_datetime_with_timezone(element["created_at"])
-            updated_at = self._format_datetime_with_timezone(element["updated_at"])
-
-            docs_by_status[element["id"]] = DocProcessingStatus(
-                content_summary=element["content_summary"],
-                content_length=element["content_length"],
-                status=element["status"],
-                created_at=created_at,
-                updated_at=updated_at,
-                chunks_count=element["chunks_count"],
-                file_path=file_path,
-                chunks_list=chunks_list,
-                metadata=metadata,
-                error_msg=element.get("error_msg"),
-                track_id=element.get("track_id"),
-                content_hash=element.get("content_hash"),
-            )
-
-        return docs_by_status
-
     def _pg_doc_processing_status_from_row(
         self, element: dict[str, Any]
     ) -> DocProcessingStatus:
@@ -6101,7 +6728,7 @@ class PGDocStatusStorage(DocStatusStorage):
     ) -> dict[str, DocProcessingStatus]:
         """Fetch documents matching any of the given statuses in a single query.
 
-        Replaces multiple sequential/parallel get_docs_by_status() calls when the
+        Replaces multiple sequential/parallel per-status reads when the
         caller needs documents across several statuses (e.g. PROCESSING + FAILED + PENDING).
         Uses a single ANY($2) query instead of N separate round-trips.  Query
         errors always propagate; ``strict=True`` additionally raises on any row
@@ -6144,49 +6771,23 @@ class PGDocStatusStorage(DocStatusStorage):
         result = await self.db.query(sql, list(params.values()), True)
 
         docs_by_track_id = {}
-        for element in result:
-            # Parse chunks_list JSON string back to list
-            chunks_list = element.get("chunks_list", [])
-            if isinstance(chunks_list, str):
-                try:
-                    chunks_list = json.loads(chunks_list)
-                except json.JSONDecodeError:
-                    chunks_list = []
-
-            # Parse metadata JSON string back to dict
-            metadata = element.get("metadata", {})
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except json.JSONDecodeError:
-                    metadata = {}
-            # Ensure metadata is a dict
-            if not isinstance(metadata, dict):
-                metadata = {}
-
-            # Safe handling for file_path
-            file_path = element.get("file_path")
-            if file_path is None:
-                file_path = "no-file-path"
-
-            # Convert datetime objects to ISO format strings with timezone info
-            created_at = self._format_datetime_with_timezone(element["created_at"])
-            updated_at = self._format_datetime_with_timezone(element["updated_at"])
-
-            docs_by_track_id[element["id"]] = DocProcessingStatus(
-                content_summary=element["content_summary"],
-                content_length=element["content_length"],
-                status=element["status"],
-                created_at=created_at,
-                updated_at=updated_at,
-                chunks_count=element["chunks_count"],
-                file_path=file_path,
-                chunks_list=chunks_list,
-                track_id=element.get("track_id"),
-                metadata=metadata,
-                error_msg=element.get("error_msg"),
-                content_hash=element.get("content_hash"),
-            )
+        for element in result or []:
+            try:
+                docs_by_track_id[element["id"]] = (
+                    self._pg_doc_processing_status_from_row(element)
+                )
+            except (KeyError, TypeError) as e:
+                # Relaxed skip-and-log, matching get_docs_by_statuses: this
+                # path had no handler at all, so one row with a missing or
+                # renamed column (schema drift after an upgrade/rollback)
+                # aborted the listing for every sibling document sharing the
+                # track_id.
+                doc_id_hint = element.get("id", "<unknown>") if element else "<unknown>"
+                logger.error(
+                    f"[{self.workspace}] Skipping document '{doc_id_hint}' — "
+                    f"required field missing or wrong type while parsing DB row: {e!r}"
+                )
+                continue
 
         return docs_by_track_id
 
@@ -6465,27 +7066,27 @@ class PGDocStatusStorage(DocStatusStorage):
 
         delete_sql = f"DELETE FROM {table_name} WHERE workspace=$1 AND id = ANY($2)"
 
-        # Chunk the id list so each statement's ANY($2) array stays bounded
-        # (a non-positive cap disables chunking). All chunks run in ONE
-        # transaction so a mid-delete failure rolls every chunk back, preserving
+        # Batch the id list so each statement's ANY($2) array stays bounded
+        # (a non-positive cap disables batching). All batches run in ONE
+        # transaction so a mid-delete failure rolls every batch back, preserving
         # the original single-statement all-or-nothing behaviour; _run_with_retry
         # re-runs the whole closure on transient errors (DELETE is idempotent).
-        chunk = (
+        delete_batch_size = (
             self._max_delete_records_per_batch
             if self._max_delete_records_per_batch > 0
             else len(ids)
         )
-        if len(ids) > chunk:
+        if len(ids) > delete_batch_size:
             logger.info(
                 f"[{self.workspace}] {self.namespace} delete: {len(ids)} ids "
-                f"split into chunks (chunk={chunk})"
+                f"split into batches (batch_size={delete_batch_size})"
             )
 
         async def _batch_delete(connection: asyncpg.Connection) -> None:
             async with connection.transaction():
-                for i in range(0, len(ids), chunk):
+                for i in range(0, len(ids), delete_batch_size):
                     await connection.execute(
-                        delete_sql, self.workspace, ids[i : i + chunk]
+                        delete_sql, self.workspace, ids[i : i + delete_batch_size]
                     )
 
         try:
@@ -6695,6 +7296,52 @@ class PGGraphQueryException(Exception):
         return self.details
 
 
+class PGGraphEdgeWriteLostError(PGGraphQueryException):
+    """Raised when an edge upsert completed without writing an edge.
+
+    The AGE upsert Cypher is ``MATCH (source) ... MATCH (target) ... CREATE``:
+    if either endpoint is absent the whole pattern fails to match, the statement
+    succeeds with zero rows, and the relation is dropped on the floor. Every
+    in-tree caller creates its endpoints first (``merge_nodes_and_edges``,
+    ``ainsert_custom_kg``, the graph-edit flows in ``utils_graph``), so this can
+    only fire on a real defect or a concurrent endpoint deletion — cases where a
+    silent drop is far worse than an error.
+
+    Attributes:
+        source_node_id / target_node_id: the endpoints of the lost edge.
+        missing_endpoints: the endpoint ids found absent, when identifiable.
+    """
+
+    def __init__(
+        self,
+        graph_name: str,
+        source_node_id: str,
+        target_node_id: str,
+        missing_endpoints: Sequence[str] = (),
+    ) -> None:
+        self.graph_name = graph_name
+        self.source_node_id = source_node_id
+        self.target_node_id = target_node_id
+        self.missing_endpoints = tuple(missing_endpoints)
+        if self.missing_endpoints:
+            details = "missing endpoint node(s): " + ", ".join(
+                f"`{node_id}`" for node_id in self.missing_endpoints
+            )
+        else:
+            details = (
+                "both endpoints appear to exist; the edge write was most likely "
+                "lost to a concurrent endpoint deletion"
+            )
+        message = (
+            f"PostgreSQL AGE: edge `{source_node_id}`-`{target_node_id}` was not "
+            f"written to graph {graph_name} ({details})"
+        )
+        super().__init__({"message": message, "details": details})
+        # PGGraphQueryException does not populate Exception.args, which would
+        # make str(exc) empty in logs and test output.
+        self.args = (message,)
+
+
 def _is_transient_graph_write_error(exc: BaseException) -> bool:
     """Return True when a PGGraphQueryException wraps a transient write-time error.
 
@@ -6870,24 +7517,59 @@ class PGGraphStorage(BaseGraphStorage):
 
             await self.db._run_with_retry(_do_configure_age_extension)
 
-            # Execute each statement separately and ignore errors
+            # Only create the labels that are actually missing. create_vlabel /
+            # create_elabel have no IF NOT EXISTS form, so calling them for an
+            # existing label makes PostgreSQL log an ERROR on every startup
+            # with_age=True here also guarantees the graph
+            # itself exists before we read its labels.
+            existing_labels = await self.db.query(
+                "SELECT l.name::text AS name "
+                "FROM ag_catalog.ag_label l "
+                "JOIN ag_catalog.ag_graph g ON l.graph = g.graphid "
+                f"WHERE g.name = left($1, {_PG_NAME_MAX_BYTES})::name",
+                [self.graph_name],
+                multirows=True,
+                with_age=True,
+                graph_name=self.graph_name,
+            )
+            present_labels = {row["name"] for row in existing_labels or []}
+
+            # Execute each statement separately and ignore errors.
+            #
+            # create_graph() is deliberately absent: every statement below runs
+            # with with_age=True, and the first one to do so has already had
+            # PostgreSQLDB._ensure_age_graph() create the graph. Repeating it
+            # here would only add one more "graph already exists" line to the
+            # PostgreSQL log.
+            #
+            # The index statements carry IF NOT EXISTS for the same reason: a
+            # plain CREATE INDEX on an existing index is an ERROR the server
+            # logs before the client can ignore it, while IF NOT EXISTS
+            # downgrades it to a NOTICE that never reaches the log.
             queries = [
-                f"SELECT create_graph('{self.graph_name}')",
-                f"SELECT create_vlabel('{self.graph_name}', 'base');",
-                f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');",
-                # f'CREATE INDEX CONCURRENTLY vertex_p_idx ON {self.graph_name}."_ag_label_vertex" (id)',
-                f'CREATE INDEX CONCURRENTLY vertex_idx_node_id ON {self.graph_name}."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
-                # f'CREATE INDEX CONCURRENTLY edge_p_idx ON {self.graph_name}."_ag_label_edge" (id)',
-                f'CREATE INDEX CONCURRENTLY edge_sid_idx ON {self.graph_name}."_ag_label_edge" (start_id)',
-                f'CREATE INDEX CONCURRENTLY edge_eid_idx ON {self.graph_name}."_ag_label_edge" (end_id)',
-                f'CREATE INDEX CONCURRENTLY edge_seid_idx ON {self.graph_name}."_ag_label_edge" (start_id,end_id)',
-                f'CREATE INDEX CONCURRENTLY directed_p_idx ON {self.graph_name}."DIRECTED" (id)',
-                f'CREATE INDEX CONCURRENTLY directed_eid_idx ON {self.graph_name}."DIRECTED" (end_id)',
-                f'CREATE INDEX CONCURRENTLY directed_sid_idx ON {self.graph_name}."DIRECTED" (start_id)',
-                f'CREATE INDEX CONCURRENTLY directed_seid_idx ON {self.graph_name}."DIRECTED" (start_id,end_id)',
-                f'CREATE INDEX CONCURRENTLY entity_p_idx ON {self.graph_name}."base" (id)',
-                f'CREATE INDEX CONCURRENTLY entity_idx_node_id ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
-                f'CREATE INDEX CONCURRENTLY entity_node_id_gin_idx ON {self.graph_name}."base" using gin(properties)',
+                *(
+                    [f"SELECT create_vlabel('{self.graph_name}', 'base');"]
+                    if "base" not in present_labels
+                    else []
+                ),
+                *(
+                    [f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');"]
+                    if "DIRECTED" not in present_labels
+                    else []
+                ),
+                # f'CREATE INDEX CONCURRENTLY IF NOT EXISTS vertex_p_idx ON {self.graph_name}."_ag_label_vertex" (id)',
+                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS vertex_idx_node_id ON {self.graph_name}."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
+                # f'CREATE INDEX CONCURRENTLY IF NOT EXISTS edge_p_idx ON {self.graph_name}."_ag_label_edge" (id)',
+                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS edge_sid_idx ON {self.graph_name}."_ag_label_edge" (start_id)',
+                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS edge_eid_idx ON {self.graph_name}."_ag_label_edge" (end_id)',
+                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS edge_seid_idx ON {self.graph_name}."_ag_label_edge" (start_id,end_id)',
+                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS directed_p_idx ON {self.graph_name}."DIRECTED" (id)',
+                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS directed_eid_idx ON {self.graph_name}."DIRECTED" (end_id)',
+                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS directed_sid_idx ON {self.graph_name}."DIRECTED" (start_id)',
+                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS directed_seid_idx ON {self.graph_name}."DIRECTED" (start_id,end_id)',
+                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_p_idx ON {self.graph_name}."base" (id)',
+                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_idx_node_id ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
+                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_node_id_gin_idx ON {self.graph_name}."base" using gin(properties)',
                 f'ALTER TABLE {self.graph_name}."DIRECTED" CLUSTER ON directed_sid_idx',
             ]
 
@@ -7218,7 +7900,11 @@ class PGGraphStorage(BaseGraphStorage):
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
         """
         Retrieves all edges (relationships) for a particular node identified by its label.
-        :return: list of dictionaries containing edge information
+
+        Returns:
+            A list of (source_id, connected_id) tuples, or None if the node does
+            not exist — the BaseGraphStorage contract, as implemented by
+            NetworkXStorage and PGOpsGraphStorage.
         """
         cypher_query = """MATCH (n:base {entity_id: $entity_id})
                       OPTIONAL MATCH (n)-[]-(connected:base)
@@ -7230,6 +7916,19 @@ class PGGraphStorage(BaseGraphStorage):
         }
 
         results = await self._query(query, params=pg_params)
+        if not results:
+            # The anchor MATCH produced no row at all, so no such node exists.
+            # An existing node with no relations is NOT this case: the OPTIONAL
+            # MATCH still yields exactly one row, with connected_id NULL, which
+            # the loop below filters into an empty list. Returning [] here too
+            # would collapse "node absent" into "node isolated" and diverge from
+            # NetworkXStorage/PGOpsGraphStorage. No in-tree caller reads the
+            # distinction today — they all guard with `if edges:` — so this
+            # restores the declared contract rather than fixing a live caller;
+            # collapsing the two here is what makes it unrecoverable for one
+            # that needs it (an error, by contrast, must raise, never return
+            # either value — see get_node_edges on the other backends).
+            return None
         edges = []
         for record in results:
             source_id = record["source_id"]
@@ -7303,6 +8002,53 @@ class PGGraphStorage(BaseGraphStorage):
             ensure_ascii=False,
         )
         return cypher_sql, params_json
+
+    def _build_endpoint_exists_sql(self) -> str:
+        """SQL returning which of the given entity ids have a vertex in the graph.
+
+        Diagnostic-only: used to name the culprit when an edge upsert wrote
+        nothing. Plain SQL over the label table (same access-operator predicate
+        as ``has_node``) so it can run on the caller's connection inside the
+        already-open write transaction.
+        """
+        return f"""
+            SELECT candidate.entity_id AS entity_id
+            FROM unnest($1::text[]) AS candidate(entity_id)
+            WHERE EXISTS (
+                SELECT 1
+                FROM {self.graph_name}.base v
+                WHERE ag_catalog.agtype_access_operator(
+                        VARIADIC ARRAY[v.properties, '"entity_id"'::agtype]
+                      ) = (to_json(candidate.entity_id::text)::text)::agtype
+            )
+        """
+
+    async def _build_edge_write_lost_error(
+        self,
+        connection: asyncpg.Connection,
+        source_node_id: str,
+        target_node_id: str,
+    ) -> PGGraphEdgeWriteLostError:
+        """Build the error for an edge upsert that returned no created edge.
+
+        Probes both endpoints so the message names the one that is missing. The
+        probe is best-effort: it runs on a connection whose transaction is about
+        to be rolled back, so a failure there must not mask the real problem.
+        """
+        endpoints = list(dict.fromkeys((source_node_id, target_node_id)))
+        missing: list[str] = []
+        try:
+            rows = await connection.fetch(self._build_endpoint_exists_sql(), endpoints)
+            present = {row["entity_id"] for row in rows}
+            missing = [node_id for node_id in endpoints if node_id not in present]
+        except Exception as probe_error:  # pragma: no cover - diagnostics only
+            logger.debug(
+                f"[{self.workspace}] Could not probe edge endpoints for "
+                f"`{source_node_id}`-`{target_node_id}`: {probe_error}"
+            )
+        return PGGraphEdgeWriteLostError(
+            self.graph_name, source_node_id, target_node_id, missing
+        )
 
     def _estimate_node_cypher_bytes(
         self, node_id: str, node_data: dict[str, str]
@@ -7444,7 +8190,15 @@ class PGGraphStorage(BaseGraphStorage):
                 await connection.execute(
                     _GRAPH_ADVISORY_LOCK_SHARED_SQL, self.graph_name
                 )
-                await connection.execute(cypher_sql, params_json)
+                # fetch(), not execute(): the Cypher RETURNs the created edge, so
+                # an empty result set is the only signal that the endpoint MATCHes
+                # failed and the edge was silently dropped (see
+                # PGGraphEdgeWriteLostError). AGE reports no error for that.
+                created = await connection.fetch(cypher_sql, params_json)
+                if not created:
+                    raise await self._build_edge_write_lost_error(
+                        connection, source_node_id, target_node_id
+                    )
 
         try:
             await self.db._run_with_retry(
@@ -7616,6 +8370,11 @@ class PGGraphStorage(BaseGraphStorage):
         duplicate DIRECTED rows. Edges are also deduped within the chunk. Retry
         semantics mirror ``upsert_edge``: DELETE + CREATE is idempotent, so a
         full-chunk replay is safe.
+
+        Like the single-edge path, each statement's returned edge is checked: an
+        edge whose endpoints are absent matches nothing and would otherwise be
+        dropped without an error. That raises and rolls the whole chunk back,
+        which is the same all-or-nothing behaviour as any other mid-chunk failure.
         """
         built = [
             self._build_upsert_edge_sql(src, tgt, edge_data)
@@ -7626,8 +8385,14 @@ class PGGraphStorage(BaseGraphStorage):
         async def _operation(connection: asyncpg.Connection) -> None:
             async with connection.transaction():
                 await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
-                for cypher_sql, params_json in built:
-                    await connection.execute(cypher_sql, params_json)
+                for (cypher_sql, params_json), (src, tgt, _edge_data) in zip(
+                    built, chunk
+                ):
+                    created = await connection.fetch(cypher_sql, params_json)
+                    if not created:
+                        raise await self._build_edge_write_lost_error(
+                            connection, src, tgt
+                        )
 
         try:
             await self.db._run_with_retry(
@@ -8194,6 +8959,13 @@ class PGGraphStorage(BaseGraphStorage):
 
             for result in incoming_results:
                 if result["node_id"] and result["connected_id"]:
+                    # A self-loop satisfies BOTH directed matches above, so the
+                    # outbound pass already listed it; appending here would
+                    # report one edge as two. Same guard pgtable_impl,
+                    # mongo_impl and opensearch_impl carry, and the rule stated
+                    # on BaseGraphStorage.get_node_edges.
+                    if result["connected_id"] == result["node_id"]:
+                        continue
                     edges_norm[result["node_id"]].append(
                         (result["connected_id"], result["node_id"])
                     )
@@ -8228,6 +9000,29 @@ class PGGraphStorage(BaseGraphStorage):
                 labels.append(result["label"])
         return labels
 
+    async def iter_labels(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        offset = 0
+        while True:
+            query = """SELECT * FROM cypher('%s', $$
+                     MATCH (n:base)
+                     WHERE n.entity_id IS NOT NULL
+                     RETURN DISTINCT n.entity_id AS label
+                     ORDER BY n.entity_id
+                     SKIP %d LIMIT %d
+                   $$) AS (label text)""" % (self.graph_name, offset, batch_size)
+            results = await self._query(query)
+            batch = [
+                result["label"]
+                for result in results
+                if result and isinstance(result, dict) and "label" in result
+            ]
+            if not batch:
+                break
+            yield batch
+            offset += len(batch)
+
     async def _bfs_subgraph(
         self, node_label: str, max_depth: int, max_nodes: int
     ) -> KnowledgeGraph:
@@ -8256,10 +9051,15 @@ class PGGraphStorage(BaseGraphStorage):
         label = self._normalize_node_id(node_label)
 
         # Build Cypher query with dynamic dollar-quoting to handle entity_id containing $ sequences
+        # NOTE: id(n) is deliberately not selected here. AGE >= 1.8.0 returns
+        # graphid from id(), which cannot be cast to bigint in the column
+        # definition list ("cannot cast type graphid to bigint"). The internal
+        # id is read from the returned vertex below, so selecting it separately
+        # was redundant anyway.
         cypher_query = f"""MATCH (n:base {{entity_id: "{label}"}})
-                    RETURN id(n) as node_id, n"""
+                    RETURN n"""
 
-        query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(cypher_query)}) AS (node_id bigint, n agtype)"
+        query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(cypher_query)}) AS (n agtype)"
 
         node_result = await self._query(query)
         if not node_result or not node_result[0].get("n"):
@@ -8316,11 +9116,15 @@ class PGGraphStorage(BaseGraphStorage):
             )
 
             # Build Cypher queries with dynamic dollar-quoting to handle entity_id containing $ sequences
+            # NOTE: id() results are declared agtype, not bigint. AGE >= 1.8.0
+            # returns graphid from id(), which the column definition list
+            # refuses to cast to bigint. agtype works on both 1.7.x and 1.8.x,
+            # and the values are consumed via str() below either way.
+            # current_internal_id is dropped entirely — it was never read.
             outgoing_cypher = f"""UNWIND [{formatted_ids}] AS node_id
                 MATCH (n:base {{entity_id: node_id}})
                 OPTIONAL MATCH (n)-[r]->(neighbor:base)
                 RETURN node_id AS current_id,
-                       id(n) AS current_internal_id,
                        id(neighbor) AS neighbor_internal_id,
                        neighbor.entity_id AS neighbor_id,
                        id(r) AS edge_id,
@@ -8332,7 +9136,6 @@ class PGGraphStorage(BaseGraphStorage):
                 MATCH (n:base {{entity_id: node_id}})
                 OPTIONAL MATCH (n)<-[r]-(neighbor:base)
                 RETURN node_id AS current_id,
-                       id(n) AS current_internal_id,
                        id(neighbor) AS neighbor_internal_id,
                        neighbor.entity_id AS neighbor_id,
                        id(r) AS edge_id,
@@ -8340,9 +9143,9 @@ class PGGraphStorage(BaseGraphStorage):
                        neighbor,
                        false AS is_outgoing"""
 
-            outgoing_query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(outgoing_cypher)}) AS (current_id text, current_internal_id bigint, neighbor_internal_id bigint, neighbor_id text, edge_id bigint, r agtype, neighbor agtype, is_outgoing bool)"
+            outgoing_query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(outgoing_cypher)}) AS (current_id text, neighbor_internal_id agtype, neighbor_id text, edge_id agtype, r agtype, neighbor agtype, is_outgoing bool)"
 
-            incoming_query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(incoming_cypher)}) AS (current_id text, current_internal_id bigint, neighbor_internal_id bigint, neighbor_id text, edge_id bigint, r agtype, neighbor agtype, is_outgoing bool)"
+            incoming_query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(incoming_cypher)}) AS (current_id text, neighbor_internal_id agtype, neighbor_id text, edge_id agtype, r agtype, neighbor agtype, is_outgoing bool)"
 
             # Execute queries
             outgoing_results = await self._query(outgoing_query)
@@ -8480,7 +9283,25 @@ class PGGraphStorage(BaseGraphStorage):
             # that is mostly an edge target is not under-ranked and dropped on
             # truncation. LEFT JOIN from the base vertex table + COALESCE keeps
             # isolated (degree-0) nodes, matching the previous OPTIONAL MATCH
-            # behaviour when the graph is not truncated. Stable tie-break on id.
+            # behaviour when the graph is not truncated.
+            #
+            # KNOWN DEVIATION from the BaseGraphStorage tie-break, which is on
+            # the label: this ranks on v.id, AGE's internal vertex id. Ordering
+            # on the entity_id is what the contract asks for and it was measured
+            # too expensive here. Selecting only v.id lets the vertex scan be
+            # index-only (entity_p_idx); the label lives in `properties`, so
+            # sorting on it forces a full heap read -- ~1.5x buffers and ~25%
+            # wall clock on a 200k-vertex / 600k-edge graph. No index removes
+            # that: the ORDER BY leads with an aggregate computed from the edge
+            # table, so no index can supply the ordering, and a covering index
+            # on (id, label) is not chosen even with enable_seqscan off.
+            #
+            # What that costs: v.id is an insertion counter, so this view is
+            # stable for a given database but still varies with ingestion order
+            # ACROSS databases holding the same graph. get_popular_labels on
+            # this backend does order by label, so the entity picker and the
+            # graph view can disagree at the same cutoff. Revisit if AGE ever
+            # gains a cheap way to read entity_id without visiting the heap.
             query_nodes = f"""
                 WITH node_degrees AS (
                     SELECT node_id, COUNT(*) AS degree
@@ -8666,12 +9487,72 @@ class PGGraphStorage(BaseGraphStorage):
             edges.append(edge_properties)
         return edges
 
+    async def iter_edges(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        offset = 0
+        while True:
+            query = f"""
+                SELECT
+                    (ag_catalog.agtype_access_operator(VARIADIC ARRAY[a.properties, '"entity_id"'::agtype]))::text AS source,
+                    (ag_catalog.agtype_access_operator(VARIADIC ARRAY[b.properties, '"entity_id"'::agtype]))::text AS target,
+                    r.properties
+                FROM {self.graph_name}."DIRECTED" r
+                JOIN {self.graph_name}.base a ON r.start_id = a.id
+                JOIN {self.graph_name}.base b ON r.end_id = b.id
+                ORDER BY r.id
+                LIMIT {int(batch_size)} OFFSET {int(offset)}
+            """
+            results = await self._query(query)
+            if not results:
+                break
+            batch: list[dict] = []
+            for result in results:
+                properties = result["properties"]
+                if isinstance(properties, str):
+                    try:
+                        properties = json.loads(properties)
+                    except json.JSONDecodeError as exc:
+                        raise PGGraphQueryException(
+                            {
+                                "message": f"Corrupt edge properties in graph {self.graph_name}: {exc}",
+                                "details": properties[:200],
+                            }
+                        ) from exc
+                edge = dict(properties)
+                edge["source"] = result["source"]
+                edge["target"] = result["target"]
+                batch.append(edge)
+            yield batch
+            offset += len(results)
+
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
-        """Get popular labels by node degree (most connected entities) using native SQL for performance."""
+        """Get popular labels by node degree (most connected entities) using native SQL for performance.
+
+        Two phases, and the second one usually does not run. Phase 1 ranks the
+        entities that HAVE edges, straight off the edge-derived degrees — the
+        cheap plan, and on any graph with more than ``limit`` connected entities
+        it fills every slot on its own. Only when it comes up short does phase 2
+        top the result up from the isolated (degree-0) entities, which is
+        exactly the case the original inner join got wrong by returning nothing
+        at all for a graph whose entities carry no relations.
+
+        Driving the whole ranking off the vertex table instead (one LEFT JOIN)
+        would be simpler, but it forces a full vertex scan on every call — on a
+        large graph, to produce a result phase 1 already had.
+        """
         try:
             # Native SQL query to calculate node degrees directly from AGE's underlying tables
-            # This is significantly faster than using the cypher() function wrapper
-            query = f"""
+            # This is significantly faster than using the cypher() function wrapper.
+            #
+            # Self-loops count twice (start_id and end_id both contribute),
+            # matching node_degree() and the other backends. COLLATE "C" makes
+            # the tie-break a byte-order comparison so it matches Python's
+            # code-point sort. The ranking columns live in a derived table
+            # because ORDER BY cannot apply COLLATE to a bare output alias
+            # (a sub-SELECT, not a CTE: CTEs are an optimization fence before
+            # PostgreSQL 12).
+            connected_query = f"""
             WITH node_degrees AS (
                 SELECT
                     node_id,
@@ -8683,31 +9564,74 @@ class PGGraphStorage(BaseGraphStorage):
                 ) AS all_edges
                 GROUP BY node_id
             )
-            SELECT
-                (ag_catalog.agtype_access_operator(VARIADIC ARRAY[v.properties, '"entity_id"'::agtype]))::text AS label
-            FROM
-                node_degrees d
-            JOIN
-                {self.graph_name}._ag_label_vertex v ON d.node_id = v.id
-            WHERE
-                ag_catalog.agtype_access_operator(VARIADIC ARRAY[v.properties, '"entity_id"'::agtype]) IS NOT NULL
+            SELECT label FROM (
+                SELECT
+                    (ag_catalog.agtype_access_operator(VARIADIC ARRAY[v.properties, '"entity_id"'::agtype]))::text AS label,
+                    d.degree AS degree
+                FROM
+                    node_degrees d
+                JOIN
+                    {self.graph_name}._ag_label_vertex v ON d.node_id = v.id
+                WHERE
+                    ag_catalog.agtype_access_operator(VARIADIC ARRAY[v.properties, '"entity_id"'::agtype]) IS NOT NULL
+            ) AS connected
             ORDER BY
-                d.degree DESC,
-                label ASC
+                degree DESC,
+                label COLLATE "C" ASC
             LIMIT $1;
             """
-            results = await self._query(query, params={"limit": limit})
+            results = await self._query(connected_query, params={"limit": limit})
             labels = [
                 result["label"] for result in results if result and "label" in result
             ]
+
+            if len(labels) < limit:
+                # Phase 1 returned fewer than `limit`, and its aggregate is
+                # exact, so the connected set is now known in full: every
+                # remaining entity has no edge at all. Top up in label order,
+                # bounded by the shortfall — never more than `limit` rows, so
+                # even a sequential vertex scan stays cheap.
+                isolated_query = f"""
+                SELECT label FROM (
+                    SELECT
+                        (ag_catalog.agtype_access_operator(VARIADIC ARRAY[v.properties, '"entity_id"'::agtype]))::text AS label
+                    FROM
+                        {self.graph_name}._ag_label_vertex v
+                    WHERE
+                        ag_catalog.agtype_access_operator(VARIADIC ARRAY[v.properties, '"entity_id"'::agtype]) IS NOT NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM {self.graph_name}._ag_label_edge e
+                            WHERE e.start_id = v.id
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM {self.graph_name}._ag_label_edge e
+                            WHERE e.end_id = v.id
+                        )
+                ) AS isolated
+                ORDER BY
+                    label COLLATE "C" ASC
+                LIMIT $1;
+                """
+                isolated_results = await self._query(
+                    isolated_query, params={"limit": limit - len(labels)}
+                )
+                labels.extend(
+                    result["label"]
+                    for result in isolated_results
+                    if result and "label" in result
+                )
 
             logger.debug(
                 f"[{self.workspace}] Retrieved {len(labels)} popular labels (limit: {limit})"
             )
             return labels
         except Exception as e:
+            # Raise, never return []: an empty list here is indistinguishable
+            # from "the graph has no entities". /graph/label/popular already
+            # turns an exception into a 500, so swallowing it handed the WebUI a
+            # 200 with an empty entity picker while the database was down.
             logger.error(f"[{self.workspace}] Error getting popular labels: {str(e)}")
-            return []
+            raise
 
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
         """Search labels with fuzzy matching using native, parameterized SQL for performance and security."""
@@ -8768,10 +9692,12 @@ class PGGraphStorage(BaseGraphStorage):
             )
             return labels
         except Exception as e:
+            # Same reasoning as get_popular_labels: "no match" and "the query
+            # failed" must not share a return value.
             logger.error(
                 f"[{self.workspace}] Error searching labels with query '{query}': {str(e)}"
             )
-            return []
+            raise
 
     async def drop(self) -> dict[str, str]:
         """Drop the storage"""

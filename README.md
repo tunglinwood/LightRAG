@@ -7,8 +7,9 @@
 # 🚀 LightRAG: Simple and Fast Retrieval-Augmented Generation
 
 <div align="center">
-    <a href="https://trendshift.io/repositories/13043" target="_blank"><img src="https://trendshift.io/api/badge/repositories/13043" alt="HKUDS%2FLightRAG | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+<a href="https://www.star-history.com/hkuds/lightrag"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/badge?repo=HKUDS/LightRAG&amp;type=trending&amp;theme=dark"><source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/badge?repo=HKUDS/LightRAG&amp;type=trending"><img alt="GitHub Trending Repository of the Day" src="https://api.star-history.com/badge?repo=HKUDS/LightRAG&amp;type=trending" height="55"></picture></a>&#32;<a href="https://trendshift.io/repositories/13043" target="_blank"><img src="https://trendshift.io/api/badge/repositories/13043" alt="HKUDS/LightRAG | Trendshift" height="55"></a>&#32;<a href="https://www.star-history.com/hkuds/lightrag"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/badge?repo=HKUDS/LightRAG&amp;type=rank&amp;theme=dark"><source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/badge?repo=HKUDS/LightRAG&amp;type=rank"><img alt="Star History Rank" src="https://api.star-history.com/badge?repo=HKUDS/LightRAG&amp;type=rank" height="55"></picture></a>
 </div>
+
 <p>
 </p>
 <div align="center">
@@ -34,6 +35,7 @@
       <a href="README-zh.md"><img src="https://img.shields.io/badge/🇨🇳中文版-1a1a2e?style=for-the-badge"></a>
       <a href="README.md"><img src="https://img.shields.io/badge/🇺🇸English-1a1a2e?style=for-the-badge"></a>
       <a href="README-ja.md"><img src="https://img.shields.io/badge/🇯🇵日本語版-1a1a2e?style=for-the-badge"></a>
+      <a href="README-id.md"><img src="https://img.shields.io/badge/🇮🇩Bahasa%20Indonesia-1a1a2e?style=for-the-badge"></a>
     </p>
     <p>
       <a href="https://pepy.tech/projects/lightrag-hku"><img src="https://static.pepy.tech/personalized-badge/lightrag-hku?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads"></a>
@@ -50,27 +52,6 @@
 
 <div align="center" style="margin: 30px 0;">
     <img src="./README.assets/b2aaf634151b4706892693ffb43d9093.png" width="800" alt="LightRAG Diagram">
-</div>
-
----
-
-<div align="center">
-  <table>
-    <tr>
-      <td style="vertical-align: middle;">
-        <img src="./assets/LiteWrite.png"
-             width="56"
-             height="56"
-             alt="LiteWrite"
-             style="border-radius: 12px;" />
-      </td>
-      <td style="vertical-align: middle; padding-left: 12px;">
-        <a href="https://litewrite.ai">
-          <img src="https://img.shields.io/badge/🚀%20LiteWrite-AI%20Native%20LaTeX%20Editor-ff6b6b?style=for-the-badge&logoColor=white&labelColor=1a1a2e">
-        </a>
-      </td>
-    </tr>
-  </table>
 </div>
 
 ---
@@ -220,7 +201,7 @@ For full description of every target see [docs/InteractiveSetup.md](./docs/Inter
 The native docx parser's opt-in `smart_heading` engine parameter uses spaCy for sentence/NER heuristics. The spaCy runtime is already included in the `api` extra — only the two pinned language models (`zh_core_web_sm` / `en_core_web_sm` 3.8.0, GitHub release wheels not published on PyPI) need one extra step:
 
 ```bash
-lightrag-download-cache --spacy --spacy-install
+lightrag-download-cache --spacy-install
 ```
 
 Enable smart_heading per file/rule (e.g. `LIGHTRAG_PARSER=docx:native(smart_heading=true)`), or globally in `.env`:
@@ -232,6 +213,27 @@ DOCX_SMART_HEADING=true
 ```
 
 When the global switch is on (or a `LIGHTRAG_PARSER` rule carries `native(smart_heading=true)`), the server verifies the models at startup and fails fast with install guidance if they are missing. Deployments that never enable smart_heading need no models. The main Docker image ships the models pre-installed (the lite image does not); for air-gapped hosts see the [Offline Deployment Guide](./docs/OfflineDeployment.md).
+
+### Optional: libcairo for SVG Rasterization (native md/textpack)
+
+The native markdown/textpack parser rasterizes embedded SVG images to PNG via `cairosvg`. `cairosvg` is a cffi binding: `pip install cairosvg` (pulled in by the `api` extra) always succeeds, but rendering only works if the native `libcairo` shared library is *also* present on the host — `pip`/`uv` cannot install system libraries. Without it, rasterization fails at runtime and the affected SVG is skipped (the rest of the document is unaffected); the server logs a warning at startup so the gap is visible before it shows up as a per-document warning later.
+
+Install the system package for your platform:
+
+```bash
+# Debian / Ubuntu (the official Docker image already includes this)
+sudo apt-get install -y libcairo2
+
+# RHEL / Fedora
+sudo dnf install -y cairo
+
+# macOS (Homebrew)
+brew install cairo
+
+# Windows: install the GTK3 runtime, which bundles libcairo-2.dll
+```
+
+Deployments that never process markdown/textpack documents with embedded SVGs can ignore the startup warning.
 
 ## About LightRAG
 
@@ -247,7 +249,7 @@ LightRAG is a lightweight knowledge-graph RAG framework and an efficient alterna
 - **Incremental Updates & Selective Deletion:** LightRAG addresses the challenges of incrementally updating and selectively deleting content from graph-based knowledge bases, keeping them current in dynamic data environments. When a document is deleted, the system can use the LLM cache created during indexing to quickly rebuild the affected entities and relationships, substantially improving update efficiency.
 - **Multiple Document Parsing Engines:** LightRAG's document processing pipeline supports MinerU, Docling, and Native and can be extended with third-party parsers. LightRAG's Native engine efficiently parses images, tables, and formulas in Word and Markdown documents, making it especially suitable for documents rich in multimodal content. The Native engine also automatically detects and corrects section headings in Word documents, improving content extraction from documents with inconsistent outlines and laying the foundation for section-aware text chunking.
 - **Multiple Text Chunking Strategies:** LightRAG supports four text chunking strategies: `Fixed-length (F)`, `Recursive character (R)`, `Vector semantic (V)`, and `Paragraph semantic (P)`. The LightRAG-native `Paragraph semantic (P)` strategy **aligns chunk boundaries with the document's native semantic boundaries**—headings, paragraphs, and tables—as closely as possible. This reduces problems such as mismatched headings and content or missing header rows when long tables are split.
-- **Multiple Storage Backends:** LightRAG's default KV, vector, and graph stores use in-memory databases with local file persistence, making them well suited for quickly evaluating the project. LightRAG also supports a wide range of commonly used storage backends for production deployments with large datasets.
+- **Multiple Storage Backends:** LightRAG's default KV, vector, and graph stores are in-memory databases with local file persistence — suitable only for small-scale testing and evaluation, **not for production**. LightRAG also supports a wide range of commonly used storage backends (PostgreSQL recommended) for production deployments with large datasets.
 
 ### Multimodal Capability Upgrades
 
@@ -294,7 +296,7 @@ When choosing an Embedding model, pay attention to its multilingual support capa
 
 ### Enabling Reranking
 
-Enabling the Rerank option during the query phase can significantly improve query quality. However, enabling Rerank typically introduces a 1–2 second delay. To minimize latency, it is highly recommended to deploy the Rerank model locally. Any mainstream, up-to-date reranker works; for local deployment, `BAAI/bge-reranker-v2-m3` is recommended. For configuration details, please refer to the `.env.example` file. Unlike Embedding models, the Rerank model can be changed at any time during the query phase.
+Enabling the Rerank option during the query phase can significantly improve query quality. However, enabling Rerank typically introduces a 1–2 second delay. To minimize latency, it is highly recommended to deploy the Rerank model locally. Any mainstream, up-to-date reranker works; for local deployment, `BAAI/bge-reranker-v2-m3` is recommended. For configuration details, please refer to the `env.example` file. Unlike Embedding models, the Rerank model can be changed at any time during the query phase.
 
 ### Document Processing Pipeline Configuration
 
@@ -313,8 +315,9 @@ Since the cloud-based MinerU service has limitations on usage, file size, and pa
 
 For large-scale document processing, you need to improve concurrency. Key environment variables related to concurrent file processing include:
 
-- **MAX_ASYNC_LLM/EXTRACT_ASYNC_LLM**: Controls the maximum concurrency for LLM models.
-- **MAX_PARALLEL_INSERT**: Controls the maximum number of files processed in parallel. Processing of text, tables, formulas, and images within a single file will also occur concurrently. `MAX_PARALLEL_INSERT` should ideally be set to about 1/3 of `MAX_ASYNC_LLM`.
+- **MAX_ASYNC_LLM**: Sets the base concurrency for LLM roles (`MAX_ASYNC` remains a deprecated alias). During file processing, it also caps entity/relation extraction tasks for the chunks of one document; each entity-merge or relation-merge phase can run up to twice this many tasks.
+- **EXTRACT_MAX_ASYNC_LLM**: Optionally overrides the Extract-role limit for actual extraction and merge-summary LLM requests. When unset, it inherits `MAX_ASYNC_LLM`; it does not change the pipeline task limits above.
+- **MAX_PARALLEL_INSERT**: Controls the maximum number of files processed in parallel, rather than the per-document chunk or graph-merge task limits. It should ideally be set to about 1/3 of `MAX_ASYNC_LLM`.
 - **MAX_PARALLEL_PARSE_MINERU**: Controls the number of parallel files processed for MinerU parsing.
 - **MAX_PARALLEL_PARSE_DOCLING**: Controls the number of parallel files processed for Docling parsing.
 - **EMBEDDING_FUNC_MAX_ASYNC**: Controls the maximum concurrency for embedding models.
@@ -337,7 +340,11 @@ LightRAG requires four types of backend storage:
 - **GRAPH_STORAGE**: Used to save the knowledge graph.
 - **DOC_STATUS_STORAGE**: Used to store the document list.
 
-By default, LightRAG's storage backends are file-persisted, in-memory databases. These default storages are intended only for development and debugging, and are not suitable for production. In a production environment, if you prefer a single backend to handle all four storage types, you can choose PostgreSQL, MongoDB, or OpenSearch. Alternatively, you can select specialized databases for vector or graph storage, such as using Milvus or Qdrant for vector storage, and Neo4j or Memgraph for graph storage.
+**All four default storages are in-memory databases** (`JsonKVStorage`, `NanoVectorDBStorage`, `NetworkXStorage`, `JsonDocStatusStorage`): the whole dataset resides in the server process's memory and local files under `WORKING_DIR` serve only as persistence, so capacity is bounded by available RAM. The defaults are therefore intended **only for small-scale testing, evaluation, and debugging, and are not suitable for production**.
+
+For production, **PostgreSQL is the recommended backend** — it can serve all four storage types on its own; MongoDB and OpenSearch are the other single-backend options. Alternatively, you can select specialized databases for vector or graph storage, such as using Milvus or Qdrant for vector storage, and Neo4j or Memgraph for graph storage.
+
+For the complete list of available implementations per storage type, see [Storage Types Supported](./docs/LightRAG-API-Server.md#storage-types-supported).
 
 ### Other Important Configurations for Document Processing
 
@@ -348,7 +355,7 @@ During the document insertion stage, you may also want to adjust the following e
 - **ENABLE_CONTENT_HEADINGS**: Controls whether the section heading information of a text chunk is sent to the LLM during the query stage (enabled by default, providing more context for the LLM).
 - **FORCE_LLM_SUMMARY_ON_MERGE / MAX_SOURCE_IDS_PER_RELATION**: Controls the maximum number of text chunks an `entity/relation` can be associated with.
 - **SOURCE_IDS_LIMIT_METHOD**: Controls whether to keep updating the entity/relation description once an `entity/relation` exceeds its associated text chunk limit (by default it stops updating, because at that point the entity-relation description is already rich enough and further updates add little value; skipping updates can greatly speed up knowledge base construction).
-- **DEFAULT_MAX_FILE_PATHS**: Controls the maximum number of source files an `entity/relation` can be associated with; once this limit is exceeded, new file names are no longer written to the vector storage.
+- **MAX_FILE_PATHS**: Controls the maximum number of source files an `entity/relation` can be associated with; once this limit is exceeded, new file names are no longer written to the vector storage.
 
 ### Resolving LLM Timeouts During Entity-Relation Extraction
 
@@ -365,6 +372,17 @@ During the document query stage, you may also want to adjust the following envir
 - **MAX_ENTITY_TOKENS / MAX_RELATION_TOKENS / MAX_TOTAL_TOKENS**: Controls the token length of the retrieved content sent to the LLM context. The retrieved content consists of three parts: `entities`, `relations`, and `text chunks`. The lengths of entities and relations can be controlled independently, while the text chunk length is determined by subtracting the entity and relation lengths from the total length.
 - **ENABLE_CONTENT_HEADINGS**: Controls whether the section heading where a text chunk resides is sent to the LLM; enabled by default, providing richer context for the LLM and improving answer quality.
 - **ENABLE_LLM_CACHE**: Whether to cache query results. Enabled by default; identical query questions, query modes, and LLM model parameters will return the same result.
+- **USER_PROMPT_PREFIX / USER_PROMPT_PREFIX_FILE**: Global instructions prepended to every request's `user_prompt` (the "Additional Instructions" section of the answer prompt), giving operators one place to customize LLM output. It is concatenated verbatim, so end the value with `\n\n` yourself. If a request's `user_prompt` is empty, the prefix alone becomes the instructions sent to the LLM; only the API field `disable_user_prompt_prefix` suppresses it, and a request can never read or replace it. Use `USER_PROMPT_PREFIX_FILE` (a `.md`/`.txt` file name under `PROMPT_DIR/user_prompt`) for long or multi-paragraph text, since a `.env` value must stay on one line.
+
+### WebUI Entries and the Default Entry
+
+The server mounts two WebUI entries from a single frontend build. **`/webui`** is the admin console: document management, knowledge-graph exploration, and query debugging with the full query-parameter panel. **`/workspace`** is a query-only entry for everyday knowledge-base users: the chat surface and nothing else (no document management, no knowledge graph, no query-parameter sidebar, no API-docs links), designed for mobile use, and showing a welcome page to visitors who are not signed in.
+
+- **LIGHTRAG_DEFAULT_UI**: Which entry the root path `/` redirects to — `webui` (default) or `workspace`. It controls **exactly one** behavior: that redirect. Both entries stay mounted either way and remain reachable at their own URLs; any other value fails startup. Set it to `workspace` when the deployment's primary audience is query users rather than administrators.
+- **UI_TEMPLATES_DIR**: Points at an optional multi-language bundle that replaces the welcome page, login-page text, query empty state, brand logo and copyright line with your own, without rebuilding the WebUI. See [UserDefinedUI.md](./docs/UserDefinedUI.md).
+- **ENABLE_AI_CONTENT_NOTICE**: Labels every **LLM-generated** answer as AI-generated in both query UIs (`/workspace` and the `/webui` retrieval panel); text the model did not write — the canned no-context reply, the admin panel's debug output — stays unlabelled. Off by default; it is a UI element only and never enters the API response or the stored chat history.
+
+Two things to know before pointing end users at `/workspace`. First, query parameters there are **inherited, not editable**: each query uses the settings `/webui` saved in the **same browser** (frontend defaults when none were saved), which is per-browser local state, not a server-wide policy. Second, hiding the admin UI is a UX split, **not** a security boundary — the API still authorizes every endpoint server-side. For the complete behavior of the query entry, see [LightRAG-API-Server.md](./docs/LightRAG-API-Server.md#the-workspace-query-entry).
 
 ## Using LightRAG As SDK
 
@@ -408,7 +426,7 @@ python examples/lightrag_openai_demo.py
 
 For a streaming response implementation example, please see `examples/lightrag_openai_compatible_demo.py`. Prior to execution, ensure you modify the sample code's LLM and embedding configurations accordingly.
 
-**Note 1**: When running the demo program, please be aware that different test scripts may use different embedding models. If you switch to a different embedding model, you must clear the data directory (`./dickens`); otherwise, the program may encounter errors. If you wish to retain the LLM cache, you can preserve the `kv_store_llm_response_cache.json` file while clearing the data directory.
+**Note 1**: When running the demo program, please be aware that different test scripts may use different embedding models. Vectors written by one model are unusable by another, so switching models requires rebuilding them. For the **demo** data specifically, the simplest route is to delete the demo directory (`./dickens`) and re-run — the corpus is small and disposable; keep `kv_store_llm_response_cache.json` if you want the LLM cache. For a **real deployment, do not delete the working directory**: it holds the knowledge graph and the text chunks, and deleting it turns a re-embedding job into a full re-ingestion of every document. Run `lightrag-rebuild-vdb` instead — see [Switching embedding models](./docs/ProgramingWithCore.md#switching-embedding-models).
 
 **Note 2**: Only `lightrag_openai_demo.py` and `lightrag_openai_compatible_demo.py` are officially supported sample codes. Other sample files are community contributions that haven't undergone full testing and optimization.
 
@@ -468,6 +486,7 @@ Entries marked 🇨🇳 also ship a Chinese translation as `*-zh.md` in the same
 | Document | What it covers |
 |---|---|
 | [LightRAG-API-Server.md](./docs/LightRAG-API-Server.md) [🇨🇳](./docs/LightRAG-API-Server-zh.md) | The complete server guide: startup, configuration, authentication, REST endpoints, and WebUI usage |
+| [UserDefinedUI.md](./docs/UserDefinedUI.md) [🇨🇳](./docs/UserDefinedUI-zh.md) | Replacing the welcome page, login-page text, user agreement, query empty state, copyright line and brand logo per language (`UI_TEMPLATES_DIR`) |
 
 **Document Processing**
 
@@ -485,6 +504,7 @@ Entries marked 🇨🇳 also ship a Chinese translation as `*-zh.md` in the same
 | Document | What it covers |
 |---|---|
 | [RoleSpecificLLMConfiguration.md](./docs/RoleSpecificLLMConfiguration.md) [🇨🇳](./docs/RoleSpecificLLMConfiguration-zh.md) | Per-role (`EXTRACT` / `QUERY` / `KEYWORD` / `VLM`) LLM and VLM configuration |
+| [LLMProviderOptions.md](./docs/LLMProviderOptions.md) | Complete reference for provider generation options (`OPENAI_LLM_*`, `OLLAMA_LLM_*`, `GEMINI_LLM_*`, `BEDROCK_LLM_*`, `*_EMBEDDING_*`) |
 | [AsymmetricEmbedding.md](./docs/AsymmetricEmbedding.md) | Query/document asymmetric embedding (`EMBEDDING_ASYMMETRIC`) and per-model prefixes |
 | [MilvusConfigurationGuide.md](./docs/MilvusConfigurationGuide.md) | Tuning Milvus index parameters through `vector_db_storage_cls_kwargs` |
 
@@ -520,7 +540,7 @@ Audits the whole graph for contributions missing from the `full_entities` / `ful
 
 Lists documents that claim the same canonical source key, and demotes the candidates the operator did not choose to duplicates. It never picks a winner on its own and never deletes content.
 
-**`download_cache.py`** — `lightrag-download-cache [--spacy --spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
+**`download_cache.py`** — `lightrag-download-cache [--spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
 
 Pre-downloads the tiktoken encodings and the pinned spaCy models required for offline deployment and the docx `smart_heading` engine parameter.
 
