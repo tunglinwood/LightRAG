@@ -53,6 +53,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# MCP server (Model Context Protocol) over stdio
+mcp = [
+    "mcp>=2.0,<3",
+]
+
 # Test framework dependencies (for CI/CD and testing)
 pytest = [
     "pytest>=8.4.2",
@@ -202,12 +207,20 @@ lightrag-hash-password = "lightrag.tools.hash_password:main"
 lightrag-download-cache = "lightrag.tools.download_cache:main"
 lightrag-clean-llmqc = "lightrag.tools.clean_llm_query_cache:main"
 lightrag-rebuild-vdb = "lightrag.tools.rebuild_vdb:main"
+lightrag-mcp = "lightrag.mcp.server:main"
 
 [project.urls]
 Homepage = "https://github.com/HKUDS/LightRAG"
 Documentation = "https://github.com/HKUDS/LightRAG"
 Repository = "https://github.com/HKUDS/LightRAG"
 "Bug Tracker" = "https://github.com/HKUDS/LightRAG/issues"
+
+[tool.uv]
+# zhipuai (offline-llm extra) pins pyjwt<2.9.0, while every mcp 2.x release
+# requires pyjwt[crypto]>=2.10.1. uv resolves the union of all extras, so the
+# two constraints are mutually exclusive without an override. zhipuai only
+# uses pyjwt's stable encode/decode API, which is unchanged across 2.10.
+override-dependencies = ["pyjwt>=2.10.1"]
 
 [tool.setuptools.packages.find]
 include = ["lightrag*"]

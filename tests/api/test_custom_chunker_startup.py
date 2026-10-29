@@ -44,6 +44,7 @@ def startup(monkeypatch, tmp_path):
     )
     args = config.initialize_config(force=True)
     from lightrag.api import lightrag_server as server
+    from lightrag.api import rag_factory
 
     captured = []
 
@@ -54,7 +55,8 @@ def startup(monkeypatch, tmp_path):
         captured.append(kwargs)
         raise Constructed
 
-    monkeypatch.setattr(server, "LightRAG", construct)
+    # Construction lives in rag_factory; the server module only forwards.
+    monkeypatch.setattr(rag_factory, "LightRAG", construct)
     monkeypatch.setattr(server, "check_frontend_build", lambda: (False, False))
     monkeypatch.setattr(server, "check_workspace_frontend_build", lambda: False)
     return server, args, captured, Constructed
